@@ -1,0 +1,70 @@
+# Generated outputs / experiment results
+output*/
+outputs/
+runtime*/
+_records/
+
+# Logs
+logs/
+*.log
+*.out
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.backup
+*~
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+cache/
+.venv/
+venv/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Large files (images / models / data)
+*.jpg
+*.png
+!assets/Method.png
+!tests/output/
+!tests/output/*.png
+*.pth
+*.pt
+*.bin
+*.onnx
+*.ckpt
+*.safetensors
+*.gguf
+*.engine
+*.pkl
+*.npz
+*.npy
+
+# Environment variables / secrets
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+
+# IDE
+.vscode/
+.idea/
+.marscode/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Local source used to render the README method figure
+/fig_method.pdf
+
+# Retained locally for the Hugging Face data release
+/DATA_AVAILABILITY.md

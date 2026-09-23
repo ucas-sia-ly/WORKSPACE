@@ -1,0 +1,14 @@
+FROM lightx2v/lightx2v:25111101-cu128 AS base
+
+RUN mkdir /workspace/LightX2V
+WORKDIR /workspace/LightX2V
+ENV PYTHONPATH=/workspace/LightX2V
+
+RUN pip install diffusers==0.37.1
+
+COPY tools tools
+COPY assets assets
+COPY configs configs
+COPY lightx2v lightx2v
+COPY lightx2v_kernel lightx2v_kernel
+COPY lightx2v_platform lightx2v_platform

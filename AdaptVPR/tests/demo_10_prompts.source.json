@@ -1,0 +1,20 @@
+{
+  "dataset": "shunpeng/AdaptCities",
+  "revision": "ca79c45f5d2854536e37a588a69a94b112a993fa",
+  "source_file": "prompts/by_city/Bangkok.jsonl",
+  "source_url": "https://huggingface.co/datasets/shunpeng/AdaptCities/blob/ca79c45f5d2854536e37a588a69a94b112a993fa/prompts/by_city/Bangkok.jsonl",
+  "selection": "First published row for each source_id, in tests/demo_10.csv order; prompts unchanged.",
+  "sample_ids": [
+    "adapt_000001",
+    "adapt_000002",
+    "adapt_000003",
+    "adapt_000007",
+    "adapt_000009",
+    "adapt_000010",
+    "adapt_000011",
+    "adapt_000016",
+    "adapt_000066",
+    "adapt_000071"
+  ],
+  "sha256": "b3c3d3f16605e82dc4413690febb1e646b2eeb03c8d9a68e9b0651cd9ebf08a0"
+}
