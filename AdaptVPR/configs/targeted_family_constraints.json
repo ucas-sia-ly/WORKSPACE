@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "weight_map": "raw_attention_map",
+  "weighted_coverage_scope": "full_map",
+  "tau_target_precision": 0.7,
+  "weighted_coverage_thresholds": [0.3, 0.5, 0.7],
+  "search": {"center_offsets": [-0.5, 0.0, 0.5], "roi_anchors": 4, "anchor_separation_tokens": 3.0},
+  "render": {"radius_fraction_of_short_side": 0.008, "max_radius_pixels": 6, "max_added_area_ratio": 0.3, "max_image_area_fraction": 0.2},
+  "families": {
+    "parked_vehicle": {"shape": "horizontal_compact", "area_range": [0.03, 0.12], "area_samples": 3, "aspect_ratios": [2.0, 3.0], "angle_offsets_degrees": [0.0]},
+    "construction_barrier": {"shape": "horizontal_compact", "area_range": [0.015, 0.08], "area_samples": 3, "aspect_ratios": [2.5, 4.0], "angle_offsets_degrees": [0.0]},
+    "traffic_cones": {"shape": "cone_triangle", "area_range": [0.004, 0.025], "area_samples": 3, "aspect_ratios": [0.55, 0.8], "angle_offsets_degrees": [0.0]},
+    "temporary_sign": {"shape": "vertical_rectangle", "area_range": [0.006, 0.035], "area_samples": 3, "aspect_ratios": [0.4, 0.65], "angle_offsets_degrees": [0.0]},
+    "vegetation": {"shape": "compact_irregular_blob", "area_range": [0.02, 0.10], "area_samples": 3, "aspect_ratios": [0.8, 1.2], "angle_offsets_degrees": [0.0]},
+    "scaffolding": {"shape": "facade_rectangle", "area_range": [0.04, 0.16], "area_samples": 3, "aspect_ratios": [0.6, 1.4], "angle_offsets_degrees": [-5.0, 0.0, 5.0]},
+    "construction_tarp": {"shape": "facade_rectangle", "area_range": [0.035, 0.14], "area_samples": 3, "aspect_ratios": [0.8, 1.6], "angle_offsets_degrees": [-5.0, 0.0, 5.0]}
+  }
+}

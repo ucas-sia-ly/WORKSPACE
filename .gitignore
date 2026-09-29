@@ -39,7 +39,7 @@ model_weights/
 *.incomplete
 
 # Generated results and service state; keep documentation/example images.
-outputs/
+#outputs/
 outputs_*/
 output/
 output_train/

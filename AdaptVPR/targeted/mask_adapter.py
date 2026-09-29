@@ -1,4 +1,8 @@
-"""Deterministic compact-mask search at original resolution; Pillow + stdlib only."""
+"""Ellipse baseline: deterministic compact-mask search; Pillow + stdlib only.
+
+Preserved unchanged for baseline comparisons. New family-specific Core/Render
+masks are implemented separately in candidate_masks.py and render_mask.py.
+"""
 
 from __future__ import annotations
 

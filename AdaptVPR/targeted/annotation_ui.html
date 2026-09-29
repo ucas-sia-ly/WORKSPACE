@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stage3 人工标注</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f4f5f7;color:#182131;font:15px system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:20px}header,.toolbar,.card{background:white;border:1px solid #dee3ea;border-radius:10px;padding:16px;margin-bottom:14px}h1{font-size:23px;margin:0 0 8px}.muted{color:#596575;font-size:13px}.toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap}button,select,textarea{font:inherit;border:1px solid #bac5d2;border-radius:6px;padding:9px;background:white}button{cursor:pointer}button:hover{background:#eef3fa}button:disabled{opacity:.45;cursor:wait}.primary{background:#205dd6;color:white}.primary:hover{background:#184eae}select{max-width:100%}.images{display:grid;grid-template-columns:1fr 1fr;gap:14px}.images .card{min-width:0}.images img{width:100%;height:380px;object-fit:contain;background:#f8f9fb;cursor:zoom-in}.fields{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}label{display:block;font-weight:600}label select{display:block;width:100%;margin-top:6px}.hint{font-weight:400;font-size:12px;color:#596575;margin-top:6px;line-height:1.5}textarea{width:100%;height:85px;margin-top:6px}#sampleId{word-break:break-all;font-family:monospace}#message{white-space:pre-wrap;font-weight:600;margin:10px 0;min-height:22px}progress{width:150px;accent-color:#205dd6}details{line-height:1.7}.error{color:#ad1824}.ok{color:#157347}@media(max-width:900px){.images,.fields{grid-template-columns:1fr 1fr}.images img{height:260px}}@media(max-width:600px){.images,.fields{grid-template-columns:1fr}}
+</style>
+<main>
+<header><h1>Stage3 · 人工标注</h1><div class="muted">独立判断原图与标记区域。页面不显示模型预测，也不会用模型结果预填标签。当前审计的是既有 generation mask，并非尚未实现的 Core / Canvas。</div></header>
+<div class="toolbar"><strong id="progressText">载入中…</strong><progress id="progress" value="0"></progress><select id="jump" aria-label="跳转样本"></select><button id="unlabeled">下一个未完成</button><button id="reload">重新载入 CSV</button></div>
+<div class="card"><div id="sampleId"></div><div class="muted" id="csvPath"></div></div>
+<div class="images"><section class="card"><strong>原图</strong><a id="sourceLink" target="_blank" rel="noopener"><img id="source" alt="原始图像"></a></section><section class="card"><strong>Target context crop · 细轮廓内为当前目标</strong><a id="cropLink" target="_blank" rel="noopener"><img id="crop" alt="带 target 轮廓的上下文裁剪"></a><div class="muted">点击图片可打开原尺寸查看。</div></section></div>
+<section class="card"><div class="fields">
+<label>区域类型<select id="human_region_type"></select><div class="hint">判断轮廓内的内容；拿不准可选 unknown。</div></label>
+<label>支撑面<select id="human_support_surface"></select><div class="hint">当前 v2：只看轮廓内实际可见支撑；树冠不自动等于土壤。</div></label>
+<label>可以现实地新增遮挡物？<select id="human_editable"></select><div class="hint">保持当前 mask 不动，考虑尺度、支撑、物体及阴影能否容纳。</div></label>
+<label>遮挡物类别<select id="human_family"></select><div class="hint">仅选 MVP 类别；不可编辑对应 none。选项不自动代填。</div></label>
+</div><label style="margin-top:14px">备注<textarea id="comment" placeholder="例如：看不见地面支撑；区域跨越墙和树；可放小型交通锥…"></textarea></label>
+<div id="message" role="status" aria-live="polite"></div>
+<div class="toolbar" style="padding:0;border:0;margin:0"><button id="prev">← 上一张</button><button id="next">下一张 →</button><button id="save">保存</button><button class="primary" id="saveNext">保存并下一张</button><span class="muted">Ctrl / ⌘ + Enter：保存并下一张 · Alt + ← / →：切换</span></div>
+</section>
+<details class="card"><summary>标注与保存说明</summary>空白表示尚未标注，不等于 false / none。允许保存部分标签，四个选项全部填写后才计为完成。已有标签会自动读取；保存时检查 editable 与 family 一致性。每次保存前保留 CSV 备份。若 CSV 被其他窗口修改，保存会拒绝覆盖，请重新载入后复核。切换样本不会自动保存。</details>
+</main>
+<script>
+const TOKEN='__SESSION_TOKEN__';
+const fields=['human_region_type','human_support_surface','human_editable','human_family','comment'];
+const choices={human_region_type:[['road','道路'],['sidewalk','人行道'],['parking_area','停车区域'],['grass','草地'],['vegetation','植被'],['building_front','建筑立面'],['wall_or_fence','墙 / 围栏'],['sky','天空'],['unknown','不确定']],human_support_surface:[['paved_ground','铺装地面'],['soil_ground','土壤 / 草地'],['building_base','建筑底部'],['facade_attachment','可见立面固定结构'],['none','没有可见支撑'],['unknown','不确定']],human_editable:[['true','可以'],['false','不可以']],human_family:[['traffic_cones','交通锥'],['construction_barrier','施工隔离栏'],['parked_vehicle','停放车辆'],['vegetation','灌木 / 植被'],['none','不编辑']]};
+const $=id=>document.getElementById(id);let state=null,index=0,dirty=false,busy=false;
+for(const [id,values] of Object.entries(choices)){ $(id).append(new Option('— 尚未标注 —',''));for(const [value,label] of values)$(id).append(new Option(`${label} · ${value}`,value)); }
+function message(text,error=false){$('message').textContent=text;$('message').className=error?'error':'ok';}
+function complete(s){return fields.slice(0,4).every(k=>s.label[k]);}
+function progress(){const done=state.samples.filter(complete).length;$('progressText').textContent=`${index+1} / ${state.samples.length} 张 · 已完成 ${done} 张`;$('progress').max=state.samples.length;$('progress').value=done;$('jump').replaceChildren(...state.samples.map((s,i)=>new Option(`${i+1}. ${complete(s)?'✓':'○'} ${s.sample_id.slice(0,12)}`,String(i))));$('jump').value=String(index);}
+function render(){const sample=state.samples[index];$('sampleId').textContent=sample.sample_id;$('csvPath').textContent=`保存到：${state.csv_path}`;for(const key of fields)$(key).value=sample.label[key]||'';for(const kind of ['source','crop']){const url=`/image/${index}/${kind}`;$(kind).src=url;$(kind+'Link').href=url;}dirty=false;progress();message('');}
+function navigate(n){if(busy)return;if(n<0||n>=state.samples.length)return;if(dirty&&!confirm('当前修改尚未保存。放弃修改并切换？')){$('jump').value=String(index);return;}index=n;render();}
+async function load(){if(busy)return;if(dirty&&!confirm('当前修改尚未保存。重新载入会丢弃这些修改，继续？'))return;try{const response=await fetch('/api/state');const data=await response.json();if(!response.ok)throw Error(data.error);state=data;index=Math.min(index,state.samples.length-1);render();}catch(e){message(e.message,true);}}
+async function save(advance){if(!state||busy)return;busy=true;document.querySelectorAll('button,select,textarea').forEach(b=>b.disabled=true);try{const record={sample_id:state.samples[index].sample_id};for(const key of fields)record[key]=$(key).value;const response=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json','X-Audit-Token':TOKEN},body:JSON.stringify({record,revision:state.revision})});const result=await response.json();if(!response.ok)throw Error(result.error);state.revision=result.revision;state.samples[index].label=record;dirty=false;progress();if(advance&&index<state.samples.length-1){index++;render();message('上一张已保存');}else message('已保存到 CSV');}catch(e){message(e.message,true);}finally{busy=false;document.querySelectorAll('button,select,textarea').forEach(b=>b.disabled=false);}}
+for(const key of fields)$(key).addEventListener('input',()=>{dirty=true;message('有未保存的修改');});
+$('prev').onclick=()=>navigate(index-1);$('next').onclick=()=>navigate(index+1);$('save').onclick=()=>save(false);$('saveNext').onclick=()=>save(true);$('reload').onclick=load;$('jump').onchange=()=>navigate(Number($('jump').value));
+$('unlabeled').onclick=()=>{if(!state)return;for(let step=1;step<=state.samples.length;step++){const n=(index+step)%state.samples.length;if(!complete(state.samples[n]))return navigate(n);}message('所有样本均已完成。');};
+window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue='';}});
+window.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();save(true);}else if(e.altKey&&e.key==='ArrowRight'){e.preventDefault();navigate(index+1);}else if(e.altKey&&e.key==='ArrowLeft'){e.preventDefault();navigate(index-1);}});
+load();
+</script>
+</html>

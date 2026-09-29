@@ -1,4 +1,8 @@
-# Vulnerability → compact generation mask
+# Vulnerability → compact generation mask (ellipse baseline)
+
+`mask_adapter.py` 保留为旧 ellipse baseline，计算行为不变。新的 family-specific
+Core/Render candidate 路径见 [candidate masks](../docs/stage3_candidate_masks.md)，
+不使用本 baseline 的统一 6% 默认面积。
 
 独立的后续 scene-aware planner 已新增，见
 [Stage3 targeted planner](../docs/stage3_targeted_planner.md)。下面仍描述纯几何 adapter；
