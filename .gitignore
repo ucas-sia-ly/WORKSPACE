@@ -1,6 +1,7 @@
 # Local datasets and downloaded models (keep source packages named models).
 /dataset/
 /datasets/
+/AdaptCities/
 /models/
 model_weights/
 

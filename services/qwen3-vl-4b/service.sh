@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 SERVICE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-CONTAINER=qwen3-vl-4b-instruct
+CONTAINER=${QWEN_CONTAINER_NAME:-qwen3-vl-4b-instruct}
 IMAGE='vllm/vllm-openai:v0.11.0@sha256:014a95f21c9edf6abe0aea6b07353f96baa4ec291c427bb1176dc7c93a85845c'
 MODEL_REVISION=ebb281ec70b05090aa6165b016eac8ec08e71b17
 BASE_URL=http://127.0.0.1:23002
@@ -16,11 +16,21 @@ case "${1:-start}" in
     command -v curl >/dev/null
     command -v python3 >/dev/null
     docker info >/dev/null
+    resource_args=()
+    if [[ -n "${QWEN_MEMORY_LIMIT:-}" ]]; then
+      resource_args+=(--memory "$QWEN_MEMORY_LIMIT" --memory-swap "${QWEN_MEMORY_SWAP_LIMIT:-$QWEN_MEMORY_LIMIT}")
+    fi
+    if [[ -n "${QWEN_CPU_LIMIT:-}" ]]; then
+      resource_args+=(--cpus "$QWEN_CPU_LIMIT")
+    fi
     if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
       if [[ "$(docker inspect -f '{{index .Config.Labels "local.qwen3-vl.service"}}' "$CONTAINER")" != "$SERVICE_DIR" ]]; then
         echo "Container name is already used by another deployment: $CONTAINER"; exit 1
       fi
       echo "Starting existing container (existing configuration retained)."
+      if (( ${#resource_args[@]} )); then
+        docker update "${resource_args[@]}" --restart "${QWEN_RESTART_POLICY:-unless-stopped}" "$CONTAINER" >/dev/null
+      fi
       docker start "$CONTAINER" >/dev/null
     else
       python3 - <<'PY'
@@ -37,7 +47,8 @@ PY
       docker run --detach \
         --name "$CONTAINER" \
         --label "local.qwen3-vl.service=$SERVICE_DIR" \
-        --restart unless-stopped \
+        --restart "${QWEN_RESTART_POLICY:-unless-stopped}" \
+        "${resource_args[@]}" \
         --gpus device=0 \
         --network host \
         --shm-size 4g \
