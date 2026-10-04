@@ -1,0 +1,8 @@
+# Install in the existing AdaptVPR IC-Light environment (do not replace its stack).
+# SALAD Torch Hub imports its training module, which needs these at import time.
+pytorch-lightning>=2.0,<3
+pytorch-metric-learning>=2.0,<3
+faiss-cpu
+# Existing environment also needs torch, torchvision, diffusers, transformers,
+# einops, numpy, Pillow, safetensors, fastapi and pydantic (adapter loader import).
+# Optional --geometry: opencv-python
