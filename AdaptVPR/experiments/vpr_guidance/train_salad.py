@@ -1,4 +1,4 @@
-"""Train a fresh SALAD model on real GSV-Cities + verified synthetic hard positives."""
+"""Train a fresh SALAD model on real GSV-Cities, optionally mixed with verified synthetic hard positives."""
 from __future__ import annotations
 
 import argparse
@@ -26,8 +26,7 @@ class MixedDataModule(pl.LightningDataModule):
         self.workers = workers
 
     def train_dataloader(self):
-        # Do not use persistent workers: the dataset receives a fresh epoch-level
-        # synthetic quota in SetDatasetEpoch and worker copies must see it.
+        # No persistent workers: each epoch receives a fresh deterministic mix plan.
         return DataLoader(
             self.dataset,
             batch_size=self.batch_size,
@@ -56,11 +55,12 @@ class SetDatasetEpoch(pl.Callback):
                 handle.write(json.dumps(stats) + "\n")
             print(
                 "mix epoch={epoch}: real={real} synth={synth} target_synth={target} "
-                "eligible_places={eligible} coverage_limited={limited}".format(
+                "capacity={capacity} eligible_places={eligible} coverage_limited={limited}".format(
                     epoch=stats["epoch"],
                     real=stats["planned_real_slots"],
                     synth=stats["planned_synthetic_slots"],
                     target=stats["target_synthetic_slots"],
+                    capacity=stats.get("synthetic_capacity_slots", 0),
                     eligible=stats["eligible_places"],
                     limited=stats["coverage_limited"],
                 ),
@@ -72,7 +72,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--salad-root", type=Path, required=True, help="local official serizba/salad checkout")
     p.add_argument("--gsv-root", type=Path, required=True)
-    p.add_argument("--synthetic-manifest", type=Path, required=True)
+    p.add_argument(
+        "--synthetic-manifest",
+        type=Path,
+        default=None,
+        help="verified synthetic manifest. Omit for the real-only control; use --synthetic-ratio 0",
+    )
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--cities", nargs="*", default=DEFAULT_CITIES)
     p.add_argument("--batch-size", type=int, default=16)
@@ -85,6 +90,11 @@ def main():
     p.add_argument("--precision", default="16-mixed")
     p.add_argument("--devices", type=int, default=1)
     args = p.parse_args()
+
+    if args.synthetic_ratio > 0 and args.synthetic_manifest is None:
+        p.error("--synthetic-manifest is required when --synthetic-ratio > 0")
+    if args.synthetic_ratio == 0:
+        args.synthetic_manifest = None
 
     salad_root = args.salad_root.resolve()
     if not (salad_root / "vpr_model.py").is_file():
@@ -105,7 +115,7 @@ def main():
     )
     dm = MixedDataModule(dataset, args.batch_size, args.workers)
 
-    # Same architecture and metric-learning objective as official SALAD.
+    # Keep the official SALAD architecture and metric-learning objective fixed.
     model = VPRModel(
         backbone_arch="dinov2_vitb14",
         backbone_config={"num_trainable_blocks": 4, "return_token": True, "norm_layer": True},
@@ -123,9 +133,12 @@ def main():
 
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
+    experiment_kind = "real_only" if args.synthetic_ratio == 0 else "real_plus_synthetic"
     (out / "config.json").write_text(
         json.dumps(
             {
+                "experiment_kind": experiment_kind,
+                "synthetic_manifest": str(args.synthetic_manifest.resolve()) if args.synthetic_manifest else None,
                 "cities": args.cities,
                 "batch_size_places": args.batch_size,
                 "img_per_place": args.img_per_place,
