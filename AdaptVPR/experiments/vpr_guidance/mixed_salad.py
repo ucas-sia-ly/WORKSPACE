@@ -1,13 +1,15 @@
 """GSV-Cities + verified synthetic place dataset for SALAD-style training.
 
-Each item is one geographical place with K images.  A controlled fraction of
-image slots is replaced by verified generated images from the same place.  This
-preserves SALAD's original metric-learning labels while exposing it to domain
-hard positives.
+Each item is one geographical place with K images.  Synthetic slots are allocated
+at epoch level so the requested real:synthetic exposure is reproducible instead
+of being an untracked Bernoulli approximation.  Every synthetic image comes from
+the same verified (city, place_id) as the real place and therefore inherits that
+place label exactly as in AdaptVPR-style hard-positive augmentation.
 """
 from __future__ import annotations
 
-import json, random
+import json
+import random
 from pathlib import Path
 
 import pandas as pd
@@ -17,11 +19,10 @@ from torch.utils.data import Dataset
 from torchvision import transforms as T
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+IMAGENET_MEAN_STD = {"mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}
 
-IMAGENET_MEAN_STD = {"mean":[0.485,0.456,0.406], "std":[0.229,0.224,0.225]}
 
-
-def build_transform(image_size=(322,322)):
+def build_transform(image_size=(322, 322)):
     return T.Compose([
         T.Resize(image_size, interpolation=T.InterpolationMode.BILINEAR),
         T.RandAugment(num_ops=3, interpolation=T.InterpolationMode.BILINEAR),
@@ -31,63 +32,149 @@ def build_transform(image_size=(322,322)):
 
 
 def _gsv_name(row, place_id):
-    city=row["city_id"]; pid=str(int(place_id)).zfill(7); pano=row["panoid"]
-    year=str(row["year"]).zfill(4); month=str(row["month"]).zfill(2); north=str(row["northdeg"]).zfill(3)
+    city = row["city_id"]
+    pid = str(int(place_id)).zfill(7)
+    pano = row["panoid"]
+    year = str(row["year"]).zfill(4)
+    month = str(row["month"]).zfill(2)
+    north = str(row["northdeg"]).zfill(3)
     return f"{city}_{pid}_{year}_{month}_{north}_{row['lat']}_{row['lon']}_{pano}.jpg"
 
 
 def load_synthetic_manifest(path: Path):
-    by_place={}
+    by_place = {}
     for line in Path(path).read_text(encoding="utf-8").splitlines():
-        if not line.strip(): continue
-        row=json.loads(line)
+        if not line.strip():
+            continue
+        row = json.loads(line)
         if not row.get("passed") or not row.get("eligible_for_training"):
             continue
-        key=(str(row["city"]), str(row["place_id"]).zfill(7))
-        gen=Path(row["generated_path"])
-        if not gen.is_file(): raise FileNotFoundError(gen)
+        key = (str(row["city"]), str(row["place_id"]).zfill(7))
+        gen = Path(row["generated_path"])
+        if not gen.is_file():
+            raise FileNotFoundError(gen)
         by_place.setdefault(key, []).append(gen)
     return by_place
 
 
 class MixedGSVCitiesDataset(Dataset):
-    def __init__(self, gsv_root: Path, synthetic_manifest: Path, cities, img_per_place=4,
-                 min_img_per_place=4, real_to_synth=(8,1), image_size=(322,322), seed=42):
-        self.root=Path(gsv_root); self.cities=list(cities); self.k=img_per_place; self.min_k=min_img_per_place
-        self.real_ratio, self.synth_ratio = real_to_synth
-        if self.real_ratio < 0 or self.synth_ratio < 0 or self.real_ratio+self.synth_ratio <= 0:
+    def __init__(
+        self,
+        gsv_root: Path,
+        synthetic_manifest: Path,
+        cities,
+        img_per_place=4,
+        min_img_per_place=4,
+        real_to_synth=(8, 1),
+        image_size=(322, 322),
+        seed=42,
+    ):
+        self.root = Path(gsv_root)
+        self.cities = list(cities)
+        self.k = int(img_per_place)
+        self.min_k = int(min_img_per_place)
+        self.real_ratio, self.synth_ratio = map(int, real_to_synth)
+        if self.real_ratio < 0 or self.synth_ratio < 0 or self.real_ratio + self.synth_ratio <= 0:
             raise ValueError("invalid real_to_synth ratio")
-        self.synthetic=load_synthetic_manifest(synthetic_manifest)
-        self.transform=build_transform(image_size); self.seed=seed; self.epoch=0
-        frames=[]
-        for city in self.cities:
-            df=pd.read_csv(self.root/"Dataframes"/f"{city}.csv")
-            df["_city"] = city; frames.append(df)
-        df=pd.concat(frames, ignore_index=True)
-        df=df[df.groupby(["city_id","place_id"])["place_id"].transform("size") >= self.min_k]
-        self.groups={(str(city), str(int(pid)).zfill(7)): group.copy()
-                     for (city,pid),group in df.groupby(["city_id","place_id"])}
-        self.keys=sorted(self.groups)
+        if self.k < 1 or self.k > self.min_k:
+            raise ValueError("img_per_place must be in [1, min_img_per_place]")
 
-    def set_epoch(self, epoch:int): self.epoch=int(epoch)
-    def __len__(self): return len(self.keys)
+        self.synthetic = load_synthetic_manifest(synthetic_manifest)
+        self.transform = build_transform(image_size)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        frames = []
+        for city in self.cities:
+            df = pd.read_csv(self.root / "Dataframes" / f"{city}.csv")
+            frames.append(df)
+        df = pd.concat(frames, ignore_index=True)
+        df = df[df.groupby(["city_id", "place_id"])["place_id"].transform("size") >= self.min_k]
+        self.groups = {
+            (str(city), str(int(pid)).zfill(7)): group.copy()
+            for (city, pid), group in df.groupby(["city_id", "place_id"])
+        }
+        self.keys = sorted(self.groups)
+        self.label_map = {key: i for i, key in enumerate(self.keys)}
+        self._synthetic_quota = {}
+        self._mix_stats = {}
+        self.set_epoch(0)
+
+    def _plan_epoch_mix(self):
+        total_slots = len(self.keys) * self.k
+        target_synth = round(
+            total_slots * self.synth_ratio / (self.real_ratio + self.synth_ratio)
+        )
+        eligible = [key for key in self.keys if self.synthetic.get(key)]
+        capacity = len(eligible) * self.k
+        planned_synth = min(target_synth, capacity)
+
+        quota = {key: 0 for key in self.keys}
+        if planned_synth and eligible:
+            rng = random.Random(self.seed * 1_000_003 + self.epoch * 10_000_019)
+            order = list(eligible)
+            rng.shuffle(order)
+            full, remainder = divmod(planned_synth, len(order))
+            full = min(full, self.k)
+            for key in order:
+                quota[key] = full
+            left = planned_synth - full * len(order)
+            if full < self.k:
+                for key in order[:left]:
+                    quota[key] += 1
+
+        actual_synth = sum(quota.values())
+        self._synthetic_quota = quota
+        self._mix_stats = {
+            "epoch": self.epoch,
+            "total_places": len(self.keys),
+            "eligible_places": len(eligible),
+            "slots_per_place": self.k,
+            "total_slots": total_slots,
+            "target_synthetic_slots": target_synth,
+            "planned_synthetic_slots": actual_synth,
+            "planned_real_slots": total_slots - actual_synth,
+            "target_real_to_synthetic": [self.real_ratio, self.synth_ratio],
+            "achieved_synthetic_fraction": (actual_synth / total_slots) if total_slots else 0.0,
+            "coverage_limited": actual_synth < target_synth,
+        }
+
+    @property
+    def mix_stats(self):
+        return dict(self._mix_stats)
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+        if hasattr(self, "keys"):
+            self._plan_epoch_mix()
+
+    def __len__(self):
+        return len(self.keys)
 
     def __getitem__(self, index):
-        key=self.keys[index]; group=self.groups[key]
-        rng=random.Random((self.seed+1)*1000003 + self.epoch*10000019 + index)
-        rows=[r for _,r in group.iterrows()]; rng.shuffle(rows)
-        selected=rows[:self.k]
-        paths=[self.root/"Images"/r["city_id"]/_gsv_name(r, int(r["place_id"])) for r in selected]
-        synth_pool=self.synthetic.get(key, [])
-        # Per-place stochastic replacement yields the requested dataset-level ratio
-        # while keeping the PxK structure expected by SALAD.
-        p_synth=self.synth_ratio/(self.real_ratio+self.synth_ratio)
-        for i in range(self.k):
-            if synth_pool and rng.random() < p_synth:
-                paths[i]=synth_pool[rng.randrange(len(synth_pool))]
-        images=[]
+        key = self.keys[index]
+        group = self.groups[key]
+        rng = random.Random((self.seed + 1) * 1_000_003 + self.epoch * 10_000_019 + index)
+        rows = [row for _, row in group.iterrows()]
+        rng.shuffle(rows)
+        selected = rows[: self.k]
+        paths = [
+            self.root / "Images" / row["city_id"] / _gsv_name(row, int(row["place_id"]))
+            for row in selected
+        ]
+
+        synth_pool = self.synthetic.get(key, [])
+        synth_slots = min(self._synthetic_quota.get(key, 0), self.k, len(paths))
+        if synth_slots:
+            slot_ids = list(range(self.k))
+            rng.shuffle(slot_ids)
+            for slot in slot_ids[:synth_slots]:
+                paths[slot] = synth_pool[rng.randrange(len(synth_pool))]
+
+        images = []
         for path in paths:
-            with Image.open(path) as im: images.append(self.transform(im.convert("RGB")))
-        # Stable city-aware integer label; only equality inside a batch matters for SALAD loss.
-        label=self.keys.index(key)
+            with Image.open(path) as image:
+                images.append(self.transform(image.convert("RGB")))
+
+        label = self.label_map[key]
         return torch.stack(images), torch.full((self.k,), label, dtype=torch.long)
