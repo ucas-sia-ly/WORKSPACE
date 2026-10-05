@@ -11,7 +11,13 @@ from typing import Any, Optional
 
 from PIL import Image
 
-from prompts.rules import normalize_weather
+# Support both package execution from the WORKSPACE root
+# (`python -m AdaptVPR...`) and the original script-style execution from
+# inside AdaptVPR. The experiment pipeline uses package execution.
+try:
+    from AdaptVPR.prompts.rules import normalize_weather
+except ModuleNotFoundError:  # backward compatibility with original script entrypoints
+    from prompts.rules import normalize_weather
 
 
 VISMATCH_ROOT = Path(os.getenv("VISMATCH_ROOT", "../vismatch"))
