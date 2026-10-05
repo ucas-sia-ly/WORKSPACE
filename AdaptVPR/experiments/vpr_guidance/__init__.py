@@ -1,1 +1,1 @@
-"""Isolated Phase 1 inference-time VPR guidance experiment."""
+"""VPR-aware Global-domain generation and downstream mixed-data VPR training."""
