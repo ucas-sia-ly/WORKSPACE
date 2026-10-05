@@ -7,22 +7,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import torch
 from PIL import Image
 
-from AdaptVPR.adapters import iclight_sd15_fc as adapter
-from AdaptVPR.verification.evaluator import DualTraitEvaluator
-from .data import image_index, place_key_from_name, read_global_prompts, resolve_source
-from .iclight import generate_released, load_iclight, load_lora
+from AdaptVPR.verification.evaluator import DualTraitEvaluator, ROUTE_THRESHOLDS
+from .data import image_index, read_global_prompts, resolve_source
+from .iclight import generate_released, load_iclight, load_lora, released_negative_prompt, sampling_policy
 from .teacher import load_salad
 
 
-def main():
+def args_parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--prompts", type=Path, required=True)
     p.add_argument("--image-root", type=Path, required=True)
+    p.add_argument("--dataframe-dir", type=Path, help="GSV-Cities Dataframes; default: image-root/../Dataframes")
     p.add_argument(
         "--lora",
         type=Path,
@@ -34,18 +35,50 @@ def main():
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--salad-repo", default="serizba/salad")
-    p.add_argument("--skip-salad-audit", action="store_true")
-    args = p.parse_args()
+    audit = p.add_mutually_exclusive_group()
+    audit.add_argument("--salad-audit", action="store_true", help="optionally load SALAD for a post-generation statistic")
+    audit.add_argument("--skip-salad-audit", action="store_true", help="compatibility flag; generation skips SALAD by default")
+    return p
+
+
+def _accepted_global_result(result):
+    """Require a genuine successful finite result from the released verifier."""
+    scores = (result.s_geo, result.s_div)
+    if any(not math.isfinite(score) or not 0 <= score <= 1 for score in scores):
+        raise ValueError(f"invalid Global verifier scores: geo={result.s_geo}, div={result.s_div}")
+    thresholds = ROUTE_THRESHOLDS["global"]
+    expected = result.s_geo >= thresholds["TAU_GEO"] and result.s_div >= thresholds["TAU_DIV"]
+    if result.skipped or not isinstance(result.passed, bool) or result.passed != expected:
+        raise ValueError("Global verifier returned skipped or inconsistent acceptance flags")
+    return result.passed is True
+
+
+def main():
+    args = args_parser().parse_args()
+    from .data import GSVLabelIndex, require_empty_output, validate_source_label
+    from .teacher import file_sha256
 
     rows = read_global_prompts(args.prompts, args.conditions, args.limit)
     images = image_index(args.image_root)
+    labels = GSVLabelIndex(args.dataframe_dir or args.image_root.resolve().parent / "Dataframes")
+    sources = []
+    for row in rows:
+        path = resolve_source(row, images)
+        city, place_id = validate_source_label(row, path, labels)
+        sampling_policy(row["condition"])
+        with Image.open(path) as image:
+            image.verify()
+        sources.append((row, path, city, place_id))
     out = args.output_dir.resolve()
+    require_empty_output(out)
     accepted_dir = out / "accepted"
     rejected_dir = out / "rejected"
     accepted_dir.mkdir(parents=True, exist_ok=True)
     rejected_dir.mkdir(parents=True, exist_ok=True)
 
     t2i, i2i, vae = load_iclight()
+    if t2i.unet is not i2i.unet:
+        raise RuntimeError("released IC-Light stages must share their UNet")
     generator_variant = "released"
     if args.lora is not None:
         load_lora(t2i.unet, args.lora)
@@ -53,15 +86,26 @@ def main():
     t2i.unet.eval()
 
     verifier = DualTraitEvaluator()
-    teacher = None if args.skip_salad_audit else load_salad(repo=args.salad_repo)
+    # Resolve the original evaluator's matcher fallback before the first sample.
+    # Record the actual matcher so B/C runs can verify the same policy was used.
+    verifier._load_matcher()
+    verifier_policy = {
+        "route": "global",
+        **ROUTE_THRESHOLDS["global"],
+        "matcher_name": verifier.matcher_name,
+        "img_size": verifier.img_size,
+        "n_kpts": verifier.n_kpts,
+        "clip_model": getattr(getattr(verifier.model, "config", None), "_name_or_path", None),
+    }
+    teacher = load_salad(repo=args.salad_repo) if args.salad_audit else None
     records_path = out / "records.jsonl"
     manifest_path = out / "synthetic_manifest.jsonl"
 
     with records_path.open("w", encoding="utf-8") as records, manifest_path.open("w", encoding="utf-8") as manifest:
-        for row in rows:
-            src_path = resolve_source(row, images)
-            source = Image.open(src_path).convert("RGB")
-            negative = row.get("negative_prompt") or adapter.DEFAULT_NEGATIVE_PROMPT
+        for row, src_path, city, place_id in sources:
+            with Image.open(src_path) as image:
+                source = image.convert("RGB")
+            negative = released_negative_prompt(row.get("negative_prompt"))
             generated = generate_released(
                 t2i,
                 i2i,
@@ -77,7 +121,8 @@ def main():
                 generated,
                 entry={"route": "global", "weather": row["condition"]},
             )
-            target_dir = accepted_dir if result.passed else rejected_dir
+            passed = _accepted_global_result(result)
+            target_dir = accepted_dir if passed else rejected_dir
             gen_path = target_dir / f"{row['sample_id']}.png"
             generated.save(gen_path)
 
@@ -88,11 +133,11 @@ def main():
                         (teacher.from_pil(source) * teacher.from_pil(generated)).sum()
                     )
 
-            city, place_id = place_key_from_name(row["source_id"])
             rec = {
                 "sample_id": row["sample_id"],
                 "source_id": row["source_id"],
                 "source_path": str(src_path),
+                "source_sha256": file_sha256(src_path),
                 "generated_path": str(gen_path),
                 "city": city,
                 "place_id": place_id,
@@ -103,15 +148,17 @@ def main():
                 "seed": args.seed,
                 "generator_variant": generator_variant,
                 "generator_checkpoint": str(args.lora.resolve()) if args.lora else None,
+                "sampling_policy": sampling_policy(row["condition"]),
+                "verifier_policy": verifier_policy,
                 "s_geo": result.s_geo,
                 "s_div": result.s_div,
-                "passed": bool(result.passed),
-                "eligible_for_training": bool(result.passed),
+                "passed": passed,
+                "eligible_for_training": passed,
                 "salad_preservation_cosine": preserve,
             }
             records.write(json.dumps(rec, ensure_ascii=False) + "\n")
             records.flush()
-            if result.passed:
+            if passed:
                 manifest.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 manifest.flush()
             print(

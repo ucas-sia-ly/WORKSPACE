@@ -18,11 +18,13 @@ from PIL import Image, ImageFile
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 
+from .data import GSVLabelIndex, canonical_place_id, gsv_image_name, validate_source_label
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 IMAGENET_MEAN_STD = {"mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}
 
 
-def build_transform(image_size=(322, 322)):
+def build_transform(image_size=(224, 224)):
     return T.Compose([
         T.Resize(image_size, interpolation=T.InterpolationMode.BILINEAR),
         T.RandAugment(num_ops=3, interpolation=T.InterpolationMode.BILINEAR),
@@ -32,29 +34,38 @@ def build_transform(image_size=(322, 322)):
 
 
 def _gsv_name(row, place_id):
-    city = row["city_id"]
-    pid = str(int(place_id)).zfill(7)
-    pano = row["panoid"]
-    year = str(row["year"]).zfill(4)
-    month = str(row["month"]).zfill(2)
-    north = str(row["northdeg"]).zfill(3)
-    return f"{city}_{pid}_{year}_{month}_{north}_{row['lat']}_{row['lon']}_{pano}.jpg"
+    return gsv_image_name(row, place_id)
 
 
-def load_synthetic_manifest(path: Path | None):
+def load_synthetic_manifest(path: Path | None, labels: GSVLabelIndex | None = None):
     if path is None:
         return {}
-    by_place = {}
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
+    path = Path(path).resolve()
+    by_place, file_labels = {}, {}
+    for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         row = json.loads(line)
-        if not row.get("passed") or not row.get("eligible_for_training"):
+        if row.get("passed") is not True or row.get("eligible_for_training") is not True:
             continue
-        key = (str(row["city"]), str(row["place_id"]).zfill(7))
+        if row.get("route") != "global":
+            raise ValueError("only verified Global synthetic images may enter SALAD training")
+        key = (str(row["city"]), canonical_place_id(row["place_id"]))
+        source = Path(row["source_path"])
+        source = (path.parent / source).resolve() if not source.is_absolute() else source.resolve()
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        if labels is not None:
+            key = validate_source_label(row, source, labels)
         gen = Path(row["generated_path"])
+        gen = (path.parent / gen).resolve() if not gen.is_absolute() else gen.resolve()
         if not gen.is_file():
             raise FileNotFoundError(gen)
+        if gen in file_labels:
+            if file_labels[gen] != key:
+                raise ValueError(f"synthetic file has conflicting place labels: {gen}")
+            continue
+        file_labels[gen] = key
         by_place.setdefault(key, []).append(gen)
     return by_place
 
@@ -68,11 +79,14 @@ class MixedGSVCitiesDataset(Dataset):
         img_per_place=4,
         min_img_per_place=4,
         real_to_synth=(8, 1),
-        image_size=(322, 322),
+        image_size=(224, 224),
         seed=42,
+        return_mix_metadata=False,
     ):
         self.root = Path(gsv_root)
         self.cities = list(cities)
+        if not self.cities or len(set(self.cities)) != len(self.cities):
+            raise ValueError("cities must be a non-empty list without duplicates")
         self.k = int(img_per_place)
         self.min_k = int(min_img_per_place)
         self.real_ratio, self.synth_ratio = map(int, real_to_synth)
@@ -82,23 +96,37 @@ class MixedGSVCitiesDataset(Dataset):
             raise ValueError("img_per_place must be in [1, min_img_per_place]")
         if self.synth_ratio > 0 and synthetic_manifest is None:
             raise ValueError("synthetic_manifest is required when synthetic_ratio > 0")
+        if self.synth_ratio == 0:
+            synthetic_manifest = None
 
-        self.synthetic = load_synthetic_manifest(synthetic_manifest)
+        self.synthetic = load_synthetic_manifest(
+            synthetic_manifest,
+            GSVLabelIndex(self.root / "Dataframes") if synthetic_manifest is not None else None,
+        )
         self.transform = build_transform(image_size)
         self.seed = int(seed)
-        self.epoch = 0
+        self.return_mix_metadata = bool(return_mix_metadata)
+        # Workers share the epoch number, including under spawn and persistent
+        # workers. Each worker reconstructs the same quota before reading a place.
+        self._shared_epoch = torch.zeros((), dtype=torch.int64).share_memory_()
+        self._planned_epoch = None
 
         frames = []
         for city in self.cities:
-            df = pd.read_csv(self.root / "Dataframes" / f"{city}.csv")
+            df = pd.read_csv(self.root / "Dataframes" / f"{city}.csv", dtype={"place_id": str})
+            if not (df["city_id"] == city).all():
+                raise ValueError(f"GSV dataframe {city}.csv has inconsistent city_id values")
+            df["place_id"] = df["place_id"].map(canonical_place_id)
             frames.append(df)
         df = pd.concat(frames, ignore_index=True)
         df = df[df.groupby(["city_id", "place_id"])["place_id"].transform("size") >= self.min_k]
         self.groups = {
-            (str(city), str(int(pid)).zfill(7)): group.copy()
+            (str(city), canonical_place_id(pid)): group.copy()
             for (city, pid), group in df.groupby(["city_id", "place_id"])
         }
         self.keys = sorted(self.groups)
+        if not self.keys:
+            raise ValueError("no GSV places have the requested number of real images")
         self.label_map = {key: i for i, key in enumerate(self.keys)}
         self._synthetic_quota = {}
         self._mix_stats = {}
@@ -140,6 +168,7 @@ class MixedGSVCitiesDataset(Dataset):
 
         actual_synth = sum(quota.values())
         self._synthetic_quota = quota
+        self._planned_epoch = self.epoch
         self._mix_stats = {
             "epoch": self.epoch,
             "total_places": len(self.keys),
@@ -157,17 +186,27 @@ class MixedGSVCitiesDataset(Dataset):
 
     @property
     def mix_stats(self):
+        self._ensure_epoch_plan()
         return dict(self._mix_stats)
 
-    def set_epoch(self, epoch: int):
-        self.epoch = int(epoch)
-        if hasattr(self, "keys"):
+    @property
+    def epoch(self):
+        return int(self._shared_epoch.item())
+
+    def _ensure_epoch_plan(self):
+        if self._planned_epoch != self.epoch:
             self._plan_epoch_mix()
+
+    def set_epoch(self, epoch: int):
+        self._shared_epoch.fill_(int(epoch))
+        if hasattr(self, "keys"):
+            self._ensure_epoch_plan()
 
     def __len__(self):
         return len(self.keys)
 
     def __getitem__(self, index):
+        self._ensure_epoch_plan()
         key = self.keys[index]
         group = self.groups[key]
         rng = random.Random((self.seed + 1) * 1_000_003 + self.epoch * 10_000_019 + index)
@@ -199,4 +238,8 @@ class MixedGSVCitiesDataset(Dataset):
                 images.append(self.transform(image.convert("RGB")))
 
         label = self.label_map[key]
-        return torch.stack(images), torch.full((self.k,), label, dtype=torch.long)
+        item = (torch.stack(images), torch.full((self.k,), label, dtype=torch.long))
+        if self.return_mix_metadata:
+            return (*item, {"synthetic_slots": synth_slots, "real_slots": self.k - synth_slots,
+                           "epoch": self.epoch})
+        return item

@@ -2,6 +2,7 @@
 # Compute s_geo (geometric consistency) and s_div (diversity score).
 
 import hashlib
+import math
 import os
 import sys
 import tempfile
@@ -230,7 +231,13 @@ class DualTraitEvaluator:
                 "CLIP image embedding dimension does not match model projection_dim: "
                 f"{feat.shape[-1]} != {projection_dim}"
             )
-        return self.functional.normalize(feat.float(), dim=-1)
+        feat = feat.float()
+        if not self.torch.isfinite(feat).all():
+            raise FloatingPointError("CLIP image embedding contains non-finite values; verification aborted")
+        norms = feat.norm(dim=-1)
+        if not self.torch.isfinite(norms).all() or (norms <= 0).any():
+            raise FloatingPointError("CLIP image embedding has an invalid norm; verification aborted")
+        return self.functional.normalize(feat, dim=-1)
 
     def _compute_s_div(self, ref_image: Image.Image, gen_image: Image.Image) -> float:
         reference_key = self._clip_cache_key(ref_image)
@@ -242,6 +249,8 @@ class DualTraitEvaluator:
             feat_ref = self._clip_reference_feature
         feat_gen = self._extract_clip_feature(gen_image)
         cosine_sim = self.functional.cosine_similarity(feat_ref, feat_gen).item()
+        if not math.isfinite(cosine_sim):
+            raise FloatingPointError("CLIP cosine similarity is non-finite; verification aborted")
         return max(0.0, min(1.0, 1.0 - cosine_sim))
 
     def evaluate(
@@ -269,6 +278,9 @@ class DualTraitEvaluator:
         else:
             s_geo = self._compute_s_geo(ref_image, gen_image)
             s_div = self._compute_s_div(ref_image, gen_image)
+
+        if not all(math.isfinite(score) and 0 <= score <= 1 for score in (s_geo, s_div)):
+            raise FloatingPointError(f"Invalid verifier scores: s_geo={s_geo}, s_div={s_div}")
 
         weather = normalize_weather((entry or {}).get("weather"))
         occlusion = str((entry or {}).get("occlusion", "") or "").lower()

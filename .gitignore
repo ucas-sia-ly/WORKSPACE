@@ -107,3 +107,5 @@ node_modules/
 *.swo
 .DS_Store
 Thumbs.db
+
+Bag-of-Queries/
