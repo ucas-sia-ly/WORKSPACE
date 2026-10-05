@@ -1,10 +1,10 @@
 """GSV-Cities + verified synthetic place dataset for SALAD-style training.
 
-Each item is one geographical place with K images.  Synthetic slots are allocated
-at epoch level so the requested real:synthetic exposure is reproducible instead
-of being an untracked Bernoulli approximation.  Every synthetic image comes from
-the same verified (city, place_id) as the real place and therefore inherits that
-place label exactly as in AdaptVPR-style hard-positive augmentation.
+Each item is one geographical place with K images. Synthetic slots are allocated
+at epoch level so the requested real:synthetic exposure is reproducible and
+measurable. Every synthetic image comes from the same verified (city, place_id)
+and inherits the parent place label, following AdaptVPR-style hard-positive
+augmentation.
 """
 from __future__ import annotations
 
@@ -41,7 +41,9 @@ def _gsv_name(row, place_id):
     return f"{city}_{pid}_{year}_{month}_{north}_{row['lat']}_{row['lon']}_{pano}.jpg"
 
 
-def load_synthetic_manifest(path: Path):
+def load_synthetic_manifest(path: Path | None):
+    if path is None:
+        return {}
     by_place = {}
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         if not line.strip():
@@ -61,7 +63,7 @@ class MixedGSVCitiesDataset(Dataset):
     def __init__(
         self,
         gsv_root: Path,
-        synthetic_manifest: Path,
+        synthetic_manifest: Path | None,
         cities,
         img_per_place=4,
         min_img_per_place=4,
@@ -78,6 +80,8 @@ class MixedGSVCitiesDataset(Dataset):
             raise ValueError("invalid real_to_synth ratio")
         if self.k < 1 or self.k > self.min_k:
             raise ValueError("img_per_place must be in [1, min_img_per_place]")
+        if self.synth_ratio > 0 and synthetic_manifest is None:
+            raise ValueError("synthetic_manifest is required when synthetic_ratio > 0")
 
         self.synthetic = load_synthetic_manifest(synthetic_manifest)
         self.transform = build_transform(image_size)
@@ -105,23 +109,34 @@ class MixedGSVCitiesDataset(Dataset):
         target_synth = round(
             total_slots * self.synth_ratio / (self.real_ratio + self.synth_ratio)
         )
-        eligible = [key for key in self.keys if self.synthetic.get(key)]
-        capacity = len(eligible) * self.k
-        planned_synth = min(target_synth, capacity)
+        capacities = {
+            key: min(self.k, len(self.synthetic.get(key, [])))
+            for key in self.keys
+        }
+        eligible = [key for key, capacity in capacities.items() if capacity > 0]
+        total_capacity = sum(capacities.values())
+        planned_synth = min(target_synth, total_capacity)
 
         quota = {key: 0 for key in self.keys}
         if planned_synth and eligible:
             rng = random.Random(self.seed * 1_000_003 + self.epoch * 10_000_019)
             order = list(eligible)
             rng.shuffle(order)
-            full, remainder = divmod(planned_synth, len(order))
-            full = min(full, self.k)
-            for key in order:
-                quota[key] = full
-            left = planned_synth - full * len(order)
-            if full < self.k:
-                for key in order[:left]:
-                    quota[key] += 1
+            remaining = planned_synth
+            # Deterministic round-robin allocation up to each place's *unique*
+            # synthetic capacity. This prevents reusing the same generated image
+            # twice inside one K-image place sample just to hit a nominal ratio.
+            while remaining > 0:
+                progressed = False
+                for key in order:
+                    if remaining <= 0:
+                        break
+                    if quota[key] < capacities[key]:
+                        quota[key] += 1
+                        remaining -= 1
+                        progressed = True
+                if not progressed:
+                    break
 
         actual_synth = sum(quota.values())
         self._synthetic_quota = quota
@@ -131,6 +146,7 @@ class MixedGSVCitiesDataset(Dataset):
             "eligible_places": len(eligible),
             "slots_per_place": self.k,
             "total_slots": total_slots,
+            "synthetic_capacity_slots": total_capacity,
             "target_synthetic_slots": target_synth,
             "planned_synthetic_slots": actual_synth,
             "planned_real_slots": total_slots - actual_synth,
@@ -163,13 +179,19 @@ class MixedGSVCitiesDataset(Dataset):
             for row in selected
         ]
 
-        synth_pool = self.synthetic.get(key, [])
-        synth_slots = min(self._synthetic_quota.get(key, 0), self.k, len(paths))
+        synth_pool = list(self.synthetic.get(key, []))
+        synth_slots = min(
+            self._synthetic_quota.get(key, 0),
+            self.k,
+            len(paths),
+            len(synth_pool),
+        )
         if synth_slots:
             slot_ids = list(range(self.k))
             rng.shuffle(slot_ids)
-            for slot in slot_ids[:synth_slots]:
-                paths[slot] = synth_pool[rng.randrange(len(synth_pool))]
+            rng.shuffle(synth_pool)
+            for slot, synthetic_path in zip(slot_ids[:synth_slots], synth_pool[:synth_slots]):
+                paths[slot] = synthetic_path
 
         images = []
         for path in paths:
