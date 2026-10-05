@@ -15,7 +15,16 @@ def load_iclight():
 
 
 def attach_lora(unet, rank: int = 8, alpha: int = 8):
+    """Attach LoRA adapters and keep their trainable weights in fp32.
+
+    The released IC-Light UNet is loaded in fp16. If LoRA parameters are left in
+    fp16, AdamW's moment estimates/epsilon can underflow after the first update,
+    which commonly turns the adapter weights into Inf/NaN on step 1. Keeping the
+    tiny set of trainable LoRA parameters in fp32 preserves the fp16 base model
+    memory footprint while making optimizer state numerically stable.
+    """
     from peft import LoraConfig
+
     unet.requires_grad_(False)
     config = LoraConfig(
         r=rank,
@@ -28,6 +37,16 @@ def attach_lora(unet, rank: int = 8, alpha: int = 8):
     trainable = [p for p in unet.parameters() if p.requires_grad]
     if not trainable:
         raise RuntimeError("no LoRA parameters became trainable")
+
+    # Important: the base IC-Light UNet is fp16, but AdamW should update LoRA
+    # weights in fp32. PEFT casts the LoRA branch input to the adapter weight
+    # dtype internally and casts the branch output back to the base-layer dtype.
+    for p in trainable:
+        p.data = p.data.float()
+
+    bad = [str(p.dtype) for p in trainable if p.dtype != torch.float32]
+    if bad:
+        raise RuntimeError(f"LoRA parameters must be fp32 for training, found: {bad[:5]}")
     return trainable
 
 
