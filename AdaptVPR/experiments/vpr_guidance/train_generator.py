@@ -45,6 +45,29 @@ def predict_x0(scheduler, z_t, eps, timestep):
     return (z_t - beta.sqrt() * eps) / alpha.sqrt().clamp_min(1e-6)
 
 
+def _tensor_stats(name: str, x: torch.Tensor) -> str:
+    y = x.detach().float()
+    finite = torch.isfinite(y)
+    if not finite.any():
+        return f"{name}: shape={tuple(x.shape)} dtype={x.dtype} finite=0/{y.numel()}"
+    vals = y[finite]
+    return (
+        f"{name}: shape={tuple(x.shape)} dtype={x.dtype} "
+        f"finite={int(finite.sum())}/{y.numel()} "
+        f"min={float(vals.min()):.6g} max={float(vals.max()):.6g} "
+        f"mean={float(vals.mean()):.6g}"
+    )
+
+
+def _require_finite(name: str, x: torch.Tensor, *, step: int, sample_id: str, timestep: int):
+    if torch.isfinite(x).all():
+        return
+    raise FloatingPointError(
+        f"non-finite {name} at step={step} sample_id={sample_id} timestep={timestep}\n"
+        + _tensor_stats(name, x)
+    )
+
+
 def main():
     args = args_parser()
     if not torch.cuda.is_available():
@@ -63,12 +86,18 @@ def main():
     scheduler = DDIMScheduler.from_config(t2i.scheduler.config)
     scheduler.set_timesteps(25, device="cuda")
     timesteps = [int(x) for x in scheduler.timesteps[-min(args.timestep_window, 25):]]
+
+    if any(p.dtype != torch.float32 for p in trainable):
+        raise RuntimeError("trainable LoRA parameters must be fp32 before constructing AdamW")
     opt = torch.optim.AdamW(trainable, lr=args.lr)
     rng = random.Random(args.seed)
+    n_trainable = sum(p.numel() for p in trainable)
+    print(f"trainable LoRA params={n_trainable:,} dtype=float32 lr={args.lr:g}")
 
     log = (out / "train.jsonl").open("w")
     for step in range(1, args.max_steps + 1):
         row = rows[rng.randrange(len(rows))]
+        sample_id = str(row["sample_id"])
         source = Image.open(row["source_path"]).convert("RGB")
         baseline = Image.open(row["baseline_path"]).convert("RGB")
         width, height = baseline.width // 8 * 8, baseline.height // 8 * 8
@@ -83,19 +112,27 @@ def main():
         t = torch.tensor([ts], device="cuda", dtype=torch.long)
         noise = torch.randn_like(z0)
         zt = scheduler.add_noise(z0, noise, t)
+        _require_finite("z0", z0, step=step, sample_id=sample_id, timestep=ts)
+        _require_finite("zt", zt, step=step, sample_id=sample_id, timestep=ts)
 
         # Pass A: get d(VPR + keep)/d(x0) without keeping the UNet graph.
         with torch.no_grad():
             eps0 = unet(zt, t, encoder_hidden_states=text,
                         cross_attention_kwargs={"concat_conds": cond}, return_dict=False)[0]
+            _require_finite("eps0", eps0, step=step, sample_id=sample_id, timestep=ts)
             x0 = predict_x0(scheduler, zt, eps0, ts)
+            _require_finite("x0", x0, step=step, sample_id=sample_id, timestep=ts)
         x0_leaf = x0.detach().float().requires_grad_(True)
         pred_img = decode_latent_01(x0_leaf, vae)
+        _require_finite("pred_img", pred_img, step=step, sample_id=sample_id, timestep=ts)
         pred_desc = teacher(pred_img)
+        _require_finite("pred_desc", pred_desc, step=step, sample_id=sample_id, timestep=ts)
         loss_vpr = (1 - (pred_desc * src_desc).sum(-1)).mean()
         loss_keep = F.l1_loss(pred_img, base_img)
         guide = args.lambda_vpr * loss_vpr + args.lambda_keep * loss_keep
+        _require_finite("guide", guide, step=step, sample_id=sample_id, timestep=ts)
         grad_x0, = torch.autograd.grad(guide, x0_leaf)
+        _require_finite("grad_x0", grad_x0, step=step, sample_id=sample_id, timestep=ts)
         grad_x0 = grad_x0.detach()
         del x0_leaf, pred_img, pred_desc, eps0, x0, guide
 
@@ -103,23 +140,45 @@ def main():
         opt.zero_grad(set_to_none=True)
         eps = unet(zt, t, encoder_hidden_states=text,
                    cross_attention_kwargs={"concat_conds": cond}, return_dict=False)[0]
+        _require_finite("eps", eps, step=step, sample_id=sample_id, timestep=ts)
         x0_train = predict_x0(scheduler, zt, eps, ts)
+        _require_finite("x0_train", x0_train, step=step, sample_id=sample_id, timestep=ts)
         loss_diff = F.mse_loss(eps.float(), noise.float())
         loss_proxy = (x0_train.float() * grad_x0).sum()
         loss = args.lambda_diff * loss_diff + loss_proxy
-        if not torch.isfinite(loss):
-            raise FloatingPointError("non-finite generator loss")
+        _require_finite("loss_diff", loss_diff, step=step, sample_id=sample_id, timestep=ts)
+        _require_finite("loss_proxy", loss_proxy, step=step, sample_id=sample_id, timestep=ts)
+        _require_finite("loss", loss, step=step, sample_id=sample_id, timestep=ts)
+
         loss.backward()
-        grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip))
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
+        if not torch.isfinite(grad_norm):
+            raise FloatingPointError(
+                f"non-finite LoRA gradient norm at step={step} sample_id={sample_id} timestep={ts}: "
+                f"grad_norm={float(grad_norm)}"
+            )
         opt.step()
+
+        # Catch optimizer-state/parameter corruption immediately instead of one step later.
+        for i, p in enumerate(trainable):
+            if not torch.isfinite(p).all():
+                raise FloatingPointError(
+                    f"AdamW produced non-finite LoRA parameter after step={step}: param_index={i} "
+                    f"dtype={p.dtype} lr={args.lr:g}"
+                )
 
         rec = {"step": step, "sample_id": row["sample_id"], "condition": row["condition"],
                "timestep": ts, "loss_diff": float(loss_diff.detach()),
                "loss_vpr": float(loss_vpr.detach()), "salad_cosine": float(1-loss_vpr.detach()),
-               "loss_keep": float(loss_keep.detach()), "grad_norm": grad_norm}
+               "loss_keep": float(loss_keep.detach()), "loss_proxy": float(loss_proxy.detach()),
+               "grad_norm": float(grad_norm)}
         log.write(json.dumps(rec) + "\n"); log.flush()
         if step == 1 or step % 10 == 0:
-            print(f"step={step} diff={rec['loss_diff']:.4f} cos={rec['salad_cosine']:.4f} keep={rec['loss_keep']:.4f}")
+            print(
+                f"step={step} diff={rec['loss_diff']:.4f} cos={rec['salad_cosine']:.4f} "
+                f"keep={rec['loss_keep']:.4f} proxy={rec['loss_proxy']:.4g} "
+                f"grad={rec['grad_norm']:.4g}"
+            )
         if step % args.save_every == 0 or step == args.max_steps:
             save_lora(unet, out / "checkpoints" / f"step_{step:06d}.pt",
                       rank=args.rank, alpha=args.alpha, extra={"step": step})
