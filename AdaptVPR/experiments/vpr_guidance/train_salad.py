@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from .data import require_empty_output
 from .mixed_salad import MixedGSVCitiesDataset
+from .salad_factory import build_fresh_salad, freeze_backbone_prefix, official_vpr_class, salad_code_hashes
 
 DEFAULT_CITIES = [
     "Bangkok", "BuenosAires", "LosAngeles", "MexicoCity", "OSL", "Rome", "Barcelona", "Chicago",
@@ -202,20 +203,6 @@ def official_model_class(base_class):
     return FreshSALAD
 
 
-def freeze_backbone_prefix(model):
-    """Express official forward freezing in parameters, also safe for DDP."""
-    backbone = model.backbone
-    dino = backbone.model
-    n = backbone.num_trainable_blocks
-    if not 0 < n <= len(dino.blocks):
-        raise ValueError("invalid number of trainable DINOv2 blocks")
-    dino.requires_grad_(False)
-    for block in dino.blocks[-n:]:
-        block.requires_grad_(True)
-    if backbone.norm_layer:
-        dino.norm.requires_grad_(True)
-
-
 def validate_resume(path: Path, output_dir: Path, config: dict, devices: int):
     if devices != 1:
         raise ValueError("resume currently requires one device to restore the saved RNG state")
@@ -274,12 +261,7 @@ def main():
         p.error("image-size must be divisible by 14 with more than 64 patch tokens")
 
     salad_root = args.salad_root.resolve()
-    if not (salad_root / "vpr_model.py").is_file():
-        raise FileNotFoundError(f"official SALAD checkout not found: {salad_root}")
-    sys.path.insert(0, str(salad_root))
-    from vpr_model import VPRModel
-    if Path(sys.modules[VPRModel.__module__].__file__).resolve().parent != salad_root:
-        raise RuntimeError("another vpr_model module shadowed the requested SALAD checkout")
+    VPRModel = official_vpr_class(salad_root)
 
     out = args.output_dir.resolve()
     rank_zero = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))) == 0
@@ -296,19 +278,9 @@ def main():
     if len(dataset) < 2:
         raise ValueError("metric training requires at least two distinct GSV places")
     dm = MixedDataModule(dataset, args.batch_size, args.workers, args.shuffle_all)
-    from .teacher import salad_hub_refs, model_sha256
-    with salad_hub_refs():
-        model = official_model_class(VPRModel)(
-            backbone_arch="dinov2_vitb14",
-            backbone_config={"num_trainable_blocks": 4, "return_token": True, "norm_layer": True},
-            agg_arch="SALAD",
-            agg_config={"num_channels": 768, "num_clusters": 64, "cluster_dim": 128, "token_dim": 256},
-            lr=6e-5, optimizer="adamw", weight_decay=9.5e-9,
-            lr_sched="linear",
-            lr_sched_args={"start_factor": 1.0, "end_factor": 0.2, "total_iters": args.max_steps},
-            loss_name="MultiSimilarityLoss", miner_name="MultiSimilarityMiner", miner_margin=0.1,
-        )
-    freeze_backbone_prefix(model)
+    from .teacher import model_sha256
+    model = build_fresh_salad(salad_root, model_class=official_model_class(VPRModel),
+                              max_steps=args.max_steps, train_backbone_blocks=4)
     initialization_sha256 = model_sha256(model)
     config = {
         "shared_mix_plan_sha256": hashlib.sha256(args.shared_mix_plan.read_bytes()).hexdigest() if args.shared_mix_plan else None,
@@ -316,11 +288,7 @@ def main():
         "initialization_policy": "pretrained_dinov2_random_salad_no_teacher_weights",
         "experiment_kind": "real_only" if args.synthetic_ratio == 0 else "real_plus_synthetic",
         "gsv_root": str(args.gsv_root.resolve()), "salad_root": str(salad_root),
-        "salad_code_sha256": {
-            name: hashlib.sha256((salad_root / name).read_bytes()).hexdigest()
-            for name in ("vpr_model.py", "models/backbones/dinov2.py",
-                         "models/aggregators/salad.py", "utils/losses.py")
-        },
+        "salad_code_sha256": salad_code_hashes(salad_root),
         "gsv_dataframe_sha256": {
             city: hashlib.sha256((args.gsv_root / "Dataframes" / f"{city}.csv").read_bytes()).hexdigest()
             for city in args.cities

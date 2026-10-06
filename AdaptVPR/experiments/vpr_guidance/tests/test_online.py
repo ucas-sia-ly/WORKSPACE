@@ -35,7 +35,7 @@ class OnlineTests(unittest.TestCase):
         self.assertEqual(first, list(balanced_chunks(rows, 16, 42, 0)))
         self.assertNotEqual(first, list(balanced_chunks(rows, 16, 42, 1)))
 
-    def test_replay_half_current_and_strict_acceptance(self):
+    def test_legacy_single_row_sampler_and_strict_acceptance(self):
         current = [{"sample_id": "new", "passed": True, "eligible_for_training": True}]
         old = [{"sample_id": "old", "passed": True, "eligible_for_training": True}]
         rng = random.Random(42)
@@ -109,16 +109,18 @@ class OnlineOrchestrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            from AdaptVPR.experiments.vpr_guidance.tests.test_data_pipeline import make_mixed_fixture
+            from AdaptVPR.experiments.vpr_guidance.tests.test_bilevel import meta_args
+            gsv_root, _, fixture_rows = make_mixed_fixture(tmp, places=4)
             rows = []
-            for i in range(3):
-                source = root / f"s{i}.png"
-                Image.new("RGB", (8, 8), (i * 40, 10, 20)).save(source)
+            for i in range(4):
+                source = Path(fixture_rows[i]['source_path'])
                 descriptor = root / f"s{i}.pt"
                 torch.save(torch.ones(1, 1), descriptor)
                 rows.append({"sample_id": f"s{i}", "source_path": str(source),
                              "source_sha256": file_sha256(source), "source_descriptor": str(descriptor),
                              "route": "global", "condition": "snow", "prompt": "snow", "negative_prompt": "negative",
-                             "city": "Test", "place_id": str(i), "teacher_sha256": "fixed",
+                             "city": "Bangkok", "place_id": str(i + 1), "teacher_sha256": "fixed",
                              "preprocessing_version": PREPROCESSING_VERSION,
                              "sampling_policy": online.sampling_policy("snow")})
             manifest = root / "source_manifest.jsonl"
@@ -148,29 +150,40 @@ class OnlineOrchestrationTests(unittest.TestCase):
                 traces.append(float(sum(value.sum() for value in lora_state_dict(pipe.unet).values())))
                 return Image.new("RGB", (8, 8), (20, 40, 60))
             fail = [False]
-            def update(row, *, step, unet, rng, **kwargs):
+            def update(episode, *, step, unet, rng, **kwargs):
+                episode.validate()
+                row = episode.places[0].synthetic_row
                 if fail[0] and step == 2:
                     raise RuntimeError("simulated interrupted round")
                 increment = rng.random() + float(torch.rand(()))
                 with torch.no_grad():
                     next(p for p in unet.parameters() if p.requires_grad).add_(increment)
-                return {"step": step, "condition": row["condition"], "sample_id": row["sample_id"],
-                        "loss_diff": 1., "loss_vpr": .1, "loss_keep": .1, "loss_total": 1.1,
-                        "salad_cosine": .9, "grad_norm": 1., "guidance_x0_grad_norm": 1., "timestep": 1}
-            def run(out, resume=None):
-                args = SimpleNamespace(prompts=manifest, gsv_root=root, salad_root=root,
+                return {"step": step, "sample_ids": [p.synthetic_row["sample_id"] for p in episode.places],
+                        "generator/loss_diff": 1., "generator/loss_meta": .1,
+                        "generator/loss_keep": .1, "generator/loss_total": 1.1,
+                        "generator/lora_grad_norm": 1., "generator/meta_only_lora_grad_norm": 1.,
+                        "generator/timestep": 1}
+            def run(out, resume=None, meta_places=2):
+                args = SimpleNamespace(prompts=manifest, gsv_root=gsv_root, salad_root=root,
                                        output_dir=out, source_manifest=manifest, conditions=["snow"],
                                        generation_passes=1, chunk_size=2, train_steps_per_chunk=1,
                                        replay_rounds=2, rank=8, alpha=8, timestep_window=10, seed=42,
-                                       lr=1e-4, lambda_diff=1., lambda_vpr=.1, lambda_keep=.05,
+                                       lr=1e-4, lambda_diff=1., lambda_keep=.05,
                                        grad_clip=1., tensorboard_dir=None, disable_tensorboard=True, resume=resume)
+                for name, value in vars(meta_args()).items():
+                    if name.startswith('meta_') or name in ('lambda_meta', 'lambda_vpr', 'generator_grad_scale'):
+                        setattr(args, name, value)
+                args.meta_places = meta_places
                 parser = argparse.ArgumentParser()
                 parser.parse_args = lambda: args
                 with ExitStack() as stack:
                     for target, replacement in [("args_parser", lambda: parser), ("load_iclight", pipeline),
                                                 ("load_salad", lambda **kw: Teacher()),
                                                 ("DualTraitEvaluator", lambda: verifier),
-                                                ("generate_released", generate), ("train_accepted_step", update)]:
+                                                ("generate_released", generate), ("train_bilevel_step", update),
+                                                ("build_fresh_salad", lambda *a, **kw: nn.Identity()),
+                                                ("meta_identity", lambda *a: {'salad_initialization_sha256': 'fresh',
+                                                                              'meta_trainable_names': []})]:
                         stack.enter_context(patch.object(online, target, replacement))
                     stack.enter_context(patch.object(online.DDIMScheduler, "from_config", return_value=Scheduler()))
                     stack.enter_context(patch.object(torch.cuda, "is_available", return_value=True))
@@ -180,7 +193,7 @@ class OnlineOrchestrationTests(unittest.TestCase):
                     online.main()
             complete = root / "complete"
             run(complete)
-            self.assertEqual(len(traces), 3)
+            self.assertEqual(len(traces), 4)
             self.assertEqual(traces[0], traces[1])
             self.assertNotEqual(traces[1], traces[2])
             reference = torch.load(complete / "final_lora.pt", weights_only=True)
@@ -200,3 +213,20 @@ class OnlineOrchestrationTests(unittest.TestCase):
             self.assertEqual(recovered["extra"]["global_step"], 2)
             with self.assertRaises(FileExistsError):
                 run(interrupted, checkpoint)
+            skipped = root / 'skipped'
+            # First chunk has two places: default four-place episode is invalid.
+            # Replay supplies the other two places for the second chunk.
+            run(skipped, meta_places=4)
+            stats = [json.loads(line) for line in (skipped / 'round_metrics.jsonl').read_text().splitlines()]
+            self.assertEqual([r['updates'] for r in stats], [0, 1])
+            self.assertEqual([r['skipped_meta_updates'] for r in stats], [1, 0])
+            self.assertTrue(stats[0]['meta_skip_reasons'])
+            # All-rejected current pools cannot update even with replay available.
+            verifier.evaluate = lambda *a, **kw: EvalResult(s_geo=.1, s_div=.2, passed=False)
+            rejected = root / 'rejected'
+            with self.assertRaisesRegex(RuntimeError, 'no verified samples were trained'):
+                run(rejected)
+            stats = [json.loads(line) for line in (rejected / 'round_metrics.jsonl').read_text().splitlines()]
+            self.assertEqual([r['updates'] for r in stats], [0, 0])
+            self.assertEqual([r['skipped_meta_updates'] for r in stats], [1, 1])
+            self.assertFalse((rejected / 'final_lora.pt').exists())

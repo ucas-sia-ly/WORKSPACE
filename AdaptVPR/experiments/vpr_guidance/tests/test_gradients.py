@@ -188,7 +188,7 @@ class GradientTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "epsilon"):
             predict_x0(scheduler, original, noise, 1)
 
-    def test_two_pass_matches_full_backward_and_vpr_reaches_lora(self):
+    def test_legacy_two_pass_utility_matches_full_backward(self):
         unet = tiny_unet()
         trainable = attach_lora(unet, rank=2, alpha=2)
         unet.enable_gradient_checkpointing()
@@ -263,15 +263,18 @@ class GradientTests(unittest.TestCase):
 
     def test_invalid_training_windows_and_zero_loss_are_rejected(self):
         arguments = dict(max_steps=1, rank=2, alpha=2, timestep_window=10, save_every=1,
-                         lr=1e-4, grad_clip=1, lambda_diff=1, lambda_vpr=0.1, lambda_keep=0.05)
+                         lr=1e-4, grad_clip=1, lambda_diff=1, lambda_meta=1., lambda_vpr=None, lambda_keep=0.05,
+                         meta_inner_lr=1e-3, meta_inner_steps=1, meta_places=4,
+                         meta_support_real_per_place=1, meta_query_real_per_place=2,
+                         meta_image_size=224, meta_train_backbone_blocks=0, generator_grad_scale=65536.)
         validate_args(SimpleNamespace(**arguments))
         for name, value in (("timestep_window", 0), ("timestep_window", 26),
-                            ("save_every", 0), ("max_steps", 0), ("lambda_vpr", -1)):
+                            ("save_every", 0), ("max_steps", 0), ("lambda_meta", -1)):
             with self.assertRaises(ValueError):
                 validate_args(SimpleNamespace(**{**arguments, name: value}))
         with self.assertRaises(ValueError):
             validate_args(SimpleNamespace(**{**arguments, "lambda_diff": 0,
-                                              "lambda_vpr": 0, "lambda_keep": 0}))
+                                              "lambda_meta": 0, "lambda_keep": 0}))
 
     def test_resume_restores_lora_optimizer_and_both_sampling_rngs(self):
         unet = tiny_unet()

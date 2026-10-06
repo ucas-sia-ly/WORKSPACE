@@ -1,4 +1,6 @@
-"""Frozen SALAD teacher used only to supervise the domain generator."""
+"""Frozen pretrained SALAD for cache compatibility, diagnostics and evaluation.
+
+Formal bilevel generator training never optimizes teacher descriptor cosine."""
 from __future__ import annotations
 
 import hashlib

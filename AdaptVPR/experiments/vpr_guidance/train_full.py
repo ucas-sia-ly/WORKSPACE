@@ -14,6 +14,7 @@ import time
 
 from .data import atomic_json, require_empty_output
 from .teacher import file_sha256
+from .salad_factory import add_meta_args, validate_meta_args, META_FIELDS, OBJECTIVE_VERSION
 
 PREFIX = "AdaptVPR.experiments.vpr_guidance."
 
@@ -31,12 +32,26 @@ def args_parser():
                           ("salad-image-size", 224), ("seed", 42)):
         p.add_argument("--" + name, type=int, default=default)
     for name, default in (("generator-lr", 1e-4), ("lambda-diff", 1.),
-                          ("lambda-vpr", .1), ("lambda-keep", .05)):
+                          ("lambda-keep", .05)):
         p.add_argument("--" + name, type=float, default=default)
+    add_meta_args(p)
     p.add_argument("--cities", nargs="+", help="same GSV cities for all three fresh SALAD runs")
     p.add_argument("--tensorboard-dir", type=Path)
     p.add_argument("--resume", action="store_true", help="resume stages and the last completed generator round")
     return p
+
+
+def generator_training_flags(args):
+    flags = []
+    mapping = {"generation_passes": "generation-passes", "chunk_size": "chunk-size",
+               "generator_steps_per_chunk": "train-steps-per-chunk", "replay_rounds": "replay-rounds",
+               "lora_rank": "rank", "lora_alpha": "alpha", "generator_lr": "lr",
+               "lambda_diff": "lambda-diff", "lambda_keep": "lambda-keep",
+               "timestep_window": "timestep-window"}
+    mapping.update({name: name.replace("_", "-") for name in META_FIELDS})
+    for key, flag in mapping.items():
+        flags += ["--" + flag, getattr(args, key)]
+    return flags
 
 
 def make_shared_mix_plan(args, out):
@@ -84,6 +99,7 @@ def make_shared_mix_plan(args, out):
 
 def main():
     args = args_parser().parse_args()
+    validate_meta_args(args)
     out = args.output_dir.resolve()
     if not args.resume:
         require_empty_output(out)
@@ -96,10 +112,15 @@ def main():
     tb = (args.tensorboard_dir or out / "tensorboard").resolve()
     config = {k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items()
               if k != "resume"}
+    config["objective_version"] = OBJECTIVE_VERSION
     config["prompts_sha256"] = file_sha256(args.prompts)
     config_path = out / "config.json"
-    if config_path.exists() and json.loads(config_path.read_text()) != config:
-        raise ValueError("full pipeline resume settings changed")
+    if config_path.exists():
+        previous = json.loads(config_path.read_text())
+        if previous.get("objective_version") != OBJECTIVE_VERSION:
+            raise ValueError("old frozen-teacher full run cannot resume as bilevel_salad_v1; start a new run")
+        if previous != config:
+            raise ValueError("full pipeline resume settings changed")
     atomic_json(config_path, config)
     state_path = out / "pipeline_state.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
@@ -123,18 +144,14 @@ def main():
     run("prepare", "prepare_data", [*shared, "--output-dir", out / "generator"], [source_manifest])
     generator = [*shared, "--output-dir", out / "generator", "--source-manifest", source_manifest,
                  "--tensorboard-dir", tb / "generator", "--seed", args.seed]
-    mapping = {"generation_passes": "generation-passes", "chunk_size": "chunk-size",
-               "generator_steps_per_chunk": "train-steps-per-chunk", "replay_rounds": "replay-rounds",
-               "lora_rank": "rank", "lora_alpha": "alpha", "generator_lr": "lr",
-               "lambda_diff": "lambda-diff", "lambda_vpr": "lambda-vpr", "lambda_keep": "lambda-keep",
-               "timestep_window": "timestep-window"}
-    for key, flag in mapping.items():
-        generator += ["--" + flag, getattr(args, key)]
+    generator += generator_training_flags(args)
     final = out / "generator/final_lora.pt"
     if "generator" not in state and final.exists():
         # Finalization may have committed before the orchestrator journal flushed.
         import torch
         payload = torch.load(final, map_location="cpu", weights_only=True)
+        from .train_online_generator import validate_bilevel_checkpoint
+        validate_bilevel_checkpoint(payload)
         if not payload.get("extra", {}).get("frozen"):
             raise ValueError("existing final LoRA is not a frozen online artifact")
         state["generator"] = {"artifacts": {str(final): file_sha256(final)}}

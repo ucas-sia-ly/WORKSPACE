@@ -20,7 +20,10 @@ from .iclight import (attach_lora, generate_released, load_iclight, load_lora,
                       sampling_policy, save_lora)
 from .prepare_data import prepare_sources
 from .teacher import file_sha256, load_salad, PREPROCESSING_VERSION, pil_tensor
-from .train_generator import train_accepted_step, report_trainable_parameters
+from .train_generator import train_bilevel_step, report_trainable_parameters
+from .bilevel import GSVRealIndex, construct_episode, EpisodeUnavailable
+from .salad_factory import (add_meta_args, validate_meta_args, build_fresh_salad,
+                            meta_identity, OBJECTIVE_VERSION)
 
 
 def args_parser():
@@ -33,9 +36,10 @@ def args_parser():
                         ("train-steps-per-chunk", 256), ("replay-rounds", 2),
                         ("rank", 8), ("alpha", 8), ("timestep-window", 10), ("seed", 42)):
         p.add_argument("--" + name, type=int, default=value)
-    for name, value in (("lr", 1e-4), ("lambda-diff", 1.), ("lambda-vpr", .1),
+    for name, value in (("lr", 1e-4), ("lambda-diff", 1.),
                         ("lambda-keep", .05), ("grad-clip", 1.)):
         p.add_argument("--" + name, type=float, default=value)
+    add_meta_args(p)
     p.add_argument("--tensorboard-dir", type=Path)
     p.add_argument("--disable-tensorboard", action="store_true")
     p.add_argument("--resume", type=Path, help="completed-round checkpoint only")
@@ -77,12 +81,9 @@ def sample_training_entry(current, replay, rng):
 
 
 def write_step(writer, record, lr):
-    tags = {"loss_diff": "loss_diff", "loss_vpr": "loss_vpr", "loss_keep": "loss_keep",
-            "loss_total": "loss_total", "salad_cosine": "salad_cosine",
-            "lora_grad_norm": "grad_norm", "x0_guidance_grad_norm": "guidance_x0_grad_norm",
-            "timestep": "timestep"}
-    for tag, key in tags.items():
-        writer.add_scalar("generator/" + tag, record[key], record["step"])
+    for tag, value in record.items():
+        if tag.startswith(("meta/", "generator/", "diagnostic/")) and isinstance(value, (int, float)):
+            writer.add_scalar(tag, value, record["step"])
     writer.add_scalar("generator/lr", lr, record["step"])
 
 
@@ -104,7 +105,7 @@ def summarize_round(records, generation_pass, round_id, index):
 
 def write_round(writer, stats):
     for key in ("pass_rate", "accepted_count", "rejected_count", "mean_s_geo",
-                "mean_s_div", "mean_salad_preservation_cosine"):
+                "mean_s_div", "mean_salad_preservation_cosine", "updates", "skipped_meta_updates"):
         writer.add_scalar("round/" + key, stats[key], stats["round_index"])
     for condition, metrics in stats["conditions"].items():
         for key in ("pass_rate", "mean_s_geo", "mean_s_div"):
@@ -132,8 +133,18 @@ def recover_journal(path, key, boundary):
         path.write_text("\n".join(kept) + ("\n" if kept else ""))
 
 
+def validate_bilevel_checkpoint(payload):
+    version = payload.get("extra", {}).get("config", {}).get("objective_version")
+    if version != OBJECTIVE_VERSION:
+        raise ValueError(f"cannot resume old frozen-teacher/different objective checkpoint ({version!r}); "
+                         f"expected {OBJECTIVE_VERSION}; start a new run")
+
+
 def main():
     args = args_parser().parse_args()
+    validate_meta_args(args)
+    if args.resume:
+        validate_bilevel_checkpoint(torch.load(args.resume, map_location="cpu", weights_only=True))
     for name in ("generation_passes", "chunk_size", "train_steps_per_chunk", "rank", "alpha", "timestep_window"):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name} must be positive")
@@ -141,9 +152,9 @@ def main():
         raise ValueError("replay_rounds >= 0 and timestep_window <= 25 required")
     if args.lr <= 0 or args.grad_clip <= 0 or not all(
             torch.isfinite(torch.tensor(v)) and v >= 0 for v in
-            (args.lr, args.grad_clip, args.lambda_diff, args.lambda_vpr, args.lambda_keep)):
+            (args.lr, args.grad_clip, args.lambda_diff, args.lambda_meta, args.lambda_keep)):
         raise ValueError("invalid optimizer/loss weights")
-    if not any((args.lambda_diff, args.lambda_vpr, args.lambda_keep)):
+    if not any((args.lambda_diff, args.lambda_meta, args.lambda_keep)):
         raise ValueError("at least one loss weight must be positive")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for full IC-Light online training")
@@ -166,9 +177,20 @@ def main():
         (out / "source_manifest.jsonl").write_bytes(Path(manifest).read_bytes())
     schedule = [(p, r, chunk) for p in range(args.generation_passes)
                 for r, chunk in enumerate(balanced_chunks(rows, args.chunk_size, args.seed, p))]
+    real_index = GSVRealIndex(args.gsv_root, cities=sorted({r["city"] for r in rows}))
+    # Validate every manifest label before any accepted pool can train.
+    for row in rows:
+        real_index.key_for_row(row)
+    meta_salad = build_fresh_salad(args.salad_root, meta=True, seed=args.seed, device="cuda",
+                                   train_backbone_blocks=args.meta_train_backbone_blocks)
+    identity = meta_identity(meta_salad, args.salad_root)
+    print("inner-loop trainable parameter names:\n" + "\n".join(identity["meta_trainable_names"]))
     config = {k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items()
               if k not in {"resume", "tensorboard_dir", "disable_tensorboard", "source_manifest"}}
-    config.update(source_manifest_sha256=file_sha256(out / "source_manifest.jsonl"),
+    config.update(objective_version=OBJECTIVE_VERSION, **identity,
+                  gsv_dataframe_sha256={city: file_sha256(args.gsv_root / "Dataframes" / f"{city}.csv")
+                                        for city in real_index.cities},
+                  source_manifest_sha256=file_sha256(out / "source_manifest.jsonl"),
                   teacher_sha256=teacher.model_fingerprint, preprocessing_version=PREPROCESSING_VERSION)
     if (out / "config.json").exists() and json.loads((out / "config.json").read_text()) != config:
         raise ValueError("resume config differs from original run")
@@ -192,6 +214,7 @@ def main():
     start, step = 0, 0
     ordering = [[row["sample_id"] for row in chunk] for _, _, chunk in schedule]
     if payload:
+        validate_bilevel_checkpoint(payload)
         saved = payload.get("extra", {})
         if saved.get("boundary") != "completed_round":
             raise ValueError("mid-round/incomplete checkpoints cannot resume online training")
@@ -293,29 +316,43 @@ def main():
                                         f"div={result.s_div:.3f} cosine={cosine:.3f} passed={passed}", index)
                     print(f"pass={generation_pass} round={round_id} generated {row['sample_id']} accepted={passed}", flush=True)
             stats = summarize_round(records, generation_pass, round_id, index)
-            stats["updates"] = args.train_steps_per_chunk if accepted else 0
+            stats["updates"] = 0
+            stats["skipped_meta_updates"] = 0
+            stats["meta_skip_reasons"] = {}
             stats["global_step_before"] = step
-            if writer:
-                write_round(writer, stats)
-            # No current anchors means no updates, even when replay exists.
             unet.train()
-            for _ in range(stats["updates"]):
-                row = sample_training_entry(accepted, replay, rng)
+            for _ in range(args.train_steps_per_chunk):
+                try:
+                    episode = construct_episode(accepted, replay, real_index, rng,
+                        places=args.meta_places, support_real_per_place=args.meta_support_real_per_place,
+                        query_real_per_place=args.meta_query_real_per_place)
+                except EpisodeUnavailable as exc:
+                    # The eligible pool stays unchanged during this round.
+                    remaining = args.train_steps_per_chunk - stats["updates"]
+                    stats["skipped_meta_updates"] += remaining
+                    stats["meta_skip_reasons"][str(exc)] = remaining
+                    print(f"round={index} skipped {remaining} meta updates: {exc}", flush=True)
+                    break
+                rec = train_bilevel_step(episode, step=step + 1, args=args, t2i=t2i, vae=vae,
+                    unet=unet, meta_salad=meta_salad, scheduler=scheduler, timesteps=timesteps,
+                    opt=opt, trainable=trainable, rng=rng, teacher=teacher,
+                    source_descriptors=descriptors)
                 step += 1
-                rec = train_accepted_step(row, step=step, args=args, t2i=t2i, vae=vae,
-                                         unet=unet, teacher=teacher, scheduler=scheduler,
-                                         timesteps=timesteps, opt=opt, trainable=trainable, rng=rng,
-                                         source_descriptor=descriptors[row["sample_id"]].to(teacher.device))
+                stats["updates"] += 1
                 rec.update(generation_pass=generation_pass, round=round_id,
-                           target_round=row["round"], target_pass=row["generation_pass"])
-                log.write(json.dumps(rec) + "\n")
+                           target_rounds=[p.synthetic_row["round"] for p in episode.places],
+                           target_passes=[p.synthetic_row["generation_pass"] for p in episode.places])
+                log.write(json.dumps(rec, allow_nan=False) + "\n")
                 log.flush()
                 if writer:
                     write_step(writer, rec, opt.param_groups[0]["lr"])
                 if step % 10 == 0:
-                    print(f"step={step} loss={rec['loss_total']:.4f} cosine={rec['salad_cosine']:.4f}", flush=True)
+                    print(f"step={step} meta={rec['generator/loss_meta']:.4f} "
+                          f"meta_grad={rec['generator/meta_only_lora_grad_norm']:.6g}", flush=True)
             replay.append(accepted)
             stats["global_step_after"] = step
+            if writer:
+                write_round(writer, stats)
             round_log.write(json.dumps(stats) + "\n")
             round_log.flush()
             if writer:

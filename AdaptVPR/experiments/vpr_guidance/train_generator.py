@@ -1,6 +1,7 @@
 """Legacy offline entry point; use train_online_generator or train_full.
 
-The train_accepted_step helper is shared by the formal online trainer.
+The formal online trainer uses train_bilevel_step. Teacher-VJP utilities below
+are isolated legacy regression helpers only.
 """
 from __future__ import annotations
 
@@ -18,6 +19,9 @@ from .iclight import (attach_lora, conditioning_source, decode_latent_01, encode
                       encode_prompt, image_tensor_01, load_iclight, load_lora,
                       sampling_policy, save_lora)
 from .teacher import file_sha256, load_salad
+from .salad_factory import (add_meta_args, validate_meta_args, preprocess_tensor,
+                            load_real_images, OBJECTIVE_VERSION, META_FIELDS)
+from .bilevel import bilevel_objective
 
 
 def args_parser():
@@ -29,7 +33,7 @@ def args_parser():
     p.add_argument("--rank", type=int, default=8)
     p.add_argument("--alpha", type=int, default=8)
     p.add_argument("--lambda-diff", type=float, default=1.0)
-    p.add_argument("--lambda-vpr", type=float, default=0.1)
+    add_meta_args(p)
     p.add_argument("--lambda-keep", type=float, default=0.05)
     p.add_argument("--timestep-window", type=int, default=10)
     p.add_argument("--grad-clip", type=float, default=1.0)
@@ -52,7 +56,8 @@ def validate_args(args):
         value = getattr(args, name)
         if not torch.isfinite(torch.tensor(value)) or value <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and positive")
-    weights = (args.lambda_diff, args.lambda_vpr, args.lambda_keep)
+    validate_meta_args(args)
+    weights = (args.lambda_diff, args.lambda_meta, args.lambda_keep)
     if not all(torch.isfinite(torch.tensor(x)) and x >= 0 for x in weights) or not any(weights):
         raise ValueError("loss weights must be finite, nonnegative, and at least one must be positive")
 
@@ -127,11 +132,12 @@ def report_trainable_parameters(unet, trainable, frozen_models):
 
 def _run_config(args, teacher):
     return {
+        "objective_version": OBJECTIVE_VERSION,
         "manifest_sha256": file_sha256(args.manifest),
         "teacher_sha256": teacher.model_fingerprint,
         **{name: getattr(args, name) for name in
-           ("rank", "alpha", "lr", "lambda_diff", "lambda_vpr", "lambda_keep",
-            "timestep_window", "grad_clip", "seed")},
+           ("rank", "alpha", "lr", "lambda_diff", "lambda_keep",
+            "timestep_window", "grad_clip", "seed", *META_FIELDS)},
     }
 
 
@@ -262,7 +268,7 @@ def _require_finite(name: str, x: torch.Tensor, *, step: int, sample_id: str, ti
 
 def train_accepted_step(row, *, step, args, t2i, vae, unet, teacher, scheduler,
                         timesteps, opt, trainable, rng, source_descriptor=None):
-    """Two-pass first-order update on a verified current/recent-round target."""
+    """LEGACY teacher-only utility; never called by formal online training."""
     if row.get("passed") is not True or row.get("eligible_for_training") is not True:
         raise ValueError("rejected candidates cannot be used by any generator loss")
     sample_id = str(row["sample_id"])
@@ -354,6 +360,138 @@ def main():
         "The offline fixed-baseline trainer is deprecated. Use "
         "python -m AdaptVPR.experiments.vpr_guidance.train_online_generator or train_full. "
         "Old baseline targets must not enter the online training loop.")
+
+
+def assert_lora_optimizer(unet, optimizer, trainable):
+    expected = {id(p) for n, p in unet.named_parameters() if p.requires_grad and "lora_" in n}
+    actual = [p for group in optimizer.param_groups for p in group["params"]]
+    if (not expected or expected != {id(p) for p in trainable}
+            or expected != {id(p) for p in actual} or len(actual) != len(expected)
+            or any(p.requires_grad and "lora_" not in n for n, p in unet.named_parameters())):
+        raise RuntimeError("generator optimizer must contain ONLY all trainable IC-Light LoRA parameters")
+
+
+def differentiable_accepted_prediction(row, *, step, t2i, vae, unet, scheduler, timesteps, rng):
+    """One noisy accepted-target UNet prediction; RGB never leaves autograd."""
+    if (row.get("passed") is not True or row.get("eligible_for_training") is not True
+            or row.get("route") != "global"):
+        raise ValueError("rejected/non-Global candidates cannot be used by any generator loss")
+    if file_sha256(row["generated_path"]) != row["generated_sha256"]:
+        raise ValueError("verified generated target content changed")
+    if file_sha256(row["source_path"]) != row["source_sha256"]:
+        raise ValueError("verified source content changed")
+    with Image.open(row["source_path"]) as image:
+        source = image.convert("RGB")
+    with Image.open(row["generated_path"]) as image:
+        target = image.convert("RGB")
+    width, height = target.width // 8 * 8, target.height // 8 * 8
+    z0 = encode_image_latent(target, vae, width, height)
+    from AdaptVPR.adapters import iclight_sd15_fc as adapter
+    with torch.no_grad():
+        cond = adapter._concat_condition(conditioning_source(source), vae, width, height)
+        text = encode_prompt(t2i, row["prompt"])
+    target_tensor = image_tensor_01(target, width, height, z0.device)
+    ts = timesteps[rng.randrange(len(timesteps))]
+    t = torch.tensor([ts], device=z0.device, dtype=torch.long)
+    noise = torch.randn_like(z0)
+    zt = scheduler.add_noise(z0, noise, t)
+    eps = unet(zt, t, encoder_hidden_states=text,
+               cross_attention_kwargs={"concat_conds": cond}, return_dict=False)[0]
+    x0 = predict_x0(scheduler, zt, eps, ts)
+    image = decode_latent_01(x0, vae)
+    for name, value in (("z0", z0), ("zt", zt), ("eps", eps), ("x0", x0), ("pred_img", image)):
+        _require_finite(name, value, step=step, sample_id=row["sample_id"], timestep=ts)
+    return image, F.mse_loss(eps.float(), noise.float()), F.l1_loss(image, target_tensor), ts
+
+
+def _gradient_norm(grads, device):
+    squares = [g.detach().float().square().sum() for g in grads if g is not None]
+    return torch.stack(squares).sum().sqrt() if squares else torch.zeros((), device=device)
+
+
+def train_bilevel_step(episode, *, step, args, t2i, vae, unet, meta_salad, scheduler,
+                       timesteps, opt, trainable, rng, teacher=None, source_descriptors=None):
+    """Actual LoRA -> RGB -> inner SGD -> real-query hypergradient.
+
+    autograd.grad only requests LoRA gradients for the outer optimizer: base
+    SALAD needs requires_grad for inner adaptation but never accumulates .grad.
+    Teacher/cache inputs are OPTIONAL diagnostics, outside the objective graph.
+    """
+    episode.validate()
+    assert_lora_optimizer(unet, opt, trainable)
+    opt.zero_grad(set_to_none=True)
+    device = trainable[0].device
+    support, queries, support_labels, query_labels = [], [], [], []
+    diff, keep, timesteps_used, images = [], [], [], []
+    for place in episode.places:
+        image, loss_diff, loss_keep, ts = differentiable_accepted_prediction(
+            place.synthetic_row, step=step, t2i=t2i, vae=vae, unet=unet,
+            scheduler=scheduler, timesteps=timesteps, rng=rng)
+        support.extend([load_real_images(place.support_real, args.meta_image_size, device),
+                        preprocess_tensor(image, args.meta_image_size)])
+        support_labels.extend([place.label] * (len(place.support_real) + 1))
+        queries.append(load_real_images(place.query_real, args.meta_image_size, device))
+        query_labels.extend([place.label] * len(place.query_real))
+        diff.append(loss_diff)
+        keep.append(loss_keep)
+        timesteps_used.append(ts)
+        images.append(image)
+    result = bilevel_objective(meta_salad, torch.cat(support),
+                torch.tensor(support_labels, device=device), torch.cat(queries),
+                torch.tensor(query_labels, device=device), inner_lr=args.meta_inner_lr,
+                inner_steps=args.meta_inner_steps)
+    loss_diff, loss_keep = torch.stack(diff).mean(), torch.stack(keep).mean()
+    loss_meta = result.outer_loss
+    loss = args.lambda_meta * loss_meta + args.lambda_diff * loss_diff + args.lambda_keep * loss_keep
+    _require_finite("generator total loss", loss, step=step, sample_id="meta_episode", timestep=timesteps_used[0])
+    # Explicit META-ONLY audit so denoising cannot hide a severed hypergradient.
+    # The frozen VAE/UNet still run in fp16. Tiny second-order pixel gradients
+    # underflow there unless scaled BEFORE backward; fast SALAD arithmetic stays
+    # fp32. A power-of-two fixed scale preserves the exact mathematical gradient.
+    scale = args.generator_grad_scale
+    meta_grads = torch.autograd.grad(loss_meta * scale, trainable, retain_graph=True, allow_unused=True)
+    meta_grads = [g.float() / scale if g is not None else None for g in meta_grads]
+    if all(g is None for g in meta_grads):
+        raise RuntimeError("meta-only LoRA hypergradient is disconnected; check second-order inner update")
+    meta_norm = _gradient_norm(meta_grads, device)
+    if not torch.isfinite(meta_norm):
+        raise FloatingPointError("non-finite meta-only LoRA hypergradient")
+    del meta_grads
+    grads = torch.autograd.grad(loss * scale, trainable, allow_unused=True)
+    for parameter, grad in zip(trainable, grads):
+        parameter.grad = grad.float() / scale if grad is not None else None
+    grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
+    if not torch.isfinite(grad_norm):
+        raise FloatingPointError(f"non-finite bilevel LoRA gradient at step={step}")
+    opt.step()
+    if any(not torch.isfinite(p).all() for p in trainable):
+        raise FloatingPointError(f"optimizer produced non-finite LoRA at step={step}")
+    rec = {"step": step, "objective_version": OBJECTIVE_VERSION,
+           "sample_ids": [p.synthetic_row["sample_id"] for p in episode.places],
+           "place_keys": [list(p.key) for p in episode.places],
+           "timesteps": timesteps_used, **result.metrics,
+           "generator/loss_diff": float(loss_diff.detach()),
+           "generator/loss_keep": float(loss_keep.detach()),
+           "generator/loss_meta": float(loss_meta.detach()),
+           "generator/loss_total": float(loss.detach()),
+           "generator/lora_grad_norm": float(grad_norm),
+           "generator/meta_only_lora_grad_norm": float(meta_norm),
+           "generator/grad_scale": scale,
+           "generator/timestep": sum(timesteps_used) / len(timesteps_used)}
+    if teacher is not None:
+        with torch.no_grad():
+            cosines = []
+            for place, image in zip(episode.places, images):
+                row = place.synthetic_row
+                src = (source_descriptors[row["sample_id"]].to(teacher.device)
+                       if source_descriptors is not None else
+                       teacher.load_source_descriptor(row["source_descriptor"], row["source_path"]))
+                cosines.append((teacher(image) * src).sum(-1).mean())
+            cosine = torch.stack(cosines).mean()
+            if not torch.isfinite(cosine):
+                raise FloatingPointError("non-finite diagnostic teacher cosine")
+            rec["diagnostic/teacher_salad_cosine"] = float(cosine)
+    return rec
 
 
 if __name__ == "__main__":
