@@ -82,6 +82,7 @@ class MixedGSVCitiesDataset(Dataset):
         image_size=(224, 224),
         seed=42,
         return_mix_metadata=False,
+        shared_mix_plan=None,
     ):
         self.root = Path(gsv_root)
         self.cities = list(cities)
@@ -128,6 +129,19 @@ class MixedGSVCitiesDataset(Dataset):
         if not self.keys:
             raise ValueError("no GSV places have the requested number of real images")
         self.label_map = {key: i for i, key in enumerate(self.keys)}
+        self.shared_capacities = None
+        if shared_mix_plan is not None:
+            plan = json.loads(Path(shared_mix_plan).read_text())
+            self.shared_capacities = {(r["city"], canonical_place_id(r["place_id"])): r["capacity"]
+                                      for r in plan["capacities"]}
+            if plan["total_places"] != len(self.keys) or plan["seed"] != self.seed:
+                raise ValueError("shared B/C exposure plan does not match real places or seed")
+            if plan["requested_ratio"] != [self.real_ratio, self.synth_ratio]:
+                raise ValueError("shared B/C exposure plan ratio mismatch")
+            for key, capacity in self.shared_capacities.items():
+                if (key not in self.groups or not isinstance(capacity, int) or capacity < 0
+                        or capacity > min(self.k, len(self.synthetic.get(key, [])))):
+                    raise ValueError("shared synthetic capacity exceeds verified pool")
         self._synthetic_quota = {}
         self._mix_stats = {}
         self.set_epoch(0)
@@ -138,7 +152,8 @@ class MixedGSVCitiesDataset(Dataset):
             total_slots * self.synth_ratio / (self.real_ratio + self.synth_ratio)
         )
         capacities = {
-            key: min(self.k, len(self.synthetic.get(key, [])))
+            key: (self.shared_capacities.get(key, 0) if self.shared_capacities is not None
+                  else min(self.k, len(self.synthetic.get(key, []))))
             for key in self.keys
         }
         eligible = [key for key, capacity in capacities.items() if capacity > 0]

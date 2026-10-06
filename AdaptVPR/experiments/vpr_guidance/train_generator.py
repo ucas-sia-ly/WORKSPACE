@@ -1,4 +1,7 @@
-"""Train IC-Light LoRA with frozen SALAD feedback on Global-route data."""
+"""Legacy offline entry point; use train_online_generator or train_full.
+
+The train_accepted_step helper is shared by the formal online trainer.
+"""
 from __future__ import annotations
 
 import argparse, json, random
@@ -257,152 +260,100 @@ def _require_finite(name: str, x: torch.Tensor, *, step: int, sample_id: str, ti
     )
 
 
+def train_accepted_step(row, *, step, args, t2i, vae, unet, teacher, scheduler,
+                        timesteps, opt, trainable, rng, source_descriptor=None):
+    """Two-pass first-order update on a verified current/recent-round target."""
+    if row.get("passed") is not True or row.get("eligible_for_training") is not True:
+        raise ValueError("rejected candidates cannot be used by any generator loss")
+    sample_id = str(row["sample_id"])
+    with Image.open(row["source_path"]) as image:
+        source = image.convert("RGB")
+    with Image.open(row["generated_path"]) as image:
+        target = image.convert("RGB")
+    width, height = target.width // 8 * 8, target.height // 8 * 8
+    z0 = encode_image_latent(target, vae, width, height)
+    from AdaptVPR.adapters import iclight_sd15_fc as adapter
+    cond = adapter._concat_condition(conditioning_source(source), vae, width, height)
+    text = encode_prompt(t2i, row["prompt"])
+    src_desc = source_descriptor if source_descriptor is not None else teacher.load_source_descriptor(row["source_descriptor"], row["source_path"])
+    base_img = image_tensor_01(target, width, height, "cuda")
+
+    ts = timesteps[rng.randrange(len(timesteps))]
+    t = torch.tensor([ts], device="cuda", dtype=torch.long)
+    noise = torch.randn_like(z0)
+    zt = scheduler.add_noise(z0, noise, t)
+    _require_finite("z0", z0, step=step, sample_id=sample_id, timestep=ts)
+    _require_finite("zt", zt, step=step, sample_id=sample_id, timestep=ts)
+
+    # Pass A: get d(VPR + keep)/d(x0) without keeping the UNet graph.
+    with torch.no_grad():
+        eps0 = unet(zt, t, encoder_hidden_states=text,
+                    cross_attention_kwargs={"concat_conds": cond}, return_dict=False)[0]
+        _require_finite("eps0", eps0, step=step, sample_id=sample_id, timestep=ts)
+        x0 = predict_x0(scheduler, zt, eps0, ts)
+        _require_finite("x0", x0, step=step, sample_id=sample_id, timestep=ts)
+    x0_leaf = x0.detach().float().requires_grad_(True)
+    pred_img = decode_latent_01(x0_leaf, vae)
+    _require_finite("pred_img", pred_img, step=step, sample_id=sample_id, timestep=ts)
+    pred_desc = teacher(pred_img)
+    _require_finite("pred_desc", pred_desc, step=step, sample_id=sample_id, timestep=ts)
+    loss_vpr = (1 - (pred_desc * src_desc).sum(-1)).mean()
+    loss_keep = F.l1_loss(pred_img, base_img)
+    guide = args.lambda_vpr * loss_vpr + args.lambda_keep * loss_keep
+    _require_finite("guide", guide, step=step, sample_id=sample_id, timestep=ts)
+    grad_x0, = torch.autograd.grad(guide, x0_leaf)
+    _require_finite("grad_x0", grad_x0, step=step, sample_id=sample_id, timestep=ts)
+    grad_x0 = grad_x0.detach()
+    del x0_leaf, pred_img, pred_desc, eps0, x0, guide
+
+    # Pass B: transfer that first-order gradient into LoRA and preserve diffusion behavior.
+    opt.zero_grad(set_to_none=True)
+    eps = unet(zt, t, encoder_hidden_states=text,
+               cross_attention_kwargs={"concat_conds": cond}, return_dict=False)[0]
+    _require_finite("eps", eps, step=step, sample_id=sample_id, timestep=ts)
+    x0_train = predict_x0(scheduler, zt, eps, ts)
+    _require_finite("x0_train", x0_train, step=step, sample_id=sample_id, timestep=ts)
+    loss_diff = F.mse_loss(eps.float(), noise.float())
+    loss_proxy = first_order_guidance_proxy(x0_train, grad_x0)
+    loss = args.lambda_diff * loss_diff + loss_proxy
+    _require_finite("loss_diff", loss_diff, step=step, sample_id=sample_id, timestep=ts)
+    _require_finite("loss_proxy", loss_proxy, step=step, sample_id=sample_id, timestep=ts)
+    _require_finite("loss", loss, step=step, sample_id=sample_id, timestep=ts)
+
+    loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
+    if not torch.isfinite(grad_norm):
+        raise FloatingPointError(
+            f"non-finite LoRA gradient norm at step={step} sample_id={sample_id} timestep={ts}: "
+            f"grad_norm={float(grad_norm)}"
+        )
+    opt.step()
+
+    # Catch optimizer-state/parameter corruption immediately instead of one step later.
+    for i, p in enumerate(trainable):
+        if not torch.isfinite(p).all():
+            raise FloatingPointError(
+                f"AdamW produced non-finite LoRA parameter after step={step}: param_index={i} "
+                f"dtype={p.dtype} lr={args.lr:g}"
+            )
+
+    rec = {"step": step, "sample_id": row["sample_id"], "condition": row["condition"],
+           "timestep": ts, "loss_diff": float(loss_diff.detach()),
+           "loss_vpr": float(loss_vpr.detach()), "salad_cosine": float(1-loss_vpr.detach()),
+           "loss_keep": float(loss_keep.detach()), "loss_proxy": float(loss_proxy.detach()),
+           "grad_norm": float(grad_norm),
+           "guidance_x0_grad_norm": float(grad_x0.norm()),
+           "loss_total": float(args.lambda_diff * loss_diff.detach()
+                               + args.lambda_vpr * loss_vpr.detach()
+                               + args.lambda_keep * loss_keep.detach())}
+    return rec
+
+
 def main():
-    args = args_parser()
-    validate_args(args)
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required")
-    random.seed(args.seed); torch.manual_seed(args.seed)
-    rows = read_manifest(args.manifest)
-    out = args.output_dir.resolve()
-    if not args.resume:
-        require_empty_output(out)
-    (out / "checkpoints").mkdir(parents=True, exist_ok=True)
-
-    t2i, _, vae = load_iclight()
-    unet = t2i.unet
-    vae.requires_grad_(False).eval(); t2i.text_encoder.requires_grad_(False).eval()
-    resume_payload = load_lora(unet, args.resume) if args.resume else None
-    if resume_payload is not None:
-        if (resume_payload["rank"], resume_payload["alpha"]) != (args.rank, args.alpha):
-            raise ValueError("resume LoRA rank/alpha differs from current arguments")
-        trainable = [p for p in unet.parameters() if p.requires_grad]
-    else:
-        trainable = attach_lora(unet, args.rank, args.alpha)
-    unet.enable_gradient_checkpointing(); unet.train()
-    teacher = load_salad(repo=args.salad_repo)
-
-    scheduler = DDIMScheduler.from_config(t2i.scheduler.config)
-    if scheduler.config.prediction_type != "epsilon":
-        raise ValueError("IC-Light training requires scheduler prediction_type='epsilon'")
-    scheduler.set_timesteps(25, device="cuda")
-    timesteps = [int(x) for x in scheduler.timesteps[-min(args.timestep_window, 25):]]
-
-    if any(p.dtype != torch.float32 for p in trainable):
-        raise RuntimeError("trainable LoRA parameters must be fp32 before constructing AdamW")
-    opt = torch.optim.AdamW(trainable, lr=args.lr)
-    rng = random.Random(args.seed)
-    report_trainable_parameters(unet, trainable, {
-        "VAE": vae, "text encoder": t2i.text_encoder, "SALAD teacher": teacher.model,
-    })
-    run_config = _run_config(args, teacher)
-    start_step = 0
-    if resume_payload is not None:
-        start_step = restore_training_state(resume_payload.get("extra"), run_config,
-                                            opt, rng, args.max_steps)
-        print(f"resumed global_step={start_step}")
-
-    with ExitStack() as resources:
-        log = resources.enter_context(prepare_training_log(out, start_step, run_config, bool(args.resume)))
-        writer = None
-        if args.tensorboard_dir is not None:
-            writer = prepare_tensorboard(args.tensorboard_dir, out / "train.jsonl", start_step, run_config)
-            resources.callback(writer.close)
-            print(f"TensorBoard scalars: {args.tensorboard_dir.resolve()}")
-        for step in range(start_step + 1, args.max_steps + 1):
-            row = rows[rng.randrange(len(rows))]
-            sample_id = str(row["sample_id"])
-            source = Image.open(row["source_path"]).convert("RGB")
-            baseline = Image.open(row["baseline_path"]).convert("RGB")
-            width, height = baseline.width // 8 * 8, baseline.height // 8 * 8
-            z0 = encode_image_latent(baseline, vae, width, height)
-            from AdaptVPR.adapters import iclight_sd15_fc as adapter
-            cond = adapter._concat_condition(conditioning_source(source), vae, width, height)
-            text = encode_prompt(t2i, row["prompt"])
-            src_desc = teacher.load_source_descriptor(row["source_descriptor"], row["source_path"])
-            base_img = image_tensor_01(baseline, width, height, "cuda")
-
-            ts = timesteps[rng.randrange(len(timesteps))]
-            t = torch.tensor([ts], device="cuda", dtype=torch.long)
-            noise = torch.randn_like(z0)
-            zt = scheduler.add_noise(z0, noise, t)
-            _require_finite("z0", z0, step=step, sample_id=sample_id, timestep=ts)
-            _require_finite("zt", zt, step=step, sample_id=sample_id, timestep=ts)
-
-            # Pass A: get d(VPR + keep)/d(x0) without keeping the UNet graph.
-            with torch.no_grad():
-                eps0 = unet(zt, t, encoder_hidden_states=text,
-                            cross_attention_kwargs={"concat_conds": cond}, return_dict=False)[0]
-                _require_finite("eps0", eps0, step=step, sample_id=sample_id, timestep=ts)
-                x0 = predict_x0(scheduler, zt, eps0, ts)
-                _require_finite("x0", x0, step=step, sample_id=sample_id, timestep=ts)
-            x0_leaf = x0.detach().float().requires_grad_(True)
-            pred_img = decode_latent_01(x0_leaf, vae)
-            _require_finite("pred_img", pred_img, step=step, sample_id=sample_id, timestep=ts)
-            pred_desc = teacher(pred_img)
-            _require_finite("pred_desc", pred_desc, step=step, sample_id=sample_id, timestep=ts)
-            loss_vpr = (1 - (pred_desc * src_desc).sum(-1)).mean()
-            loss_keep = F.l1_loss(pred_img, base_img)
-            guide = args.lambda_vpr * loss_vpr + args.lambda_keep * loss_keep
-            _require_finite("guide", guide, step=step, sample_id=sample_id, timestep=ts)
-            grad_x0, = torch.autograd.grad(guide, x0_leaf)
-            _require_finite("grad_x0", grad_x0, step=step, sample_id=sample_id, timestep=ts)
-            grad_x0 = grad_x0.detach()
-            del x0_leaf, pred_img, pred_desc, eps0, x0, guide
-
-            # Pass B: transfer that first-order gradient into LoRA and preserve diffusion behavior.
-            opt.zero_grad(set_to_none=True)
-            eps = unet(zt, t, encoder_hidden_states=text,
-                       cross_attention_kwargs={"concat_conds": cond}, return_dict=False)[0]
-            _require_finite("eps", eps, step=step, sample_id=sample_id, timestep=ts)
-            x0_train = predict_x0(scheduler, zt, eps, ts)
-            _require_finite("x0_train", x0_train, step=step, sample_id=sample_id, timestep=ts)
-            loss_diff = F.mse_loss(eps.float(), noise.float())
-            loss_proxy = first_order_guidance_proxy(x0_train, grad_x0)
-            loss = args.lambda_diff * loss_diff + loss_proxy
-            _require_finite("loss_diff", loss_diff, step=step, sample_id=sample_id, timestep=ts)
-            _require_finite("loss_proxy", loss_proxy, step=step, sample_id=sample_id, timestep=ts)
-            _require_finite("loss", loss, step=step, sample_id=sample_id, timestep=ts)
-
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
-            if not torch.isfinite(grad_norm):
-                raise FloatingPointError(
-                    f"non-finite LoRA gradient norm at step={step} sample_id={sample_id} timestep={ts}: "
-                    f"grad_norm={float(grad_norm)}"
-                )
-            opt.step()
-
-            # Catch optimizer-state/parameter corruption immediately instead of one step later.
-            for i, p in enumerate(trainable):
-                if not torch.isfinite(p).all():
-                    raise FloatingPointError(
-                        f"AdamW produced non-finite LoRA parameter after step={step}: param_index={i} "
-                        f"dtype={p.dtype} lr={args.lr:g}"
-                    )
-
-            rec = {"step": step, "sample_id": row["sample_id"], "condition": row["condition"],
-                   "timestep": ts, "loss_diff": float(loss_diff.detach()),
-                   "loss_vpr": float(loss_vpr.detach()), "salad_cosine": float(1-loss_vpr.detach()),
-                   "loss_keep": float(loss_keep.detach()), "loss_proxy": float(loss_proxy.detach()),
-                   "grad_norm": float(grad_norm),
-                   "guidance_x0_grad_norm": float(grad_x0.norm()),
-                   "loss_total": float(args.lambda_diff * loss_diff.detach()
-                                       + args.lambda_vpr * loss_vpr.detach()
-                                       + args.lambda_keep * loss_keep.detach())}
-            log.write(json.dumps(rec) + "\n"); log.flush()
-            if writer is not None:
-                write_tensorboard_record(writer, rec, run_config)
-            if step == 1 or step % 10 == 0:
-                print(
-                    f"step={step} diff={rec['loss_diff']:.4f} cos={rec['salad_cosine']:.4f} "
-                    f"keep={rec['loss_keep']:.4f} proxy={rec['loss_proxy']:.4g} "
-                    f"grad={rec['grad_norm']:.4g}"
-                )
-            if step % args.save_every == 0 or step == args.max_steps:
-                save_lora(unet, out / "checkpoints" / f"step_{step:06d}.pt",
-                          rank=args.rank, alpha=args.alpha,
-                          extra=training_state(step, run_config, opt, rng))
+    raise RuntimeError(
+        "The offline fixed-baseline trainer is deprecated. Use "
+        "python -m AdaptVPR.experiments.vpr_guidance.train_online_generator or train_full. "
+        "Old baseline targets must not enter the online training loop.")
 
 
 if __name__ == "__main__":

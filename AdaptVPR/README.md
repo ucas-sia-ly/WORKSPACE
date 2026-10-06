@@ -22,6 +22,10 @@ Official repository for [AdaptVPR: Route-Aware Hard Positive Generation for Robu
   <img src="assets/matching_demos/06_dual06_lisbon_5s_loop.gif" width="48%" />
 </p>
 
+## 面向最终 VPR 实验的训练
+
+Global generator 的正式训练入口是 `python -m AdaptVPR.experiments.vpr_guidance.train_full`，随后通过 TensorBoard 监控，用 `evaluate_all` 在真实 SVOX、RobotCar-Seasons 公开位姿子集和 Nordland 上评估 fresh SALAD A/B/C。完整命令、数据布局和 protocol 见 [最终实验 README](experiments/vpr_guidance/README.md)。
+
 ## 📢 News
 
 - **2026-09-10** — ⚡ Improved planning reproducibility and verification efficiency with fully documented scheduler configuration and content-validated CLIP reference-feature caching.

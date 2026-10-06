@@ -1,405 +1,173 @@
-# VPR-aware Global-domain generation for AdaptVPR
+# 面向最终实验的 VPR-aware Global generator
 
-This directory implements the AdaptVPR-style pipeline you asked for, restricted to **Global/domain changes only**:
+唯一推荐流程：`train_full` → TensorBoard → `evaluate_all`。
+最终 VPR 结论来自真实 SVOX、RobotCar-Seasons 和 Nordland。生成图的 verifier 分数、SALAD cosine、loss 仅用于 generator monitoring。
 
-1. Use AdaptVPR Global prompts (weather / illumination / time-of-day) with IC-Light.
-2. Train a small IC-Light UNet LoRA with a **frozen pretrained SALAD teacher** so generated images retain more place-discriminative information.
-3. Run the trained generator normally to build a synthetic hard-positive pool. There is **no SALAD and no latent optimization at inference time**.
-4. Apply the original AdaptVPR Global verifier. Only geometry/diversity-passing images are eligible for VPR training.
-5. Each accepted synthetic image inherits the parent GSV-Cities `(city, place_id)` label.
-6. Mix verified synthetic images with real GSV-Cities images, default real:synthetic = **8:1**.
-7. Train a **fresh SALAD** with its original DINOv2+SALAD architecture and metric-learning loss.
+## 环境与数据
 
-The pretrained SALAD in Stage 2 is only a **teacher for the generator**. The SALAD trained in Stage 4 is a new VPR model and does not reuse teacher descriptors or add a teacher loss.
-
-This pipeline does not use AdaptVPR Local/Dual generation, LightX2V, Qwen planning, reflection control, inference-time VPR guidance, or BoQ training.
-
----
-
-## 0. Environment
-
-Run from the repository root in the existing AdaptVPR / pinned IC-Light environment:
+在 WORKSPACE 根目录、现有 AdaptVPR Python 环境运行：
 
 ```bash
 python -m pip install -r AdaptVPR/experiments/vpr_guidance/requirements.txt
-
 export ICLIGHT_ROOT="$PWD/IC-Light"
 export ICLIGHT_BASE_MODEL_PATH="$PWD/models/stable-diffusion-v1-5"
 export ICLIGHT_MODEL_PATH="$PWD/models/iclight-ckpt/iclight_sd15_fc.safetensors"
+export VISMATCH_ROOT="$PWD/vismatch"
 ```
 
-For training the new VPR model, clone the official SALAD repository separately, e.g.:
+使用本地 `salad/`，不需要重新 clone。SALAD teacher 读取官方预训练权重；fresh SALAD 使用预训练 DINOv2 backbone + 随机初始化 SALAD aggregator，不复用 teacher 的 aggregator 权重。Torch Hub 的权重应已缓存，或运行环境应允许下载。
+
+保留当前目录即可：
+
+```text
+dataset/
+  AdaptCities/prompts/adaptcities_160k_prompts.jsonl
+  gsv-cities/
+    Dataframes/<city>.csv
+    Images/<city>/*.jpg
+  svox/images/test/
+    gallery/
+    queries/
+    queries_night/ queries_rain/ queries_snow/ ...
+  nordland/
+    README.txt
+    images/test/database/
+    images/test/queries/
+  RobotCar-Seasons/
+    images/<condition>/<left|rear|right>/*.jpg
+    metadata/robotcar_v2_train.txt
+    metadata/robotcar_v2_test.txt
+    3D-models/individual/colmap_reconstructions/001_aligned.zip ... 049_aligned.zip
+```
+
+RobotCar metadata 文件名末尾现有的 `?utm_source=chatgpt.com` 也能自动识别，可自行去掉后缀以便管理；不要同时保留两份同名 train metadata。官方 COLMAP archives 可直接读取，无需解压 `points3D.txt`。也支持原生 `images.txt` / `images.bin`。
+
+## 1. 完整训练
 
 ```bash
-git clone https://github.com/serizba/salad.git external/salad
+python -m AdaptVPR.experiments.vpr_guidance.train_full \
+  --prompts dataset/AdaptCities/prompts/adaptcities_160k_prompts.jsonl \
+  --gsv-root dataset/gsv-cities --salad-root salad \
+  --conditions snow night rain fog --output-dir outputs/full_run \
+  --generation-passes 2 --chunk-size 128 --generator-steps-per-chunk 256 \
+  --replay-rounds 2 --lora-rank 8 --lora-alpha 8 --generator-lr 1e-4 \
+  --lambda-diff 1.0 --lambda-vpr 0.1 --lambda-keep 0.05 --timestep-window 10 \
+  --real-ratio 8 --synthetic-ratio 1 --salad-steps 4000 --salad-workers 8 \
+  --seed 42 --tensorboard-dir outputs/full_run/tensorboard
 ```
 
-You also need GSV-Cities in the usual layout:
+`--cities`、`--salad-batch-size`、`--salad-image-size` 可控制三套 SALAD 的共同设置。SALAD training 默认 image size 224，真实 evaluation 默认 322×322。这些设置对 A/B/C 完全一致。
 
-```text
-dataset/gsv-cities/
-  Dataframes/<City>.csv
-  Images/<City>/*.jpg
-```
+编排按顺序执行 source preparation、online generator、B pool、C pool、fresh SALAD A/B/C，随后停止，不自动 benchmark。
 
----
+- `prepare_data` 只验证 Global source、GSV dataframe label、目标 condition、源图可读性，并缓存 frozen SALAD source descriptor。输出 `source_manifest.jsonl`，不生成 baseline。
+- 每 pass 在 condition 内 deterministic shuffle，然后轮流取样形成 chunk；每条 prompt 在该 pass 恰好出现一次。某 condition 耗尽后重新分配剩余 slots，并记录实际分布。
+- 当前 `G_r` 对整个 chunk 完整执行 released IC-Light stage 1 + refinement。训练时的一次 predicted-x0 只用于 loss 估计，不能替代 candidate refresh。
+- 每张 candidate 进入真实 `DualTraitEvaluator` 的 Global route。阈值保持 `geometry >= 0.78`、`diversity >= 0.15`。两者通过才允许进入训练，rejected 只保存审计。
+- accepted 当前图片 `y_r` 编码成 latent；low-noise timestep 下计算 diffusion MSE、SALAD source cosine loss、相对于 `y_r` 的 L1 keep loss。只更新 fp32 LoRA 参数；teacher、VAE、text encoder、base UNet 固定。
+- two-pass first-order gradient 保留：Pass A 对同一 predicted-x0 计算 VPR/keep gradient，Pass B 用 VJP proxy 传给 LoRA。
+- 每 step 以 50% 概率选 current accepted pool，50% 选最近两个 round 的 accepted replay。replay 为空时只用 current。current 没有 accepted 时该 round 不更新；不会用 rejected 或仅凭 replay 强行补步骤。
+- 每 round 训练结束再生成下个 chunk。active replay 有界，旧图片保留审计但不参与 sampling。
+- online seed 为 SHA256(`base_seed, sample_id, generation_pass, round_id`) 的稳定整数。B/C final-generation seed 只依赖 `base_seed, sample_id`，不含 variant。
+- B/C 同 source、prompt、negative、seed、scheduler、resolution、refinement 和 Global verifier，唯一生成器差异是 LoRA。默认不加载 SALAD，不做 inference-time guidance。
+- `final_lora.pt` 发布后禁止在线 trainer 继续修改；pipeline 验证 downstream 前后的内容 fingerprint。
 
-## 1. Prepare generator-training targets
+### A/B/C 的可比性和数据覆盖
 
-Do **not** train the domain generator against the original daytime image. That would encourage it to undo the requested snow/night/rain/fog appearance. Instead, cache the released IC-Light domain-shift result as the diffusion/preservation target, while the SALAD teacher descriptor comes from the original source image.
+A 只用 real GSV。B 用 original synthetic，C 用 final-LoRA synthetic。相同 architecture、初始权重 fingerprint、seed、optimizer、steps、batch size、augmentation、城市、loss/miner。
+
+`shared_mix_plan.json` 用 **B/C 都有 accepted synthetic 的地点**，每地点 synthetic capacity 取两池的较小值。两套 dataloader 使用同一配额，因此即使最后一个 epoch 不完整，实际 real/synthetic slots 也一致。各池的其他 accepted 图片仍留在完整 manifest 供审计；训练使用共同地点覆盖以控制曝光比例这一混杂因素。
+
+当前四条件有 20,614 条 prompts，而 62,514 个有效 real places 在每地点 4 张、8:1 时需要约 27,784 个 synthetic slots/epoch。现有数据即使全部通过，也不足以达到 8:1。系统采用两池都能达到的共同实际比例，明确输出 `coverage_limited`、目标比例及实际 slots，不把目标 8:1 写成实际比例。若需要完整 8:1，应补充 Global prompts，尤其是更多有效 GSV 地点覆盖，直到共同 accepted capacity 足够。
+
+### 恢复
+
+完整流程用原命令加 `--resume`。已完成阶段核验内容 hash 后跳过。source descriptor 可按 source hash、teacher weights fingerprint、preprocessing version 安全复用。
+
+Online generator 每个完整 round 边界保存 LoRA、AdamW、global step、pass/round、完整 sample ordering、active replay、Python/sample RNG、torch/CUDA RNG、config 和 teacher/verifier fingerprint。初始未训练边界也保存，支持首个 round 中断后重做。mid-round checkpoint 明确拒绝。
+
+中断 round 的图片目录与未提交日志尾部改名为 `.interrupted-*` 保留，再从最近完成边界重做。TensorBoard 恢复 committed journal，清除旧事件显示。单独调用 online trainer：`train_online_generator --resume <round_checkpoint>`，参数须与原 run 一致。
+
+Fresh SALAD 支持完整 epoch checkpoint 恢复；若最后一次 checkpoint 是未完成 epoch，full pipeline 保留原目录为 `.interrupted-*` 后从同一初始化重新训练该 SALAD。最终相同步数预算可结束于半个 epoch，仍保存完整 `checkpoints/last.ckpt`。
+
+## 2. TensorBoard
 
 ```bash
-python -m AdaptVPR.experiments.vpr_guidance.prepare_data \
-  --prompts /path/to/adaptcities_prompts.jsonl \
-  --image-root dataset/gsv-cities/Images \
-  --conditions snow night rain fog \
-  --output-dir outputs/generator_train
+tensorboard --logdir outputs/full_run/tensorboard --host 0.0.0.0 --port 6006
 ```
 
-Only prompt records with `route == "global"` are used.
+目录为 `generator/`、`salad_A/`、`salad_B/`、`salad_C/`。Generator 默认启用，仅单独 trainer 的 `--disable-tensorboard` 能关闭。
 
-GSV-Cities Dataframes are required as label ground truth. They default to
-`<image-root>/../Dataframes`; use `--dataframe-dir` for a different layout. Every
-source identity and any declared city/place label are checked against these CSVs
-before models are loaded. Sample IDs must be safe, unique output basenames.
-Preparation and generation require a new or empty output directory and refuse
-to overwrite an existing experiment. Preparation publishes its final manifest
-only after all rows have been written successfully.
+Step curves：`generator/loss_diff`、`loss_vpr`、`loss_keep`、`loss_total`、`salad_cosine`、`lora_grad_norm`、`x0_guidance_grad_norm`、`lr`、`timestep`。
 
-Output:
+Round curves：`round/pass_rate`、`accepted_count`、`rejected_count`、`mean_s_geo`、`mean_s_div`、`mean_salad_preservation_cosine`，以及每个实际 condition 的 pass rate、geo/div、cosine、generated count。每 round 前四个样本保存 `source | generated` panel 与 condition / geo / div / cosine / acceptance caption；小于四条的末尾 chunk 则全部记录。
 
-```text
-outputs/generator_train/
-  baseline/*.png
-  source_salad/*.pt
-  generator_train.jsonl
-```
+SALAD curves：`train/loss`、`train/b_acc`、`train/lr`；每 epoch 记录实际 `data/synthetic_fraction`、`real_to_synthetic`、`synthetic_slots`、`real_slots`。A 的 synthetic fraction 为 0，real-to-synthetic scalar 使用 0 表示无 synthetic；JSON 的该比值为 null，避免伪造有限比值。
 
-Meaning:
-
-- `baseline/*.png`: original released IC-Light domain-shift output;
-- `source_salad/*.pt`: frozen pretrained SALAD descriptor of the source image;
-- `generator_train.jsonl`: source/prompt/baseline/descriptor mapping.
-
-Descriptor caches include the source path/content hash, actual teacher weight
-hash, preprocessing version and descriptor dimension. The manifest also stores
-source/baseline content hashes, dataframe labels and generation policy. Legacy
-tensor-only caches must be rebuilt with `prepare_data` in a new directory.
-
----
-
-## 2. Train the VPR-aware IC-Light generator
+## 3. 真实数据集评估
 
 ```bash
-python -m AdaptVPR.experiments.vpr_guidance.train_generator \
-  --manifest outputs/generator_train/generator_train.jsonl \
-  --output-dir outputs/iclight_vpr_lora \
-  --max-steps 1000 \
-  --lambda-diff 1.0 \
-  --lambda-vpr 0.1 \
-  --lambda-keep 0.05
+python -m AdaptVPR.experiments.vpr_guidance.evaluate_all \
+  --a-checkpoint outputs/full_run/salad_A/checkpoints/last.ckpt \
+  --b-checkpoint outputs/full_run/salad_B/checkpoints/last.ckpt \
+  --c-checkpoint outputs/full_run/salad_C/checkpoints/last.ckpt \
+  --salad-root salad --svox-root dataset/svox \
+  --robotcar-root dataset/RobotCar-Seasons --nordland-root dataset/nordland \
+  --image-size 322 --batch-size 32 --output-dir outputs/full_run/eval
 ```
 
-Only IC-Light UNet attention LoRA parameters are updated. IC-Light base weights, VAE, text encoder and SALAD teacher stay frozen.
-Startup prints every trainable parameter name, trainable/total counts and the
-ratio, and verifies that the optimizer owns exactly these LoRA parameters. The
-targets are `to_q`, `to_k`, `to_v` and `to_out.0` in UNet attention modules; LoRA
-weights and AdamW state use fp32 while the released base model uses fp16.
+直接加载 fresh Lightning `.ckpt` 的 `state_dict` 和 architecture hyperparameters，也支持相同 architecture 的 raw state dict。无需手动转换。A/B/C 统一 RGB、tensor bilinear antialias resize、ImageNet normalization、L2 descriptor normalization 和 CPU FAISS `IndexFlatIP` exact retrieval。完整 reference 排序分批进行，median/mean rank 不会截断在 top 10。
 
-For cached baseline latent `z0`, training samples a low-noise timestep from the released 25-step DDIM schedule and optimizes:
+输出每个 A/B/C × dataset 的 JSON、per-query `.ranks.json`，以及 `evaluation_summary.json` / `.csv`。CSV 保留 Night/Rain/Snow、RobotCar Night/Other、Nordland 的 R@1，并包含实际 condition 的 R@5/R@10。不存在的 condition 留空；不填 0。RobotCar Other 是排除 `night` 与 `night-rain` 后的 condition macro-average。
+
+SVOX 按实际 `queries*` 目录发现 conditions，`queries` 标为 normal；GT 使用本地 README 明确定义的文件名 UTM 字段，默认 25m retrieval radius。10m 是数据集构建时保证 query 有邻居的筛选阈值，与 25m retrieval 评估阈值不同。`--positive-radius` 可明确指定；协议写入 JSON。参考 [公开 retrieval 实现](https://github.com/gmberton/deep-visual-geo-localization-benchmark/blob/master/datasets_ws.py)。不会通过图像序号或相似 basename 猜 positives。
+
+Nordland 当前 prepared layout 使用 README 定义的真实帧序号 ±10。所有 27,592 条 query 都评估；该 protocol 与 SALAD vendored subsampled GT 区分。若采用 `ref/query` 且文件匹配，优先加载 `salad/datasets/Nordland` 的原始 db/query/GT metadata。可以通过显式 metadata 使用其他已定义 split。
+
+RobotCar-Seasons 按用户选择，默认使用官方 `robotcar_v2_train.txt` 中公开位姿的 adverse-condition 图片作为本地 evaluation queries，`overcast-reference` COLMAP 图片为 reference。读取 metadata 中实际 condition，公开 camera-to-world 4×4 转为 COLMAP world-to-camera quaternion + world camera center；默认 25m positives。输出明确标为 **`robotcar_v2_public_pose_evaluation`，不是官方 hidden-test benchmark**。该子集不用于本项目训练。
+
+同时按官方联合阈值 (0.25m,2°)/(0.5m,5°)/(5m,10°) 计算 top-1 reference pose transfer 的 localization accuracy。JSON 将 `recall_metrics` 和 `official_metrics` 分开，并声明 `estimator=top1_reference_pose_transfer`。这是一种纯 retrieval pose estimator，未加入 local matching/PnP。见 [v2 pose convention](https://data.ciirc.cvut.cz/public/projects/2020VisualLocalization/RobotCar-Seasons/README_RobotCar_v2.md)、[官方阈值](https://www.visuallocalization.net/benchmark/)。官方 `robotcar_v2_test.txt` 没有 query GT，不能声称算出了其本地官方 test 结果。
+
+单模型入口参数：
 
 ```text
-L_diff = MSE(epsilon_pred, epsilon)
-L_vpr  = 1 - cos(SALAD(x0_pred), SALAD(source))
-L_keep = L1(decode(x0_pred), released_ICLight_output)
+evaluate_real --checkpoint ... --salad-root salad --dataset svox|robotcar-seasons|nordland
+              --dataset-root ... --image-size 322 --batch-size 32 --output ...
 ```
 
-`L_diff` preserves the original domain-generation behavior. `L_vpr` pushes the generator to preserve place-discriminative content. `L_keep` discourages unnecessary appearance/geometry drift.
+可加 `--metadata`、`--reference-dir`、`--query-dirs`、`--positive-radius`、`--frame-tolerance`。`evaluate_all` 接受 `--svox-metadata`、`--robotcar-metadata`、`--nordland-metadata`。所有 GT 和 split 在提取 descriptors 前检查；不存在/无 positive 的 query 明确报错，不偷偷删除。
 
-The implementation uses a two-pass first-order gradient so the trainable UNet graph and full DINOv2-SALAD graph do not need to stay resident simultaneously.
-Pass A computes the VPR/keep gradient with respect to a detached, differentiable
-predicted latent. Pass B injects that cotangent using a **sum**, giving the same
-first derivative as direct backpropagation for identical deterministic UNet
-outputs. A CPU test compares all LoRA gradients against a single full backward.
-The teacher runs in eval mode with all parameters frozen; its backbone forward
-retains input gradients instead of the upstream training-only detach.
+### 可选显式 metadata
 
-Generator checkpoints include optimizer/global-step and Python/torch/CUDA RNG
-states. Use `--resume <checkpoint>` to continue with identical settings. Resuming
-into an existing output requires its log to end exactly at that checkpoint; use
-a new output directory when restoring an older checkpoint. Legacy weight-only
-LoRA files support strict inference loading, but cannot resume training.
+默认查找 `<dataset-root>/metadata/evaluation.json`。路径相对 dataset root；positive index 相对 `references` 的原始列表。例：
 
-To resume to a total of 10000 steps with live TensorBoard curves, keep the
-original training settings and add these options to the training command:
-
-```bash
-  --resume outputs/iclight_vpr_lora/checkpoints/step_003000.pt \
-  --max-steps 10000 \
-  --tensorboard-dir outputs/iclight_vpr_lora/tensorboard
+```json
+{
+  "protocol": {"name": "official_retrieval_mapping", "source": "metadata publication or path"},
+  "references": [{"path": "images/reference/1.jpg"}],
+  "queries": [{"path": "images/night/2.jpg", "condition": "night", "positives": [0]}]
+}
 ```
 
-```bash
-tensorboard --logdir outputs/iclight_vpr_lora/tensorboard --host 127.0.0.1 --port 6006
-```
+`positives` 也可使用 reference 完整相对路径。若提供双方 `pose={"center_m":[x,y,z],"quaternion_wxyz":[qw,qx,qy,qz]}` 与 `protocol.positive_radius_m`，可自动按 metric radius 生成 positives。Quaternion 统一 world→camera，所有 poses 必须在同一世界坐标系。缺少 poses 时 localization metrics 明确 unavailable。
 
-Open http://127.0.0.1:6006. Scalars include the diffusion/VPR/keep losses,
-their weighted contributions, total loss, SALAD cosine, gradient norms and
-learning rate. `loss/guidance_proxy` is the signed first-order gradient proxy;
-`loss/total` reports the weighted diffusion/VPR/keep objective. TensorBoard
-history is rebuilt from the validated `train.jsonl` at startup, preserving the
-global step and replacing stale events from an interrupted run. Use a dedicated
-TensorBoard directory for each training run. Generation validation metrics are
-computed separately by `generate_dataset`; these training curves do not measure
-full-sampling quality.
-
-Checkpoints are saved under:
+## 输出与研究判断
 
 ```text
-outputs/iclight_vpr_lora/checkpoints/
+outputs/full_run/
+  config.json pipeline_state.json complete.json
+  generator/
+    source_manifest.jsonl source_salad/ config.json
+    rounds/pass_00_round_000/{accepted,rejected,records.jsonl}
+    checkpoints/ final_lora.pt train.jsonl round_metrics.jsonl
+  synthetic_B/{accepted,rejected,records.jsonl,synthetic_manifest.jsonl}
+  synthetic_C/{accepted,rejected,records.jsonl,synthetic_manifest.jsonl}
+  shared_mix_plan.json
+  salad_A/ salad_B/ salad_C/  # config, mix_stats, checkpoints/last.ckpt
+  tensorboard/{generator,salad_A,salad_B,salad_C}/
+  eval/{evaluation_summary.json,evaluation_summary.csv,...}
 ```
 
----
+核心问题是 **C > B 是否成立**；B > A 表示普通 domain augmentation 是否有效。summary 保存 B−A、C−B 的 macro R@1/5/10 差值；condition 指标用于判断 night/snow/rain 的变化，SVOX normal 等用于观察一般条件退化。单 seed 的差值是实验结果，不能自动等同统计显著性。
 
-## 3. Build two synthetic pools with the **same** generation/verifier code
-
-This is important for a fair downstream experiment. `generate_dataset.py` supports both the original released generator and the VPR-aware generator.
-
-### B. Original AdaptVPR Global-generation control
-
-Omit `--lora`:
-
-```bash
-python -m AdaptVPR.experiments.vpr_guidance.generate_dataset \
-  --prompts /path/to/adaptcities_prompts.jsonl \
-  --image-root dataset/gsv-cities/Images \
-  --conditions snow night rain fog \
-  --output-dir outputs/synthetic_original
-```
-
-This writes records with:
-
-```text
-generator_variant = released
-```
-
-### C. VPR-aware generator
-
-Use the trained LoRA:
-
-```bash
-python -m AdaptVPR.experiments.vpr_guidance.generate_dataset \
-  --prompts /path/to/adaptcities_prompts.jsonl \
-  --image-root dataset/gsv-cities/Images \
-  --lora outputs/iclight_vpr_lora/checkpoints/step_001000.pt \
-  --conditions snow night rain fog \
-  --output-dir outputs/synthetic_vpr_aware
-```
-
-This writes records with:
-
-```text
-generator_variant = vpr_lora
-```
-
-Both variants share the same two-stage IC-Light sampling and the original
-AdaptVPR `DualTraitEvaluator` with `route="global"`. They preserve released frozen
-prompts verbatim, use the original Global negative prompt by default, and match
-the original HTTP generator's JPEG-95 source conditioning. An explicit input
-`negative_prompt` is honored identically by both variants. DDIM, seed, CFG=7.5,
-size, 25 stage-1 steps and 20 effective refinement steps are shared; refinement
-strength is 0.22 for rain and 0.30 otherwise. Both stages share the same UNet.
-LoRA loading requires the complete adapter key set and matching shapes, rank,
-targets and base metadata; missing weights or base-model keys are errors.
-
-Generation skips SALAD by default. `--salad-audit` explicitly enables the
-optional preservation statistic. It performs no latent optimization.
-The original Global thresholds remain geometry >= 0.78 and diversity >= 0.15;
-non-finite/invalid verifier values abort the run. Records store sampling and
-actual verifier policy, including any original matcher fallback. B/C comparisons
-must use identical policies and inputs. After these policy/cache fixes, rebuild
-both pools instead of comparing a newly generated C pool with an old B pool.
-
-Each output directory contains:
-
-```text
-accepted/                  # verifier-passing images
-rejected/                  # verifier-failing images
-records.jsonl              # all candidates and verifier scores
-synthetic_manifest.jsonl   # accepted candidates only; used by VPR training
-```
-
-Each accepted synthetic image inherits its source `(city, place_id)` label. The optional `salad_preservation_cosine` in `records.jsonl` is only an audit statistic; it is not used by the downstream VPR loss.
-
----
-
-## 4. Train fresh SALAD models for the actual downstream experiment
-
-The important experiment is not whether the teacher SALAD likes the generated images. The important experiment is whether **new VPR models trained with those images perform better**.
-
-Use the same SALAD architecture, optimizer, loss, batch size, training steps and seed for all groups.
-
-### A. Real-only baseline
-
-```bash
-python -m AdaptVPR.experiments.vpr_guidance.train_salad \
-  --salad-root external/salad \
-  --gsv-root dataset/gsv-cities \
-  --output-dir outputs/salad_A_real_only \
-  --real-ratio 1 \
-  --synthetic-ratio 0 \
-  --max-steps 4000 \
-  --seed 42
-```
-
-No synthetic manifest is required when `--synthetic-ratio 0`.
-
-### B. Real + original AdaptVPR Global synthetic
-
-```bash
-python -m AdaptVPR.experiments.vpr_guidance.train_salad \
-  --salad-root external/salad \
-  --gsv-root dataset/gsv-cities \
-  --synthetic-manifest outputs/synthetic_original/synthetic_manifest.jsonl \
-  --output-dir outputs/salad_B_original_synth \
-  --real-ratio 8 \
-  --synthetic-ratio 1 \
-  --max-steps 4000 \
-  --seed 42
-```
-
-### C. Real + VPR-aware-generator synthetic
-
-```bash
-python -m AdaptVPR.experiments.vpr_guidance.train_salad \
-  --salad-root external/salad \
-  --gsv-root dataset/gsv-cities \
-  --synthetic-manifest outputs/synthetic_vpr_aware/synthetic_manifest.jsonl \
-  --output-dir outputs/salad_C_vpr_aware_synth \
-  --real-ratio 8 \
-  --synthetic-ratio 1 \
-  --max-steps 4000 \
-  --seed 42
-```
-
-The fresh VPR model keeps the official SALAD setup:
-
-- DINOv2 ViT-B/14 backbone;
-- last four trainable backbone blocks;
-- SALAD aggregator: 64 clusters, cluster dim 128, token dim 256;
-- MultiSimilarityLoss;
-- MultiSimilarityMiner with margin 0.1.
-
-Defaults also follow the official `main.py`: 60 places per batch, four images per
-place, 224x224 input, AdamW at 6e-5 with weight decay 9.5e-9, and a linear schedule
-from 1.0 to 0.2. Places shuffle within cities by default; `--shuffle-all` changes
-that for all comparison groups. ImageNet normalization and RandAugment are
-retained. A local wrapper fixes the inherited scheduler's double advance so it
-steps once per optimizer update; the official metric loss/miner/training step
-are unchanged. Frozen backbone-prefix parameters are marked non-trainable for
-DDP compatibility.
-
-Full downstream checkpoints store optimizer, scheduler, step/epoch and RNG
-state. `--resume` currently supports a completed epoch on one device, with
-unchanged experiment settings. Mid-epoch or distributed resume is rejected
-explicitly. `--accelerator cpu --precision 32-true` can run CPU smoke tests;
-production defaults remain GPU with mixed precision.
-
-Synthetic images receive **no special downstream loss**. They are simply same-place hard positives with the parent geographical label.
-
----
-
-## 5. How the 8:1 real:synthetic exposure works
-
-SALAD trains on places, with `K` images for each place. `mixed_salad.py` keeps this layout unchanged.
-
-At the beginning of every epoch it computes the target number of synthetic image slots from the requested ratio. For 8:1:
-
-```text
-synthetic_fraction = 1 / 9
-```
-
-It then assigns synthetic slots only to places that have verified generated images. Allocation is deterministic for a given seed/epoch and never uses the same synthetic file twice inside one K-image place item.
-
-Every epoch writes its actual exposure to:
-
-```text
-<output-dir>/mix_stats.jsonl
-```
-
-Important fields:
-
-```text
-target_synthetic_slots
-synthetic_capacity_slots
-planned_synthetic_slots
-actual_synthetic_slots
-actual_real_slots
-actual_ratio
-actual_synthetic_fraction
-coverage_limited
-epoch_complete
-```
-
-If `coverage_limited=true`, the accepted synthetic pool is too sparse to reach the requested 8:1 exposure without duplicating images. The code intentionally uses the lower achievable fraction instead of silently oversampling the same synthetic image.
-
-The loader attaches slot counts which a callback removes before the official
-SALAD training step. Only batches actually consumed by training count toward
-the journal. DDP counters are summed across ranks and only rank zero writes the
-file; sampler padding and partial epochs can make actual exposure differ from
-the full dataset plan. `epoch_complete=false` marks a partial epoch. Shared epoch
-state prevents stale quota plans even with persistent workers. Repeated paths
-are deduplicated, conflicting labels are rejected, and only actual Boolean
-`passed=true`/`eligible_for_training=true` Global records with verified source
-labels enter the pool. Capacity-limited and padded runs must be reported with
-their measured fraction; an 8:1 request is not a universal guarantee.
-
----
-
-## 6. What to compare
-
-The core comparison is:
-
-```text
-A. fresh SALAD trained on real GSV-Cities only
-B. fresh SALAD trained on real + original Global synthetic images
-C. fresh SALAD trained on real + VPR-aware Global synthetic images
-```
-
-Keep everything other than the synthetic dataset fixed.
-
-Evaluate A/B/C on the same VPR benchmarks, especially adverse-domain queries such as night, snow/season and rain/fog where available.
-
-The desired result is not simply:
-
-```text
-teacher SALAD(source, generated) increases
-```
-
-The desired result is:
-
-```text
-new VPR trained with C > new VPR trained with B
-```
-
-while B versus A tells you how much ordinary AdaptVPR-style Global augmentation already helps.
-
----
-
-## 7. Recommended first run
-
-Do not begin with the entire dataset. First validate the full loop with a small Global subset:
-
-```text
-1. prepare ~100-500 Global prompts
-2. train generator LoRA for a short run
-3. generate both original and VPR-aware pools from the same prompts/seeds
-4. inspect verifier pass rate and SALAD audit distribution
-5. train A/B/C with identical short SALAD budgets
-6. only then scale generator data and VPR training steps
-```
-
-The decisive downstream metric is the held-out VPR benchmark performance of A/B/C, not the generator-training loss by itself.
-
-See [AUDIT_REPORT.md](AUDIT_REPORT.md) for confirmed bugs, executed commands,
-CPU evidence and the GPU-dependent checks that remain unverified.
+`train_generator.py` 的旧 offline CLI 已弃用，其 loss/gradient helpers 保留供 online trainer 和现有 unit tests 使用。旧 baseline cache 不兼容新 source manifest，不迁移为 online targets。旧 smoke utilities / 审计文档保留历史用途，不是推荐流程。

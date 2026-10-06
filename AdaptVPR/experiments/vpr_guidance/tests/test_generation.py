@@ -270,6 +270,7 @@ class GenerationEntryPointTests(unittest.TestCase):
             self.assertEqual(accepted[0]["verifier_policy"]["matcher_name"], "test")
             c_out = root / "generated_c"
             lora_path = root / "trained.pt"
+            torch.save({"extra": {}}, lora_path)
             c_argv = list(argv)
             c_argv[-1] = str(c_out)
             c_argv.extend(["--lora", str(lora_path)])

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 import types
 from pathlib import Path
 
@@ -135,27 +136,27 @@ class SaladTeacher:
         return descriptor.to(device=self.device, dtype=torch.float32)
 
 
-def load_salad(device: str = "cuda", repo: str = SALAD_REPO) -> SaladTeacher:
-    """Load SALAD and its nested DINOv2 dependency without branch discovery.
-
-    Torch Hub probes GitHub for unqualified repositories even when their source
-    is cached. Explicit main refs reuse that cache and avoid this network probe.
-    Keep the override scoped to construction; local paths and caller-specified
-    refs retain their normal behavior.
-    """
-    source = "local" if Path(repo).is_dir() else "github"
+@contextmanager
+def salad_hub_refs():
+    """Reuse explicit main caches without unqualified Torch Hub branch discovery."""
     hub_load = torch.hub.load
 
     def load_with_refs(repo_or_dir, model, *args, **kwargs):
         if kwargs.get("source", "github") == "github" and repo_or_dir in (
-            SALAD_REPO, "facebookresearch/dinov2"
-        ):
+                SALAD_REPO, "facebookresearch/dinov2"):
             repo_or_dir += ":main"
         return hub_load(repo_or_dir, model, *args, **kwargs)
 
     torch.hub.load = load_with_refs
     try:
-        model = torch.hub.load(repo, "dinov2_salad", pretrained=True, trust_repo=True, source=source)
+        yield
     finally:
         torch.hub.load = hub_load
+
+
+def load_salad(device: str = "cuda", repo: str = SALAD_REPO) -> SaladTeacher:
+    """Load the frozen pretrained teacher from local SALAD or its Hub cache."""
+    source = "local" if Path(repo).is_dir() else "github"
+    with salad_hub_refs():
+        model = torch.hub.load(repo, "dinov2_salad", pretrained=True, trust_repo=True, source=source)
     return SaladTeacher(model, device=device)

@@ -8,3 +8,5 @@ tensorboard>=2.14,<3
 # Core stack is provided by AdaptVPR/IC-Light: torch, torchvision, diffusers,
 # transformers, numpy, Pillow, safetensors.  Real AdaptVPR verification also
 # requires the repository's CLIP/VisMatch dependencies.
+
+scipy

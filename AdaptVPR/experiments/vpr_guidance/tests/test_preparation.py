@@ -15,11 +15,12 @@ from PIL import Image
 
 from AdaptVPR.experiments.vpr_guidance import prepare_data
 from AdaptVPR.experiments.vpr_guidance.data import gsv_image_name
-from AdaptVPR.experiments.vpr_guidance.train_generator import read_manifest
+from AdaptVPR.experiments.vpr_guidance.train_online_generator import read_source_manifest
+from AdaptVPR.experiments.vpr_guidance.teacher import file_sha256, PREPROCESSING_VERSION
 
 
 class PreparationTests(unittest.TestCase):
-    def test_preparation_keeps_source_baseline_descriptor_and_label_together(self):
+    def test_preparation_caches_sources_without_generating_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             gsv = root / "gsv"
@@ -44,29 +45,29 @@ class PreparationTests(unittest.TestCase):
             out = root / "output"
 
             class TeacherDouble:
+                model_fingerprint = "fixed-test-teacher"
+
+                def load_source_descriptor(self, path, source_path):
+                    payload = torch.load(path, weights_only=True)
+                    if payload["source_sha256"] != file_sha256(source_path):
+                        raise ValueError("source content mismatch")
+                    return payload["descriptor"]
+
                 def from_pil(self, image):
                     return torch.tensor(image.getpixel((0, 0)), dtype=torch.float32)
 
                 def save_source_descriptor(self, path, descriptor, source_path):
-                    torch.save({"descriptor": descriptor, "source_path": str(source_path)}, path)
+                    torch.save({"descriptor": descriptor, "source_path": str(source_path),
+                                "source_sha256": file_sha256(source_path)}, path)
 
-            # Controlled baseline retains the source identity while recording a
-            # domain request. This validates bookkeeping, not model quality.
-            def generate_double(t2i, i2i, vae, source, prompt, negative, seed, condition):
-                self.assertEqual(condition, "snow")
-                self.assertEqual(seed, 42)
-                return source.copy()
-
-            argv = ["prepare_data", "--prompts", str(prompt_path), "--image-root", str(gsv / "Images"),
+            argv = ["prepare_data", "--prompts", str(prompt_path), "--gsv-root", str(gsv), "--salad-root", str(root / "salad"),
                     "--output-dir", str(out)]
-            with patch("sys.argv", argv), patch.object(prepare_data, "load_iclight", return_value=(None, None, None)), \
-                    patch.object(prepare_data, "load_salad", return_value=TeacherDouble()), \
-                    patch.object(prepare_data, "generate_released", side_effect=generate_double), \
+            with patch("sys.argv", argv), patch.object(prepare_data, "load_salad", return_value=TeacherDouble()), \
                     redirect_stdout(StringIO()):
                 prepare_data.main()
-            manifest = out / "generator_train.jsonl"
-            rows = read_manifest(manifest)
-            self.assertFalse((out / "generator_train.jsonl.partial").exists())
+            manifest = out / "source_manifest.jsonl"
+            rows, _ = read_source_manifest(manifest, TeacherDouble())
+            self.assertFalse((out / "source_manifest.jsonl.partial").exists())
             self.assertEqual(len(rows), 2)
             for place, row in enumerate(rows, 1):
                 self.assertEqual(row["place_id"], f"{place:07d}")
@@ -74,13 +75,17 @@ class PreparationTests(unittest.TestCase):
                 self.assertEqual(row["prompt"], f"snow {place}")
                 payload = torch.load(row["source_descriptor"], weights_only=True)
                 self.assertEqual(payload["source_path"], row["source_path"])
-                with Image.open(row["baseline_path"]) as baseline:
-                    self.assertTrue(torch.equal(payload["descriptor"],
-                                                torch.tensor(baseline.getpixel((0, 0)), dtype=torch.float32)))
-            # Replacing a baseline with another sample is detected before training.
-            Path(rows[0]["baseline_path"]).write_bytes(Path(rows[1]["baseline_path"]).read_bytes())
-            with self.assertRaisesRegex(ValueError, "baseline content mismatch"):
-                read_manifest(manifest)
+                self.assertNotIn("baseline_path", row)
+                self.assertEqual(row["teacher_sha256"], TeacherDouble.model_fingerprint)
+                self.assertEqual(row["preprocessing_version"], PREPROCESSING_VERSION)
+            self.assertFalse((out / "baseline").exists())
+            with patch("sys.argv", argv), patch.object(prepare_data, "load_salad", return_value=TeacherDouble()), \
+                    patch.object(TeacherDouble, "from_pil", side_effect=AssertionError("cache must be reused")), \
+                    redirect_stdout(StringIO()):
+                prepare_data.main()
+            Path(rows[0]["source_path"]).write_bytes(Path(rows[1]["source_path"]).read_bytes())
+            with self.assertRaisesRegex(ValueError, "source content changed"):
+                read_source_manifest(manifest, TeacherDouble())
 
 
 if __name__ == "__main__":

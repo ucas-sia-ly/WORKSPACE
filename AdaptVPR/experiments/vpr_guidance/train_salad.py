@@ -139,6 +139,12 @@ class SetDatasetEpoch(pl.Callback):
             epoch_complete=self.epoch_complete, world_size=trainer.world_size,
             global_step=trainer.global_step,
         )
+        if trainer.logger:
+            trainer.logger.log_metrics({
+                "data/synthetic_fraction": stats["actual_synthetic_fraction"],
+                "data/real_to_synthetic": stats["actual_real_to_synthetic"] if synthetic else 0.,
+                "data/synthetic_slots": synthetic, "data/real_slots": real,
+            }, step=trainer.global_step)
         if trainer.is_global_zero:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             with self.history_path.open("a", encoding="utf-8") as handle:
@@ -183,6 +189,15 @@ def official_model_class(base_class):
 
         def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
             optimizer.step(closure=optimizer_closure)
+
+        def training_step(self, batch, batch_idx):
+            result = super().training_step(batch, batch_idx)
+            loss = result["loss"] if isinstance(result, dict) else result
+            self.log("train/loss", loss, on_step=True, on_epoch=False)
+            if getattr(self, "batch_acc", None):
+                self.log("train/b_acc", sum(self.batch_acc) / len(self.batch_acc), on_step=True)
+            self.log("train/lr", self.optimizers().param_groups[0]["lr"], on_step=True)
+            return result
 
     return FreshSALAD
 
@@ -229,8 +244,10 @@ def main():
     p.add_argument("--salad-root", type=Path, required=True, help="local official serizba/salad checkout")
     p.add_argument("--gsv-root", type=Path, required=True)
     p.add_argument("--synthetic-manifest", type=Path, default=None)
+    p.add_argument("--shared-mix-plan", type=Path, help="matched B/C per-place synthetic exposure capacities")
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--resume", type=Path, help="full checkpoint saved at a completed epoch")
+    p.add_argument("--tensorboard-dir", type=Path, help="explicit log directory, defaults to output-dir/tensorboard")
     p.add_argument("--cities", nargs="+", default=DEFAULT_CITIES)
     p.add_argument("--batch-size", type=int, default=60)
     p.add_argument("--img-per-place", type=int, default=4)
@@ -274,23 +291,29 @@ def main():
         img_per_place=args.img_per_place, min_img_per_place=args.img_per_place,
         real_to_synth=(args.real_ratio, args.synthetic_ratio),
         image_size=(args.image_size, args.image_size), seed=args.seed,
-        return_mix_metadata=True,
+        return_mix_metadata=True, shared_mix_plan=args.shared_mix_plan,
     )
     if len(dataset) < 2:
         raise ValueError("metric training requires at least two distinct GSV places")
     dm = MixedDataModule(dataset, args.batch_size, args.workers, args.shuffle_all)
-    model = official_model_class(VPRModel)(
-        backbone_arch="dinov2_vitb14",
-        backbone_config={"num_trainable_blocks": 4, "return_token": True, "norm_layer": True},
-        agg_arch="SALAD",
-        agg_config={"num_channels": 768, "num_clusters": 64, "cluster_dim": 128, "token_dim": 256},
-        lr=6e-5, optimizer="adamw", weight_decay=9.5e-9,
-        lr_sched="linear",
-        lr_sched_args={"start_factor": 1.0, "end_factor": 0.2, "total_iters": args.max_steps},
-        loss_name="MultiSimilarityLoss", miner_name="MultiSimilarityMiner", miner_margin=0.1,
-    )
+    from .teacher import salad_hub_refs, model_sha256
+    with salad_hub_refs():
+        model = official_model_class(VPRModel)(
+            backbone_arch="dinov2_vitb14",
+            backbone_config={"num_trainable_blocks": 4, "return_token": True, "norm_layer": True},
+            agg_arch="SALAD",
+            agg_config={"num_channels": 768, "num_clusters": 64, "cluster_dim": 128, "token_dim": 256},
+            lr=6e-5, optimizer="adamw", weight_decay=9.5e-9,
+            lr_sched="linear",
+            lr_sched_args={"start_factor": 1.0, "end_factor": 0.2, "total_iters": args.max_steps},
+            loss_name="MultiSimilarityLoss", miner_name="MultiSimilarityMiner", miner_margin=0.1,
+        )
     freeze_backbone_prefix(model)
+    initialization_sha256 = model_sha256(model)
     config = {
+        "shared_mix_plan_sha256": hashlib.sha256(args.shared_mix_plan.read_bytes()).hexdigest() if args.shared_mix_plan else None,
+        "initialization_sha256": initialization_sha256,
+        "initialization_policy": "pretrained_dinov2_random_salad_no_teacher_weights",
         "experiment_kind": "real_only" if args.synthetic_ratio == 0 else "real_plus_synthetic",
         "gsv_root": str(args.gsv_root.resolve()), "salad_root": str(salad_root),
         "salad_code_sha256": {
@@ -329,10 +352,18 @@ def main():
         # previous epoch. Use its epoch loop and stop at the identical step budget.
         accelerator=args.accelerator, devices=args.devices, max_epochs=args.max_steps,
         precision=args.precision, default_root_dir=out,
-        callbacks=[SetDatasetEpoch(out, args.max_steps), checkpoint], logger=True,
+        callbacks=[SetDatasetEpoch(out, args.max_steps), checkpoint],
+        logger=pl.loggers.TensorBoardLogger(save_dir=str(args.tensorboard_dir or out / "tensorboard"),
+                                           name="", version=""),
         log_every_n_steps=10, num_sanity_val_steps=0, use_distributed_sampler=False,
     )
     trainer.fit(model, datamodule=dm, ckpt_path=str(args.resume.resolve()) if args.resume else None)
+    # Publish an explicit full checkpoint even when the common step budget ends mid-epoch.
+    trainer.save_checkpoint(str(out / "checkpoints" / "last.ckpt"))
+    if trainer.is_global_zero:
+        from .data import atomic_json
+        atomic_json(out / "complete.json", {"global_step": trainer.global_step,
+                                           "initialization_sha256": initialization_sha256})
 
 
 if __name__ == "__main__":

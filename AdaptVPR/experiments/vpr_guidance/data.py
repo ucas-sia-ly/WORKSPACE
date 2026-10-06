@@ -173,3 +173,50 @@ def validate_source_label(row: dict, source_path: Path, labels: GSVLabelIndex):
     if "place_id" in row and canonical_place_id(row["place_id"]) != pid:
         raise ValueError(f"source place_id disagrees with manifest: {source_path}")
     return city, pid
+
+
+def sample_seed(base_seed: int, sample_id: str, generation_pass=None, round_id=None) -> int:
+    """Stable across processes; final B/C deliberately omit pass, round and variant."""
+    import hashlib
+    identity = [int(base_seed), sample_id]
+    if generation_pass is not None or round_id is not None:
+        identity.extend([generation_pass, round_id])
+    digest = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).digest()
+    return int.from_bytes(digest[:8], "big") % (2**63 - 1)
+
+
+def balanced_chunks(rows, chunk_size: int, base_seed: int, generation_pass: int):
+    """Shuffle within conditions and interleave without replacement each pass."""
+    import random
+    from collections import defaultdict, deque
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    rng = random.Random(sample_seed(base_seed, "ordering", generation_pass, 0))
+    groups = defaultdict(list)
+    for row in rows:
+        groups[row["condition"]].append(row)
+    queues = {}
+    for condition in sorted(groups):
+        rng.shuffle(groups[condition])
+        queues[condition] = deque(groups[condition])
+    chunk = []
+    while queues:
+        conditions = sorted(queues)
+        rng.shuffle(conditions)
+        for condition in conditions:
+            chunk.append(queues[condition].popleft())
+            if not queues[condition]:
+                del queues[condition]
+            if len(chunk) == chunk_size:
+                yield chunk
+                chunk = []
+    if chunk:
+        yield chunk
+
+
+def atomic_json(path: Path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".partial")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+    temporary.replace(path)
