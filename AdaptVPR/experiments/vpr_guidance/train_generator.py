@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse, json, random
+from contextlib import ExitStack
 from pathlib import Path
 
 import torch
@@ -33,6 +34,8 @@ def args_parser():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--salad-repo", default="serizba/salad")
     p.add_argument("--resume", type=Path, help="resume a generator checkpoint including optimizer/RNG state")
+    p.add_argument("--tensorboard-dir", type=Path,
+                   help="write live TensorBoard scalars and import existing train.jsonl history")
     return p.parse_args()
 
 
@@ -188,6 +191,49 @@ def prepare_training_log(output_dir, start_step, run_config, resume):
     return log_path.open("a" if resume else "w", encoding="utf-8")
 
 
+def write_tensorboard_record(writer, record, run_config):
+    step = record["step"]
+    tags = {
+        "loss/diffusion": "loss_diff", "loss/vpr": "loss_vpr",
+        "loss/keep": "loss_keep", "loss/total": "loss_total",
+        "loss/guidance_proxy": "loss_proxy", "quality/salad_cosine": "salad_cosine",
+        "grad/lora_before_clip": "grad_norm",
+        "grad/guidance_x0": "guidance_x0_grad_norm", "sampling/timestep": "timestep",
+    }
+    for tag, key in tags.items():
+        writer.add_scalar(tag, record[key], step)
+    for loss in ("diff", "vpr", "keep"):
+        writer.add_scalar(f"weighted_loss/{loss}",
+                          run_config[f"lambda_{loss}"] * record[f"loss_{loss}"], step)
+    writer.add_scalar("optimizer/learning_rate", run_config["lr"], step)
+    writer.add_scalar(f"condition/{record['condition']}/salad_cosine", record["salad_cosine"], step)
+
+
+def prepare_tensorboard(log_dir, log_path, start_step, run_config):
+    """Rebuild persisted history, purging stale/duplicate events on each restart.
+
+    train.jsonl is validated against the restored checkpoint before this call.
+    Replaying it also recovers metrics that were not flushed before a failure.
+    Use a TensorBoard directory dedicated to this training run.
+    """
+    from torch.utils.tensorboard import SummaryWriter
+
+    writer = SummaryWriter(log_dir=str(log_dir), purge_step=0, flush_secs=10)
+    try:
+        writer.add_text("run/config", json.dumps(run_config, indent=2), start_step)
+        with Path(log_path).open(encoding="utf-8") as history:
+            for line in history:
+                if line.strip():
+                    record = json.loads(line)
+                    if record["step"] <= start_step:
+                        write_tensorboard_record(writer, record, run_config)
+        writer.flush()
+    except BaseException:
+        writer.close()
+        raise
+    return writer
+
+
 def _tensor_stats(name: str, x: torch.Tensor) -> str:
     y = x.detach().float()
     finite = torch.isfinite(y)
@@ -256,100 +302,107 @@ def main():
                                             opt, rng, args.max_steps)
         print(f"resumed global_step={start_step}")
 
-    log = prepare_training_log(out, start_step, run_config, bool(args.resume))
-    for step in range(start_step + 1, args.max_steps + 1):
-        row = rows[rng.randrange(len(rows))]
-        sample_id = str(row["sample_id"])
-        source = Image.open(row["source_path"]).convert("RGB")
-        baseline = Image.open(row["baseline_path"]).convert("RGB")
-        width, height = baseline.width // 8 * 8, baseline.height // 8 * 8
-        z0 = encode_image_latent(baseline, vae, width, height)
-        from AdaptVPR.adapters import iclight_sd15_fc as adapter
-        cond = adapter._concat_condition(conditioning_source(source), vae, width, height)
-        text = encode_prompt(t2i, row["prompt"])
-        src_desc = teacher.load_source_descriptor(row["source_descriptor"], row["source_path"])
-        base_img = image_tensor_01(baseline, width, height, "cuda")
+    with ExitStack() as resources:
+        log = resources.enter_context(prepare_training_log(out, start_step, run_config, bool(args.resume)))
+        writer = None
+        if args.tensorboard_dir is not None:
+            writer = prepare_tensorboard(args.tensorboard_dir, out / "train.jsonl", start_step, run_config)
+            resources.callback(writer.close)
+            print(f"TensorBoard scalars: {args.tensorboard_dir.resolve()}")
+        for step in range(start_step + 1, args.max_steps + 1):
+            row = rows[rng.randrange(len(rows))]
+            sample_id = str(row["sample_id"])
+            source = Image.open(row["source_path"]).convert("RGB")
+            baseline = Image.open(row["baseline_path"]).convert("RGB")
+            width, height = baseline.width // 8 * 8, baseline.height // 8 * 8
+            z0 = encode_image_latent(baseline, vae, width, height)
+            from AdaptVPR.adapters import iclight_sd15_fc as adapter
+            cond = adapter._concat_condition(conditioning_source(source), vae, width, height)
+            text = encode_prompt(t2i, row["prompt"])
+            src_desc = teacher.load_source_descriptor(row["source_descriptor"], row["source_path"])
+            base_img = image_tensor_01(baseline, width, height, "cuda")
 
-        ts = timesteps[rng.randrange(len(timesteps))]
-        t = torch.tensor([ts], device="cuda", dtype=torch.long)
-        noise = torch.randn_like(z0)
-        zt = scheduler.add_noise(z0, noise, t)
-        _require_finite("z0", z0, step=step, sample_id=sample_id, timestep=ts)
-        _require_finite("zt", zt, step=step, sample_id=sample_id, timestep=ts)
+            ts = timesteps[rng.randrange(len(timesteps))]
+            t = torch.tensor([ts], device="cuda", dtype=torch.long)
+            noise = torch.randn_like(z0)
+            zt = scheduler.add_noise(z0, noise, t)
+            _require_finite("z0", z0, step=step, sample_id=sample_id, timestep=ts)
+            _require_finite("zt", zt, step=step, sample_id=sample_id, timestep=ts)
 
-        # Pass A: get d(VPR + keep)/d(x0) without keeping the UNet graph.
-        with torch.no_grad():
-            eps0 = unet(zt, t, encoder_hidden_states=text,
-                        cross_attention_kwargs={"concat_conds": cond}, return_dict=False)[0]
-            _require_finite("eps0", eps0, step=step, sample_id=sample_id, timestep=ts)
-            x0 = predict_x0(scheduler, zt, eps0, ts)
-            _require_finite("x0", x0, step=step, sample_id=sample_id, timestep=ts)
-        x0_leaf = x0.detach().float().requires_grad_(True)
-        pred_img = decode_latent_01(x0_leaf, vae)
-        _require_finite("pred_img", pred_img, step=step, sample_id=sample_id, timestep=ts)
-        pred_desc = teacher(pred_img)
-        _require_finite("pred_desc", pred_desc, step=step, sample_id=sample_id, timestep=ts)
-        loss_vpr = (1 - (pred_desc * src_desc).sum(-1)).mean()
-        loss_keep = F.l1_loss(pred_img, base_img)
-        guide = args.lambda_vpr * loss_vpr + args.lambda_keep * loss_keep
-        _require_finite("guide", guide, step=step, sample_id=sample_id, timestep=ts)
-        grad_x0, = torch.autograd.grad(guide, x0_leaf)
-        _require_finite("grad_x0", grad_x0, step=step, sample_id=sample_id, timestep=ts)
-        grad_x0 = grad_x0.detach()
-        del x0_leaf, pred_img, pred_desc, eps0, x0, guide
+            # Pass A: get d(VPR + keep)/d(x0) without keeping the UNet graph.
+            with torch.no_grad():
+                eps0 = unet(zt, t, encoder_hidden_states=text,
+                            cross_attention_kwargs={"concat_conds": cond}, return_dict=False)[0]
+                _require_finite("eps0", eps0, step=step, sample_id=sample_id, timestep=ts)
+                x0 = predict_x0(scheduler, zt, eps0, ts)
+                _require_finite("x0", x0, step=step, sample_id=sample_id, timestep=ts)
+            x0_leaf = x0.detach().float().requires_grad_(True)
+            pred_img = decode_latent_01(x0_leaf, vae)
+            _require_finite("pred_img", pred_img, step=step, sample_id=sample_id, timestep=ts)
+            pred_desc = teacher(pred_img)
+            _require_finite("pred_desc", pred_desc, step=step, sample_id=sample_id, timestep=ts)
+            loss_vpr = (1 - (pred_desc * src_desc).sum(-1)).mean()
+            loss_keep = F.l1_loss(pred_img, base_img)
+            guide = args.lambda_vpr * loss_vpr + args.lambda_keep * loss_keep
+            _require_finite("guide", guide, step=step, sample_id=sample_id, timestep=ts)
+            grad_x0, = torch.autograd.grad(guide, x0_leaf)
+            _require_finite("grad_x0", grad_x0, step=step, sample_id=sample_id, timestep=ts)
+            grad_x0 = grad_x0.detach()
+            del x0_leaf, pred_img, pred_desc, eps0, x0, guide
 
-        # Pass B: transfer that first-order gradient into LoRA and preserve diffusion behavior.
-        opt.zero_grad(set_to_none=True)
-        eps = unet(zt, t, encoder_hidden_states=text,
-                   cross_attention_kwargs={"concat_conds": cond}, return_dict=False)[0]
-        _require_finite("eps", eps, step=step, sample_id=sample_id, timestep=ts)
-        x0_train = predict_x0(scheduler, zt, eps, ts)
-        _require_finite("x0_train", x0_train, step=step, sample_id=sample_id, timestep=ts)
-        loss_diff = F.mse_loss(eps.float(), noise.float())
-        loss_proxy = first_order_guidance_proxy(x0_train, grad_x0)
-        loss = args.lambda_diff * loss_diff + loss_proxy
-        _require_finite("loss_diff", loss_diff, step=step, sample_id=sample_id, timestep=ts)
-        _require_finite("loss_proxy", loss_proxy, step=step, sample_id=sample_id, timestep=ts)
-        _require_finite("loss", loss, step=step, sample_id=sample_id, timestep=ts)
+            # Pass B: transfer that first-order gradient into LoRA and preserve diffusion behavior.
+            opt.zero_grad(set_to_none=True)
+            eps = unet(zt, t, encoder_hidden_states=text,
+                       cross_attention_kwargs={"concat_conds": cond}, return_dict=False)[0]
+            _require_finite("eps", eps, step=step, sample_id=sample_id, timestep=ts)
+            x0_train = predict_x0(scheduler, zt, eps, ts)
+            _require_finite("x0_train", x0_train, step=step, sample_id=sample_id, timestep=ts)
+            loss_diff = F.mse_loss(eps.float(), noise.float())
+            loss_proxy = first_order_guidance_proxy(x0_train, grad_x0)
+            loss = args.lambda_diff * loss_diff + loss_proxy
+            _require_finite("loss_diff", loss_diff, step=step, sample_id=sample_id, timestep=ts)
+            _require_finite("loss_proxy", loss_proxy, step=step, sample_id=sample_id, timestep=ts)
+            _require_finite("loss", loss, step=step, sample_id=sample_id, timestep=ts)
 
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
-        if not torch.isfinite(grad_norm):
-            raise FloatingPointError(
-                f"non-finite LoRA gradient norm at step={step} sample_id={sample_id} timestep={ts}: "
-                f"grad_norm={float(grad_norm)}"
-            )
-        opt.step()
-
-        # Catch optimizer-state/parameter corruption immediately instead of one step later.
-        for i, p in enumerate(trainable):
-            if not torch.isfinite(p).all():
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
+            if not torch.isfinite(grad_norm):
                 raise FloatingPointError(
-                    f"AdamW produced non-finite LoRA parameter after step={step}: param_index={i} "
-                    f"dtype={p.dtype} lr={args.lr:g}"
+                    f"non-finite LoRA gradient norm at step={step} sample_id={sample_id} timestep={ts}: "
+                    f"grad_norm={float(grad_norm)}"
                 )
+            opt.step()
 
-        rec = {"step": step, "sample_id": row["sample_id"], "condition": row["condition"],
-               "timestep": ts, "loss_diff": float(loss_diff.detach()),
-               "loss_vpr": float(loss_vpr.detach()), "salad_cosine": float(1-loss_vpr.detach()),
-               "loss_keep": float(loss_keep.detach()), "loss_proxy": float(loss_proxy.detach()),
-               "grad_norm": float(grad_norm),
-               "guidance_x0_grad_norm": float(grad_x0.norm()),
-               "loss_total": float(args.lambda_diff * loss_diff.detach()
-                                   + args.lambda_vpr * loss_vpr.detach()
-                                   + args.lambda_keep * loss_keep.detach())}
-        log.write(json.dumps(rec) + "\n"); log.flush()
-        if step == 1 or step % 10 == 0:
-            print(
-                f"step={step} diff={rec['loss_diff']:.4f} cos={rec['salad_cosine']:.4f} "
-                f"keep={rec['loss_keep']:.4f} proxy={rec['loss_proxy']:.4g} "
-                f"grad={rec['grad_norm']:.4g}"
-            )
-        if step % args.save_every == 0 or step == args.max_steps:
-            save_lora(unet, out / "checkpoints" / f"step_{step:06d}.pt",
-                      rank=args.rank, alpha=args.alpha,
-                      extra=training_state(step, run_config, opt, rng))
-    log.close()
+            # Catch optimizer-state/parameter corruption immediately instead of one step later.
+            for i, p in enumerate(trainable):
+                if not torch.isfinite(p).all():
+                    raise FloatingPointError(
+                        f"AdamW produced non-finite LoRA parameter after step={step}: param_index={i} "
+                        f"dtype={p.dtype} lr={args.lr:g}"
+                    )
+
+            rec = {"step": step, "sample_id": row["sample_id"], "condition": row["condition"],
+                   "timestep": ts, "loss_diff": float(loss_diff.detach()),
+                   "loss_vpr": float(loss_vpr.detach()), "salad_cosine": float(1-loss_vpr.detach()),
+                   "loss_keep": float(loss_keep.detach()), "loss_proxy": float(loss_proxy.detach()),
+                   "grad_norm": float(grad_norm),
+                   "guidance_x0_grad_norm": float(grad_x0.norm()),
+                   "loss_total": float(args.lambda_diff * loss_diff.detach()
+                                       + args.lambda_vpr * loss_vpr.detach()
+                                       + args.lambda_keep * loss_keep.detach())}
+            log.write(json.dumps(rec) + "\n"); log.flush()
+            if writer is not None:
+                write_tensorboard_record(writer, rec, run_config)
+            if step == 1 or step % 10 == 0:
+                print(
+                    f"step={step} diff={rec['loss_diff']:.4f} cos={rec['salad_cosine']:.4f} "
+                    f"keep={rec['loss_keep']:.4f} proxy={rec['loss_proxy']:.4g} "
+                    f"grad={rec['grad_norm']:.4g}"
+                )
+            if step % args.save_every == 0 or step == args.max_steps:
+                save_lora(unet, out / "checkpoints" / f"step_{step:06d}.pt",
+                          rank=args.rank, alpha=args.alpha,
+                          extra=training_state(step, run_config, opt, rng))
 
 
 if __name__ == "__main__":

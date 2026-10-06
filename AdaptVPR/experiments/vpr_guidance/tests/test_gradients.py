@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -17,10 +18,11 @@ from PIL import Image
 from AdaptVPR.experiments.vpr_guidance.iclight import (
     attach_lora, decode_latent_01, load_lora, lora_state_dict, sampling_policy, save_lora,
 )
+from AdaptVPR.experiments.vpr_guidance import teacher
 from AdaptVPR.experiments.vpr_guidance.teacher import SaladTeacher, file_sha256, pil_tensor
 from AdaptVPR.experiments.vpr_guidance.train_generator import (
     first_order_guidance_proxy, predict_x0, prepare_training_log, read_manifest, restore_training_state,
-    training_state, validate_args,
+    prepare_tensorboard, training_state, validate_args, write_tensorboard_record,
 )
 
 
@@ -88,6 +90,58 @@ def tiny_unet():
         up_block_types=("UpBlock2D", "CrossAttnUpBlock2D"),
         cross_attention_dim=8, attention_head_dim=2,
     )
+
+
+class TeacherLoadingTests(unittest.TestCase):
+    def check_loading(self, repo, expected_repo, expected_source):
+        calls = []
+        model = object()
+
+        def upstream_load(repo_or_dir, name, *args, **kwargs):
+            calls.append((repo_or_dir, name, args, kwargs))
+            if name == "dinov2_salad":
+                # Reproduce upstream SALAD's unqualified nested dependency.
+                torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+            return model
+
+        with patch.object(torch.hub, "load", side_effect=upstream_load) as hub_load, \
+                patch.object(teacher, "SaladTeacher") as constructor:
+            result = teacher.load_salad(device="cpu", repo=repo)
+            self.assertIs(result, constructor.return_value)
+            constructor.assert_called_once_with(model, device="cpu")
+            self.assertIs(torch.hub.load, hub_load)
+        self.assertEqual(calls, [
+            (expected_repo, "dinov2_salad", (),
+             {"pretrained": True, "trust_repo": True, "source": expected_source}),
+            ("facebookresearch/dinov2:main", "dinov2_vitb14", (), {}),
+        ])
+
+    def test_default_and_nested_repositories_have_explicit_refs(self):
+        self.check_loading(teacher.SALAD_REPO, "serizba/salad:main", "github")
+
+    def test_local_salad_still_pins_nested_dinov2(self):
+        with tempfile.TemporaryDirectory() as repo:
+            self.check_loading(repo, repo, "local")
+
+    def test_explicit_salad_ref_is_preserved(self):
+        self.check_loading("serizba/salad:custom", "serizba/salad:custom", "github")
+
+    def test_hub_loader_restored_after_nested_failure(self):
+        def upstream_load(repo_or_dir, name, **kwargs):
+            if name == "dinov2_salad":
+                return torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+            raise RuntimeError("backbone failed")
+
+        with patch.object(torch.hub, "load", side_effect=upstream_load) as hub_load:
+            with self.assertRaisesRegex(RuntimeError, "backbone failed"):
+                teacher.load_salad(device="cpu")
+            self.assertIs(torch.hub.load, hub_load)
+
+    def test_explicit_ref_avoids_torch_hub_branch_probe(self):
+        with patch.object(torch.hub, "urlopen", side_effect=AssertionError("network probe")):
+            self.assertEqual(torch.hub._parse_repo_info("facebookresearch/dinov2:main"),
+                             ("facebookresearch", "dinov2", "main"))
+
 
 
 class GradientTests(unittest.TestCase):
@@ -258,6 +312,34 @@ class GradientTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "settings differ"):
                 restore_training_state(payload["extra"], {"manifest_sha256": "changed"},
                                        restored_optimizer, restored_rng, max_steps=3)
+
+    def test_tensorboard_rebuilds_history_without_duplicate_or_stale_steps(self):
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+        config = {"lambda_diff": 1., "lambda_vpr": .1, "lambda_keep": .05, "lr": 1e-4}
+        record = {"condition": "snow", "timestep": 161, "loss_diff": 1., "loss_vpr": .2,
+                  "loss_keep": .3, "loss_total": 1.035, "loss_proxy": -.1,
+                  "salad_cosine": .8, "grad_norm": .4, "guidance_x0_grad_norm": .05}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            history = root / "train.jsonl"
+            history.write_text("".join(json.dumps({**record, "step": step}) + "\n"
+                                       for step in (1, 2)))
+            python_rng, torch_rng = random.getstate(), torch.get_rng_state().clone()
+            writer = prepare_tensorboard(root / "events", history, 2, config)
+            self.assertEqual(random.getstate(), python_rng)
+            self.assertTrue(torch.equal(torch.get_rng_state(), torch_rng))
+            # Simulate events flushed after the checkpoint but before a crash.
+            write_tensorboard_record(writer, {**record, "step": 4}, config)
+            writer.close()
+            writer = prepare_tensorboard(root / "events", history, 2, config)
+            write_tensorboard_record(writer, {**record, "step": 3}, config)
+            writer.close()
+            events = EventAccumulator(str(root / "events"), size_guidance={"scalars": 0}).Reload()
+            for tag in ("loss/total", "quality/salad_cosine", "weighted_loss/vpr"):
+                self.assertEqual([event.step for event in events.Scalars(tag)], [1, 2, 3])
+            self.assertAlmostEqual(events.Scalars("weighted_loss/vpr")[-1].value, .02)
+            self.assertAlmostEqual(events.Scalars("loss/guidance_proxy")[-1].value, -.1)
 
     def test_training_manifest_rejects_legacy_and_changed_baseline(self):
         with tempfile.TemporaryDirectory() as temporary:

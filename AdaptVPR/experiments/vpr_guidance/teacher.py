@@ -136,6 +136,26 @@ class SaladTeacher:
 
 
 def load_salad(device: str = "cuda", repo: str = SALAD_REPO) -> SaladTeacher:
+    """Load SALAD and its nested DINOv2 dependency without branch discovery.
+
+    Torch Hub probes GitHub for unqualified repositories even when their source
+    is cached. Explicit main refs reuse that cache and avoid this network probe.
+    Keep the override scoped to construction; local paths and caller-specified
+    refs retain their normal behavior.
+    """
     source = "local" if Path(repo).is_dir() else "github"
-    model = torch.hub.load(repo, "dinov2_salad", pretrained=True, trust_repo=True, source=source)
+    hub_load = torch.hub.load
+
+    def load_with_refs(repo_or_dir, model, *args, **kwargs):
+        if kwargs.get("source", "github") == "github" and repo_or_dir in (
+            SALAD_REPO, "facebookresearch/dinov2"
+        ):
+            repo_or_dir += ":main"
+        return hub_load(repo_or_dir, model, *args, **kwargs)
+
+    torch.hub.load = load_with_refs
+    try:
+        model = torch.hub.load(repo, "dinov2_salad", pretrained=True, trust_repo=True, source=source)
+    finally:
+        torch.hub.load = hub_load
     return SaladTeacher(model, device=device)

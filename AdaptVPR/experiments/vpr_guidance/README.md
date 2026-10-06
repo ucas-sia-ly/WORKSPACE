@@ -130,6 +130,29 @@ into an existing output requires its log to end exactly at that checkpoint; use
 a new output directory when restoring an older checkpoint. Legacy weight-only
 LoRA files support strict inference loading, but cannot resume training.
 
+To resume to a total of 10000 steps with live TensorBoard curves, keep the
+original training settings and add these options to the training command:
+
+```bash
+  --resume outputs/iclight_vpr_lora/checkpoints/step_003000.pt \
+  --max-steps 10000 \
+  --tensorboard-dir outputs/iclight_vpr_lora/tensorboard
+```
+
+```bash
+tensorboard --logdir outputs/iclight_vpr_lora/tensorboard --host 127.0.0.1 --port 6006
+```
+
+Open http://127.0.0.1:6006. Scalars include the diffusion/VPR/keep losses,
+their weighted contributions, total loss, SALAD cosine, gradient norms and
+learning rate. `loss/guidance_proxy` is the signed first-order gradient proxy;
+`loss/total` reports the weighted diffusion/VPR/keep objective. TensorBoard
+history is rebuilt from the validated `train.jsonl` at startup, preserving the
+global step and replacing stale events from an interrupted run. Use a dedicated
+TensorBoard directory for each training run. Generation validation metrics are
+computed separately by `generate_dataset`; these training curves do not measure
+full-sampling quality.
+
 Checkpoints are saved under:
 
 ```text
