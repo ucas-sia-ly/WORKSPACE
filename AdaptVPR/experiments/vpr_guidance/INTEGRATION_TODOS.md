@@ -2,6 +2,18 @@
 
 This document lists components that need to be implemented or connected to complete the full pipeline.
 
+**Update (2026-10-07):** SALAD entry points now exist in the separate `salad/`
+checkout: `salad/train_salad.py` and `salad/evaluate_salad.py`. See
+[the runnable workflow](../../../salad/WORKFLOW.md) for current commands,
+accepted synthetic JSONL input, evaluation protocols, checkpoint recovery,
+and the explicit manifest required by RobotCar-Seasons. From this directory,
+invoke them as `python ../../../salad/train_salad.py ...` and
+`python ../../../salad/evaluate_salad.py ...`. The older interface examples
+below describe the integration design; they are not local files in this directory.
+The iterative orchestration remains unconnected. IC-Light LoRA inference is now
+available through the adapter's optional `ADAPTVPR_LORA_CHECKPOINT` environment
+variable; see [service configuration](../../docs/API_CONTRACTS.md).
+
 ## ✅ Completed Components
 
 - [x] Hard case loading and management (`hard_cases.py`)
@@ -11,6 +23,9 @@ This document lists components that need to be implemented or connected to compl
 - [x] Hard case extraction utility (`extract_hard_cases.py`)
 - [x] Test suite (`test_implementation.py`)
 - [x] Documentation (README, QUICKSTART, DESIGN_COMPARISON)
+- [x] SALAD training entry point (`../../../salad/train_salad.py`)
+- [x] SALAD evaluation entry point (`../../../salad/evaluate_salad.py`)
+- [x] Optional IC-Light LoRA loading in `adapters/iclight_sd15_fc.py`
 
 ## ⚠️ Missing Components (Need Implementation)
 
@@ -150,9 +165,13 @@ python generate_with_lora.py \
 
 **Purpose**: Allow AdaptVPR generation to use a LoRA checkpoint
 
-**Current**: AdaptVPR loads vanilla IC-Light, no LoRA support
+**Current**: The adapter optionally loads a VPR-guidance checkpoint from
+`ADAPTVPR_LORA_CHECKPOINT`, using checkpoint metadata for rank and alpha. The
+launcher forwards this setting and resolves relative paths. Both sampling
+pipelines share the adapted UNet. Leave the variable unset/empty for vanilla.
 
-**Needed**: Add LoRA loading before generation
+**Completed interface**: Environment variable (Approach 1 below). The additional
+adapter/API alternatives below are design options, not implemented interfaces.
 
 **Approach 1: Environment Variable**
 ```python
@@ -287,7 +306,8 @@ To run the full iterative pipeline:
   - `python finetune_generator.py ...` (✅ implemented)
   
 - [ ] Generate synthetic data with LoRA
-  - `python AdaptVPR/run.py ... --lora-checkpoint ...` (**TODO**: add LoRA support)
+  - Set `ADAPTVPR_LORA_CHECKPOINT`, restart the adapter, then run `python AdaptVPR/run.py ...`
+  - No `--lora-checkpoint` flag is provided by `run.py`.
   
 - [ ] Train SALAD on real + new synthetic
   - `python train_salad.py ...` (**TODO**)

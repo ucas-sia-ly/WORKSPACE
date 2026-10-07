@@ -59,6 +59,24 @@ Request:
 
 The four high-resolution fields are optional.
 
+For VPR-guidance LoRA inference, set `ADAPTVPR_LORA_CHECKPOINT` in `.env` or the
+service environment to a checkpoint saved by
+`experiments/vpr_guidance/lora_utils.py`. The adapter reads rank and alpha from
+the checkpoint metadata and applies it to the shared UNet used by both sampling
+stages. An unset or empty value uses vanilla IC-Light. Relative paths in `.env`
+are resolved against the AdaptVPR root by the startup script. Invalid checkpoints
+fail initialization and are reported by `/health`; they do not silently fall back.
+Restart the IC-Light service after changing the checkpoint. For the bundled
+launcher, from the AdaptVPR directory:
+
+```bash
+export ADAPTVPR_LORA_CHECKPOINT=/absolute/path/to/lora_final.safetensors
+ADAPTVPR_FORCE_RESTART=1 bash scripts/start_generation_services.sh --wait
+```
+
+The launcher restarts both configured generation services. This option loads the
+project's custom LoRA format; external Diffusers/PEFT checkpoints need conversion.
+
 ## LightX2V generation
 
 Local and Dual routes use the same endpoint and are distinguished by the prompt

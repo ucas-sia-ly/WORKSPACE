@@ -80,14 +80,9 @@ def extract_hard_cases_from_salad_eval(
             "distance_to_correct": query.get("distance_gt", 1.0),
         }
 
-        # Try to infer source_id from query_id
-        # Typical format: "CITY/PANOID_HEADING" or similar
-        query_id = query["query_id"]
-        if "/" in query_id:
-            # Assume it's CITY/PANOID_HEADING format
-            case["source_id"] = query_id
-        else:
-            case["source_id"] = None
+        # Benchmark query IDs do not identify GSV-Cities source images. Only
+        # preserve a mapping explicitly supplied by the evaluation manifest.
+        case["source_id"] = query.get("source_id")
 
         output_cases.append(case)
 

@@ -59,12 +59,15 @@ def load_hard_cases(manifest_path: Path, gsv_root: Optional[Path] = None) -> lis
 
         # Try to find source image if GSV root is provided
         source_path = None
-        if gsv_root and "source_id" in entry:
-            source_id = entry["source_id"]
-            # GSV-Cities structure: Images/CITY/PANOID_HEADING.jpg
-            potential = gsv_root / "Images" / source_id
-            if potential.exists():
-                source_path = str(potential)
+        source_id = entry.get("source_id")
+        if gsv_root and isinstance(source_id, str) and source_id.strip():
+            # A source_id is a relative path within GSV-Cities/Images, not
+            # an external benchmark path or an arbitrary absolute filename.
+            relative = Path(source_id)
+            if not relative.is_absolute() and ".." not in relative.parts:
+                potential = gsv_root / "Images" / relative
+                if potential.is_file():
+                    source_path = str(potential)
 
         cases.append(HardCase(
             query_id=query_id,
@@ -72,7 +75,7 @@ def load_hard_cases(manifest_path: Path, gsv_root: Optional[Path] = None) -> lis
             source_path=source_path,
             correct_match_id=entry["correct_match_id"],
             wrong_match_id=entry["wrong_match_id"],
-            retrieval_rank=entry.get("rank", -1),
+            retrieval_rank=entry.get("retrieval_rank", entry.get("rank", -1)),
             distance_to_wrong=entry.get("distance_to_wrong", 0.0),
             distance_to_correct=entry.get("distance_to_correct", 1.0),
         ))

@@ -127,6 +127,7 @@ start_service() {
     # An existing tmux server retains its old environment. Forward current model
     # settings explicitly so changing .env really enables disk offload.
     local -a tmux_environment=(
+      -e "ADAPTVPR_LORA_CHECKPOINT=${ADAPTVPR_LORA_CHECKPOINT:-}"
       -e "LIGHTX2V_DISK_OFFLOAD=${LIGHTX2V_DISK_OFFLOAD:-0}"
       -e "LIGHTX2V_CPU_OFFLOAD=${LIGHTX2V_CPU_OFFLOAD:-1}"
     )

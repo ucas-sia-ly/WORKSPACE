@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class GenerationServiceStartupTest(unittest.TestCase):
-    def check_launcher(self, use_tmux, wait=False, existing_server=False):
+    def check_launcher(self, use_tmux, wait=False, existing_server=False, has_lora=True):
         with tempfile.TemporaryDirectory(prefix="adaptvpr-startup-") as directory:
             temporary = Path(directory)
             project = temporary / "AdaptVPR's test"
@@ -33,7 +33,7 @@ class GenerationServiceStartupTest(unittest.TestCase):
                 (project / "adapters" / name).write_text(
                     "import json, os\n"
                     "print(json.dumps({key: os.environ.get(key) for key in "
-                    "['LIGHTX2V_ROOT', 'LIGHTX2V_MODEL_PATH', 'LIGHTX2V_DISK_OFFLOAD', 'PYTHONPATH', 'PLATFORM']}), flush=True)\n"
+                    "['LIGHTX2V_ROOT', 'LIGHTX2V_MODEL_PATH', 'LIGHTX2V_DISK_OFFLOAD', 'ADAPTVPR_LORA_CHECKPOINT', 'PYTHONPATH', 'PLATFORM']}), flush=True)\n"
                     + ("from http.server import HTTPServer, BaseHTTPRequestHandler\n"
                        "class Handler(BaseHTTPRequestHandler):\n"
                        " def log_message(self, *args): pass\n"
@@ -46,6 +46,7 @@ class GenerationServiceStartupTest(unittest.TestCase):
             (project / ".env").write_text(
                 "ICLIGHT_ROOT=../IC-Light\nLIGHTX2V_ROOT=../LightX2V\n"
                 "LIGHTX2V_MODEL_PATH=../model-from-dotenv\nLIGHTX2V_DISK_OFFLOAD=1\n"
+                + ("ADAPTVPR_LORA_CHECKPOINT=outputs/round_0/lora/lora_final.safetensors\n" if has_lora else "")
             )
             env = {key: value for key, value in os.environ.items()
                    if not key.startswith(("ICLIGHT_", "LIGHTX2V_", "ADAPTVPR_"))}
@@ -77,7 +78,8 @@ class GenerationServiceStartupTest(unittest.TestCase):
                 env["PATH"] = str(wrapper.parent) + os.pathsep + env["PATH"]
             try:
                 if existing_server:
-                    stale = dict(env, LIGHTX2V_MODEL_PATH="/stale/path", LIGHTX2V_DISK_OFFLOAD="0")
+                    stale = dict(env, LIGHTX2V_MODEL_PATH="/stale/path", LIGHTX2V_DISK_OFFLOAD="0",
+                                 ADAPTVPR_LORA_CHECKPOINT="/stale/lora.safetensors")
                     subprocess.run([tmux, "-L", server, "-f", str(config), "new-session", "-d", "-s", "keeper",
                                     "/bin/sleep", "8"], env=stale, check=True, timeout=3)
                 result = subprocess.run(
@@ -103,6 +105,8 @@ class GenerationServiceStartupTest(unittest.TestCase):
                     self.assertEqual(data["PYTHONPATH"].split(os.pathsep)[0], str(temporary / upstream))
                     self.assertEqual(data["PLATFORM"], "cuda")
                     self.assertEqual(data["LIGHTX2V_DISK_OFFLOAD"], "1")
+                    expected_lora = str(project / "outputs/round_0/lora/lora_final.safetensors") if has_lora else ""
+                    self.assertEqual(data["ADAPTVPR_LORA_CHECKPOINT"], expected_lora)
             finally:
                 if use_tmux:
                     subprocess.run([tmux, "-L", server, "kill-server"], capture_output=True, timeout=3)
@@ -117,6 +121,10 @@ class GenerationServiceStartupTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("tmux") and shutil.which("fish"), "requires tmux and fish")
     def test_existing_tmux_server_gets_updated_model_settings_and_waits(self):
         self.check_launcher(use_tmux=True, wait=True, existing_server=True)
+
+    @unittest.skipUnless(shutil.which("tmux") and shutil.which("fish"), "requires tmux and fish")
+    def test_existing_tmux_server_clears_unconfigured_lora_checkpoint(self):
+        self.check_launcher(use_tmux=True, existing_server=True, has_lora=False)
 
 
 if __name__ == "__main__":

@@ -166,6 +166,17 @@ def load_pipeline() -> tuple[object, object, object]:
     ).to("cuda")
     pipe_i2i.scheduler = pipe_t2i.scheduler
     pipe_i2i.set_progress_bar_config(disable=True)
+    # Inject last: these custom LoRA layers are held by forward closures, not UNet children.
+    if os.getenv("ADAPTVPR_LORA_CHECKPOINT", "").strip():
+        import sys
+        from safetensors import safe_open
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from experiments.vpr_guidance.lora_utils import inject_lora_into_unet, load_lora_checkpoint
+        lora_checkpoint = _required_path("ADAPTVPR_LORA_CHECKPOINT")
+        with safe_open(str(lora_checkpoint), framework="pt") as f:
+            metadata = f.metadata() or {}
+        lora_layers = inject_lora_into_unet(unet, rank=int(metadata["lora_rank"]), alpha=float(metadata["lora_alpha"]))
+        load_lora_checkpoint(lora_layers, lora_checkpoint)
     return pipe_t2i, pipe_i2i, vae
 
 
