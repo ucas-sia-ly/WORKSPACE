@@ -1,0 +1,24 @@
+[Unit]
+Description=AdaptVPR IC-Light generation service
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=%h/github/WORKSPACE/IC-Light
+EnvironmentFile=%h/github/WORKSPACE/AdaptVPR/.env
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=PYTHONPATH=%h/github/WORKSPACE/IC-Light
+Environment=PLATFORM=cuda
+Environment=SKIP_PLATFORM_CHECK=True
+Environment=ICLIGHT_PORT=8002
+Environment=ICLIGHT_OUTPUT_DIR=%h/github/WORKSPACE/AdaptVPR/tmp/service_outputs/iclight
+ExecStart=%h/miniconda3/envs/AdaptVPR/bin/python %h/github/WORKSPACE/AdaptVPR/adapters/iclight_sd15_fc.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+StandardOutput=append:%h/github/WORKSPACE/AdaptVPR/tmp/logs/iclight_8002.log
+StandardError=append:%h/github/WORKSPACE/AdaptVPR/tmp/logs/iclight_8002.log
+
+[Install]
+WantedBy=default.target
