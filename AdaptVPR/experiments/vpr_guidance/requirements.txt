@@ -1,10 +1,7 @@
-torch>=2.0.0
-torchvision>=0.15.0
-diffusers>=0.21.0
-transformers>=4.30.0
-safetensors>=0.3.0
-accelerate>=0.20.0
-Pillow>=9.0.0
-numpy>=1.21.0
-tqdm>=4.60.0
-lpips>=0.1.4
+# On top of AdaptVPR/requirements.txt, adapters/requirements.txt and
+# salad/requirements-workflow.txt (already required by the reused stages).
+torch>=2.0
+diffusers>=0.21
+transformers>=4.30
+safetensors>=0.3
+python-dotenv

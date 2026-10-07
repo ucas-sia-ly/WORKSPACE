@@ -53,60 +53,6 @@ def test_hard_cases():
     print("✓ Hard case loading test passed")
 
 
-def test_losses():
-    """Test loss computation."""
-    print("\n=== Testing Loss Functions ===")
-
-    from losses import DiffusionLoss, IdentityLoss, DiversityLoss
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-
-    # Test diffusion loss
-    print("\n[1/3] Testing DiffusionLoss...")
-    loss_diff = DiffusionLoss()
-    noise_pred = torch.randn(2, 4, 64, 64, device=device)
-    noise_target = torch.randn(2, 4, 64, 64, device=device)
-    diff_loss = loss_diff(noise_pred, noise_target)
-    assert diff_loss.item() > 0
-    print(f"  Diffusion loss: {diff_loss.item():.4f}")
-    print("  ✓ DiffusionLoss works")
-
-    # Test identity loss
-    print("\n[2/3] Testing IdentityLoss...")
-    try:
-        loss_identity = IdentityLoss(model_name="dinov2", device=device)
-        images1 = torch.rand(2, 3, 224, 224, device=device)
-        images2 = torch.rand(2, 3, 224, 224, device=device)
-        identity_loss = loss_identity(images1, images2)
-        assert 0 <= identity_loss.item() <= 2.0
-        print(f"  Identity loss (random images): {identity_loss.item():.4f}")
-
-        # Test with same image (should be close to 0)
-        identity_loss_same = loss_identity(images1, images1)
-        print(f"  Identity loss (same images): {identity_loss_same.item():.4f}")
-        assert identity_loss_same.item() < 0.1
-        print("  ✓ IdentityLoss works (DINO)")
-    except Exception as e:
-        print(f"  ⚠ DINOv2 not available: {e}")
-        print("  Trying CLIP instead...")
-        loss_identity = IdentityLoss(model_name="clip", device=device)
-        identity_loss = loss_identity(images1, images2)
-        print(f"  Identity loss (CLIP, random): {identity_loss.item():.4f}")
-        print("  ✓ IdentityLoss works (CLIP)")
-
-    # Test diversity loss
-    print("\n[3/3] Testing DiversityLoss...")
-    loss_diverse = DiversityLoss(feature_extractor="simple", device=device)
-    images = torch.rand(4, 3, 64, 64, device=device)
-    diverse_loss = loss_diverse(images)
-    print(f"  Diversity loss: {diverse_loss.item():.4f}")
-    assert diverse_loss.item() < 0  # Negative because we want to minimize negative diversity
-    print("  ✓ DiversityLoss works")
-
-    print("\n✓ All loss tests passed")
-
-
 def test_lora_utils():
     """Test LoRA utilities."""
     print("\n=== Testing LoRA Utils ===")
@@ -201,7 +147,6 @@ def test_training_step_smoke():
     from types import SimpleNamespace
 
     from diffusers import DDIMScheduler
-    from losses import DiffusionLoss
 
     class FakeVAE(torch.nn.Module):
         def __init__(self):
@@ -284,7 +229,7 @@ def test_training_step_smoke():
     noise_pred = unet(unet_input, timesteps, fake_text_embeds).sample
     assert noise_pred.shape == noise.shape
 
-    loss = DiffusionLoss()(noise_pred, noise)
+    loss = torch.nn.functional.mse_loss(noise_pred, noise)
     assert torch.isfinite(loss).item(), "Diffusion loss must be finite"
 
     print(f"Loss: {loss.item():.4f}")
@@ -302,8 +247,10 @@ def test_training_step_smoke():
     assert any(not torch.equal(before, after.detach())
                for before, after in zip(lora_before, lora_params)), \
         "The optimizer must update LoRA weights"
+    # LoRA layers are registered children, so exclude them from the base check.
+    lora_ids = {id(param) for param in lora_params}
     assert all(param.grad is None and torch.equal(base_before[name], param.detach())
-               for name, param in unet.named_parameters()), \
+               for name, param in unet.named_parameters() if id(param) not in lora_ids), \
         "Frozen base UNet parameters must remain unchanged"
     assert all(param.grad is None for param in vae.parameters()), \
         "The frozen VAE must not receive gradients"
@@ -319,7 +266,6 @@ def main():
 
     try:
         test_hard_cases()
-        test_losses()
         test_lora_utils()
         test_training_step_smoke()
 

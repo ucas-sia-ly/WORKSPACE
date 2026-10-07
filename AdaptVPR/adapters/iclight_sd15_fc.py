@@ -92,33 +92,56 @@ def _configure_unet(unet, checkpoint_path: Path) -> None:
     import safetensors.torch as sf
     import torch
 
+    if unet.conv_in.in_channels != 4:
+        raise ValueError("IC-Light must be configured once on a 4-channel base UNet")
     with torch.no_grad():
+        original_conv = unet.conv_in
         new_conv_in = torch.nn.Conv2d(
             8,
-            unet.conv_in.out_channels,
-            unet.conv_in.kernel_size,
-            unet.conv_in.stride,
-            unet.conv_in.padding,
+            original_conv.out_channels,
+            original_conv.kernel_size,
+            original_conv.stride,
+            original_conv.padding,
+            dilation=original_conv.dilation,
+            groups=original_conv.groups,
+            bias=original_conv.bias is not None,
+            padding_mode=original_conv.padding_mode,
+            device=original_conv.weight.device,
+            dtype=original_conv.weight.dtype,
         )
         new_conv_in.weight.zero_()
-        new_conv_in.weight[:, :4].copy_(unet.conv_in.weight)
-        new_conv_in.bias = unet.conv_in.bias
+        new_conv_in.weight[:, :4].copy_(original_conv.weight)
+        new_conv_in.bias = original_conv.bias
         unet.conv_in = new_conv_in
 
     original_forward = unet.forward
 
     def hooked_forward(sample, timestep, encoder_hidden_states, **kwargs):
-        concat = kwargs["cross_attention_kwargs"]["concat_conds"].to(sample)
+        attention_kwargs = dict(kwargs.get("cross_attention_kwargs") or {})
+        concat = attention_kwargs.pop("concat_conds", None)
+        if concat is None:
+            raise ValueError("IC-Light requires cross_attention_kwargs['concat_conds']")
+        if (sample.ndim != 4 or concat.ndim != 4 or sample.shape[1] != 4
+                or concat.shape[1] != 4 or sample.shape[2:] != concat.shape[2:]
+                or concat.shape[0] == 0 or sample.shape[0] % concat.shape[0]):
+            raise ValueError("IC-Light source condition must have compatible batch and 4-channel latent shape")
+        concat = concat.to(sample)
         concat = torch.cat([concat] * (sample.shape[0] // concat.shape[0]), dim=0)
-        kwargs["cross_attention_kwargs"] = {}
+        kwargs["cross_attention_kwargs"] = attention_kwargs
         return original_forward(
             torch.cat([sample, concat], dim=1), timestep, encoder_hidden_states, **kwargs
         )
 
-    unet.forward = hooked_forward
     offset = sf.load_file(str(checkpoint_path), device="cpu")
     original = unet.state_dict()
-    unet.load_state_dict({key: original[key] + offset[key] for key in original}, strict=True)
+    if set(original) != set(offset):
+        raise ValueError("IC-Light offset keys differ from the configured base UNet")
+    if any(original[key].shape != offset[key].shape for key in original):
+        raise ValueError("IC-Light offset shapes differ from the configured base UNet")
+    unet.load_state_dict({key: original[key] + offset[key].to(original[key]) for key in original}, strict=True)
+    # Keep config.in_channels=4: the pipelines still create four noise channels;
+    # this forward adds the other four source-condition channels.
+    unet.forward = hooked_forward
 
 
 def load_pipeline() -> tuple[object, object, object]:
@@ -166,17 +189,18 @@ def load_pipeline() -> tuple[object, object, object]:
     ).to("cuda")
     pipe_i2i.scheduler = pipe_t2i.scheduler
     pipe_i2i.set_progress_bar_config(disable=True)
-    # Inject last: these custom LoRA layers are held by forward closures, not UNet children.
+    # Inject after both pipelines move their shared UNet, using its serving dtype/device.
     if os.getenv("ADAPTVPR_LORA_CHECKPOINT", "").strip():
         import sys
-        from safetensors import safe_open
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-        from experiments.vpr_guidance.lora_utils import inject_lora_into_unet, load_lora_checkpoint
+        from experiments.vpr_guidance.lora_utils import (
+            inject_lora_into_unet, load_lora_checkpoint, lora_config_from_metadata, read_lora_metadata,
+        )
         lora_checkpoint = _required_path("ADAPTVPR_LORA_CHECKPOINT")
-        with safe_open(str(lora_checkpoint), framework="pt") as f:
-            metadata = f.metadata() or {}
-        lora_layers = inject_lora_into_unet(unet, rank=int(metadata["lora_rank"]), alpha=float(metadata["lora_alpha"]))
+        rank, alpha = lora_config_from_metadata(read_lora_metadata(lora_checkpoint))
+        lora_layers = inject_lora_into_unet(unet, rank=rank, alpha=alpha)
         load_lora_checkpoint(lora_layers, lora_checkpoint)
+    unet.eval().requires_grad_(False)
     return pipe_t2i, pipe_i2i, vae
 
 
@@ -189,9 +213,10 @@ def _concat_condition(image, vae, width: int, height: int):
     import numpy as np
     import torch
 
-    resized = image.resize((width, height))
+    resized = image.convert("RGB").resize((width, height))
     array = np.asarray(resized).astype("float32") / 127.5 - 1.0
-    tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).to("cuda", dtype=torch.float16)
+    parameter = next(vae.parameters())
+    tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).to(parameter)
     with torch.inference_mode():
         return vae.encode(tensor).latent_dist.mode() * vae.config.scaling_factor
 

@@ -1,386 +1,45 @@
-# Integration TODOs
+# SALAD 反馈闭环：集成状态与后续实验
 
-This document lists components that need to be implemented or connected to complete the full pipeline.
+更新日期：2026-10-08。当前路线已经从“外部检索失败找回 GSV 源图”改为“训练源图的 verified 候选，经当前学生的 mined-positive utility 选择，再进行学生训练和条件去噪 LoRA”。可运行命令统一见 [README](README.md)，SALAD 数据与评估协议见 [工作流](../../../salad/WORKFLOW.md)。
 
-**Update (2026-10-07):** SALAD entry points now exist in the separate `salad/`
-checkout: `salad/train_salad.py` and `salad/evaluate_salad.py`. See
-[the runnable workflow](../../../salad/WORKFLOW.md) for current commands,
-accepted synthetic JSONL input, evaluation protocols, checkpoint recovery,
-and the explicit manifest required by RobotCar-Seasons. From this directory,
-invoke them as `python ../../../salad/train_salad.py ...` and
-`python ../../../salad/evaluate_salad.py ...`. The older interface examples
-below describe the integration design; they are not local files in this directory.
-The iterative orchestration remains unconnected. IC-Light LoRA inference is now
-available through the adapter's optional `ADAPTVPR_LORA_CHECKPOINT` environment
-variable; see [service configuration](../../docs/API_CONTRACTS.md).
+## 已连接的组件
 
-## ✅ Completed Components
+- [x] `generate_candidates.py` 复用发布的 Global prompts、AdaptVPR 源图解析、IC-Light 两阶段 sampler、rain 策略和 Global 双指标 verifier。
+- [x] 固定 seed 与过滤后连续切片；候选身份、路径、配置/代码/输入指纹校验；JPEG 原子保存、截断尾行恢复与损坏图像补生成。
+- [x] `score_candidates.py` 使用当前 SALAD checkpoint、GSV 元数据 place 标签、按 place 分组的真实负池与同 place 的真实正 co-anchors，按每次抽样 mining 后平均 utility。
+- [x] `random` 与 `hardness` 在相同的合格候选组中选一张；评分记录 expected utility、mining probability 和 unusable 原因。
+- [x] `salad/train_salad.py` 支持 real-only、real + accepted pool、完整学生 checkpoint 初始化及 epoch 边界恢复。
+- [x] `train_lora.py` 只使用 verified 且高于 utility 阈值的 selected，训练现有 8-channel IC-Light UNet 的 attention LoRA；SALAD 不参与梯度传播。
+- [x] LoRA 层注册、fp32 参数、冻结基础权重、scheduler prediction type、完整批次循环与数据路径/分辨率检查。
+- [x] LoRA `.training.pt` v2 保存 optimizer、schedule、sampler 和随机状态；安全加载拒绝旧 v1 状态；服务权重在全部步骤完成后发布。
+- [x] IC-Light adapter 可加载服务 LoRA；`run_loop.py` 连接 `random`、`select`、`full`，支持 extra args、无 mined positives 时保留生成器、阶段指纹缓存及恢复。
+- [x] `audit` 与 `final --match-pools` 校验三个分支共同的 prompt/source/condition 组；最终学生使用预训练 backbone 和新随机 aggregator。
+- [x] `--dry-run`、SALAD/LoRA `--check-data` 和 CPU/mock 回归检查。
+- [x] 保留 `hard_cases.py`、`extract_hard_cases.py` 的兼容接口：只接受明确 source_id，不从外部 SVOX query 反推 GSV 源图。
 
-- [x] Hard case loading and management (`hard_cases.py`)
-- [x] Three loss functions: diffusion, identity, diversity (`losses.py`)
-- [x] LoRA injection and checkpoint management (`lora_utils.py`)
-- [x] LoRA fine-tuning script (`finetune_generator.py`)
-- [x] Hard case extraction utility (`extract_hard_cases.py`)
-- [x] Test suite (`test_implementation.py`)
-- [x] Documentation (README, QUICKSTART, DESIGN_COMPARISON)
-- [x] SALAD training entry point (`../../../salad/train_salad.py`)
-- [x] SALAD evaluation entry point (`../../../salad/evaluate_salad.py`)
-- [x] Optional IC-Light LoRA loading in `adapters/iclight_sd15_fc.py`
+旧的 `finetune_generator.py`、`losses.py`、`run_iterative_pipeline.py` 以及旧 QUICKSTART/设计摘要已经被 Claude 移除；它们不是待补齐的入口。当前 LoRA 目标是筛选正样本上的条件去噪 MSE，没有旧文档里的 identity/diversity 联合损失。
 
-## ⚠️ Missing Components (Need Implementation)
+## 当前证据
 
-### 1. SALAD Training Script
+现有 Bangkok probe 共 160 个候选、37 个通过旧 verifier。修正后的评分保留 18 个 prompt 组，8 张 selected 的 utility 大于 0。合格候选和 selected 的平均 mining probability 分别为 `0.2179`、`0.2292`。`train_lora.py --check-data` 读到 18 行、8 个合格训练例，分辨率为 `400 × 296`。
 
-**File**: `train_salad.py`
+这些数字来自 `outputs/vpr_guidance_smoke/cand_probe/` 与 `outputs/vpr_guidance_smoke/score_probe_codex/`。legacy 迁移只校验当前配置、身份和产物，保留原 verifier scores，并记录历史 input/code/model hashes 缺失。它不等同于重新运行 verifier。
 
-**Purpose**: Train a fresh SALAD model on real + synthetic data
+## 尚需完成的实验
 
-**Inputs**:
-- GSV-Cities real images
-- AdaptVPR generated synthetic images (from manifest)
-- Validation sets (SVOX, Nordland, RobotCar)
+- [ ] 按同一参数和 seed 跑完三个分支的多轮实验，保存每轮 accepted groups、utility 分布、mining probability、学生数据曝光与 LoRA 更新/跳过记录。
+- [ ] 在三个 `final_pool.jsonl` 完成后执行 `audit --match-pools`，报告每个分支被排除的组及共同组数；以共同组的 matched pools 做公平 final。
+- [ ] 加入同配方的 real-only final 基线，并完成 SVOX 各 condition 的独立 Recall@1/5/10 评估。反馈学生或少量 query 的 smoke 结果不能代替最终比较。
+- [ ] 使用多个 seed 验证选择与 LoRA 的差异，报告均值、波动和 verifier 接受率，避免把一次小规模 probe 当作效果结论。
+- [ ] 扩展训练城市/conditions，并在需要时运行 Nordland、RobotCar-Seasons 等协议；RobotCar 使用明确 eval manifest，不猜测配对关系。
+- [ ] 检查 negative-pool size、抽样次数与 synthetic exposure 对结果的影响。当前 utility 是 real-only batch 的 MS 正项代理，不覆盖 synthetic co-anchors、随机训练增强、完整负项或所有尾 batch。
 
-**Outputs**:
-- Trained SALAD checkpoint
-- Training logs and metrics
+完整闭环已有入口，以上是尚待运行和验证的实验，不是宣称已获得的 Recall 改善。
 
-**Interface**:
-```python
-python train_salad.py \
-  --real-data /path/to/Gsvcities \
-  --synthetic-manifest /path/to/generation/manifest.json \
-  --output-dir ./outputs/salad \
-  --epochs 50 \
-  --batch-size 32 \
-  --backbone dinov2_vitb14 \
-  --aggregator salad \
-  --init-policy random_aggregator_pretrained_backbone
-```
+## 运行时约束
 
-**Key Requirements**:
-- Use pretrained DINOv2 backbone (frozen or partially frozen)
-- Initialize SALAD aggregator randomly (not from pretrained)
-- Train with MultiSimilarityLoss + hard mining
-- Track real vs synthetic exposure per epoch
-- Save checkpoints at regular intervals
+同一实验 root 的参数、输入和关键实现必须保持不变。wrapper 对 manifest/checkpoint/元数据文件按内容哈希，对大型目录按 inventory、size、mtime 签名；后者不是全部 JPEG 内容校验。改配方或代码后使用新 root。
 
-**Reference**: Original SALAD repository: https://github.com/serizba/salad
+离线 fresh/student-0/final 使用本地 `--backbone-repo` 和 `--backbone-weights`。完整 SALAD `--init-checkpoint`/resume 已含 backbone，wrapper 会移除额外 backbone weights；final 始终建立新 aggregator。LoRA `--resume` 仅恢复同一次 v2 训练，`--init-lora` 用于新轮次，两者互斥。
 
----
-
-### 2. SALAD Evaluation Script
-
-**File**: `evaluate_salad.py`
-
-**Purpose**: Evaluate trained SALAD on validation sets and extract error cases
-
-**Inputs**:
-- Trained SALAD checkpoint
-- Validation dataset (SVOX/Nordland/RobotCar)
-
-**Outputs**:
-- Recall@1/5/10 metrics
-- Error cases JSON (for hard case extraction)
-- Visualization of hard cases (optional)
-
-**Interface**:
-```python
-python evaluate_salad.py \
-  --checkpoint ./outputs/salad/checkpoint.pt \
-  --dataset SVOX \
-  --dataset-root /path/to/SVOX \
-  --output ./outputs/evaluation/SVOX_results.json \
-  --save-hard-cases
-```
-
-**Output Format** (must match `extract_hard_cases.py` expectations):
-```json
-{
-  "dataset": "SVOX",
-  "checkpoint": "/path/to/checkpoint.pt",
-  "recall": {
-    "R@1": 0.847,
-    "R@5": 0.923,
-    "R@10": 0.956
-  },
-  "error_queries": [
-    {
-      "query_id": "Bangkok/12345_0",
-      "query_path": "/path/to/query.jpg",
-      "ground_truth": "Bangkok/12345_90",
-      "predicted": "Bangkok/67890_0",
-      "rank": 15,
-      "distance_pred": 0.12,
-      "distance_gt": 0.45
-    },
-    ...
-  ]
-}
-```
-
----
-
-### 3. IC-Light Generation with LoRA
-
-**File**: `generate_with_lora.py`
-
-**Purpose**: Generate synthetic images using IC-Light + fine-tuned LoRA
-
-**Inputs**:
-- GSV-Cities source images
-- Generation prompts (from AdaptVPR planning)
-- LoRA checkpoint (optional, None = vanilla IC-Light)
-
-**Outputs**:
-- Generated images
-- Generation manifest (paths, prompts, verification results)
-
-**Interface**:
-```python
-python generate_with_lora.py \
-  --sources /path/to/sources.txt \
-  --prompts /path/to/prompts.jsonl \
-  --lora-checkpoint ./outputs/lora/lora_final.safetensors \
-  --output-dir ./outputs/generated \
-  --base-model /path/to/sd15 \
-  --iclight-checkpoint /path/to/iclight_sd15_fc.safetensors \
-  --num-inference-steps 25 \
-  --highres-denoise 0.30
-```
-
-**Key Requirements**:
-- Load base IC-Light pipeline
-- Inject LoRA if provided, else use vanilla
-- Run AdaptVPR verification on generated images
-- Save only accepted images (passed=True, eligible_for_training=True)
-- Create manifest compatible with SALAD training
-
-**Integration Point**: Can reuse existing `AdaptVPR/run.py` generation logic, just need to inject LoRA before generation
-
----
-
-### 4. Integration with AdaptVPR Generation Pipeline
-
-**File**: Modify `AdaptVPR/adapters/iclight_sd15_fc.py` or create wrapper
-
-**Purpose**: Allow AdaptVPR generation to use a LoRA checkpoint
-
-**Current**: The adapter optionally loads a VPR-guidance checkpoint from
-`ADAPTVPR_LORA_CHECKPOINT`, using checkpoint metadata for rank and alpha. The
-launcher forwards this setting and resolves relative paths. Both sampling
-pipelines share the adapted UNet. Leave the variable unset/empty for vanilla.
-
-**Completed interface**: Environment variable (Approach 1 below). The additional
-adapter/API alternatives below are design options, not implemented interfaces.
-
-**Approach 1: Environment Variable**
-```python
-# In iclight_sd15_fc.py, after loading UNet:
-lora_checkpoint = os.getenv("ADAPTVPR_LORA_CHECKPOINT")
-if lora_checkpoint:
-    from experiments.vpr_guidance.lora_utils import inject_lora_into_unet, load_lora_checkpoint
-    lora_layers = inject_lora_into_unet(unet, rank=8, alpha=8.0)
-    load_lora_checkpoint(lora_layers, Path(lora_checkpoint))
-    print(f"Loaded LoRA from {lora_checkpoint}")
-```
-
-**Approach 2: Separate Adapter**
-```python
-# Create iclight_sd15_fc_lora.py
-# Same as iclight_sd15_fc.py but with LoRA injection
-# Set different port (8003) and environment variable for LoRA path
-```
-
-**Approach 3: API Parameter**
-```python
-# Modify GenerateRequest in iclight_sd15_fc.py
-class GenerateRequest(BaseModel):
-    image_path: str
-    prompt: str
-    # ... existing fields ...
-    lora_checkpoint: Optional[str] = None  # New field
-```
-
----
-
-## 🔌 Integration Points
-
-### Connection 1: AdaptVPR → SALAD Training
-
-**From**: `AdaptVPR/run.py` output (generation manifest + images)
-
-**To**: `train_salad.py` input (real + synthetic data)
-
-**Bridge**: Need to parse AdaptVPR manifest and create dataset
-
-```python
-# In train_salad.py
-def load_synthetic_data(manifest_path: Path):
-    """Load synthetic images from AdaptVPR manifest."""
-    records = load_jsonl(manifest_path.parent / "records")
-    
-    synthetic_images = []
-    for record in records:
-        if record.get("passed") and record.get("eligible_for_training"):
-            source_path = record["source_path"]
-            generated_path = record["output_path"]
-            synthetic_images.append({
-                "source": source_path,
-                "generated": generated_path,
-                "route": record["route"],
-                "prompt": record.get("prompt"),
-            })
-    
-    return synthetic_images
-```
-
-### Connection 2: SALAD Evaluation → Hard Cases
-
-**From**: `evaluate_salad.py` output (error cases JSON)
-
-**To**: `extract_hard_cases.py` input
-
-**Bridge**: Already implemented in `extract_hard_cases.py`, just need matching format
-
-### Connection 3: Hard Cases → LoRA Training
-
-**From**: `extract_hard_cases.py` output (hard_cases.json)
-
-**To**: `finetune_generator.py` input
-
-**Bridge**: Already implemented, just need valid source_path mapping
-
-```python
-# In finetune_generator.py, improve source path resolution
-def resolve_source_path(case: HardCase, gsv_root: Path) -> Path | None:
-    """Find source image in GSV-Cities."""
-    source_id = case.source_id or case.query_id
-    
-    # Try multiple patterns
-    patterns = [
-        gsv_root / "Images" / source_id,
-        gsv_root / "Images" / source_id.replace("_", "/"),
-        # Add more patterns as needed
-    ]
-    
-    for path in patterns:
-        if path.exists():
-            return path
-    
-    return None
-```
-
-### Connection 4: LoRA → Generation
-
-**From**: `finetune_generator.py` output (LoRA checkpoint)
-
-**To**: AdaptVPR generation with LoRA loaded
-
-**Bridge**: See "Integration with AdaptVPR Generation Pipeline" above
-
----
-
-## 📋 Complete Workflow Checklist
-
-To run the full iterative pipeline:
-
-### Round 0: Baseline
-
-- [ ] Generate synthetic data with vanilla IC-Light
-  - `python AdaptVPR/run.py ...` (existing)
-  
-- [ ] Train SALAD on real + synthetic
-  - `python train_salad.py ...` (**TODO**)
-  
-- [ ] Evaluate SALAD on validation sets
-  - `python evaluate_salad.py --dataset SVOX ...` (**TODO**)
-  - `python evaluate_salad.py --dataset Nordland ...` (**TODO**)
-  - `python evaluate_salad.py --dataset RobotCar ...` (**TODO**)
-  
-- [ ] Extract and merge hard cases
-  - `python extract_hard_cases.py merge ...` (✅ implemented)
-
-### Round 1: First LoRA
-
-- [ ] Fine-tune LoRA on hard cases
-  - `python finetune_generator.py ...` (✅ implemented)
-  
-- [ ] Generate synthetic data with LoRA
-  - Set `ADAPTVPR_LORA_CHECKPOINT`, restart the adapter, then run `python AdaptVPR/run.py ...`
-  - No `--lora-checkpoint` flag is provided by `run.py`.
-  
-- [ ] Train SALAD on real + new synthetic
-  - `python train_salad.py ...` (**TODO**)
-  
-- [ ] Evaluate and extract hard cases
-  - Same as Round 0
-
-### Round 2+: Iteration
-
-- Repeat Round 1 steps with updated LoRA
-
----
-
-## 🎯 Priority Implementation Order
-
-### P0 (Critical Path)
-1. **SALAD training script** - Without this, can't evaluate if the approach works
-2. **SALAD evaluation script** - Need hard cases to fine-tune LoRA
-3. **LoRA support in AdaptVPR generation** - Need to use fine-tuned LoRA
-
-### P1 (Important)
-4. **Source path resolution** - Better heuristics for finding GSV source from query_id
-5. **Manifest compatibility** - Ensure AdaptVPR output works with SALAD input
-6. **Checkpoint management** - Clean interface for saving/loading between rounds
-
-### P2 (Nice to Have)
-7. **Visualization tools** - Plot loss curves, visualize hard cases, compare images
-8. **Hyperparameter tuning** - Grid search for lambda weights, LoRA rank
-9. **Multi-GPU support** - Distribute training across GPUs
-
----
-
-## 🧪 Testing Strategy
-
-After implementing each component:
-
-1. **Unit test**: Does it run without errors on minimal input?
-2. **Smoke test**: Does it produce reasonable output on small dataset?
-3. **Integration test**: Does output from A work as input to B?
-4. **Full pipeline test**: Can you run one complete round end-to-end?
-
-For the full pipeline test:
-- Use 10 source images
-- Generate 10 synthetic images (Round 0)
-- Train SALAD for 5 epochs (sanity check)
-- Evaluate on 50 validation queries (mock dataset)
-- Extract ~5 hard cases
-- Fine-tune LoRA for 50 steps
-- Generate 10 new synthetic images (Round 1)
-- Compare SALAD_0 vs SALAD_1 recall
-
-If all steps complete and SALAD_1 ≈ SALAD_0, that's acceptable for initial test. Real improvement needs full-scale runs.
-
----
-
-## 📝 Documentation TODOs
-
-- [ ] Add example SALAD evaluation output format to docs
-- [ ] Document GSV-Cities path resolution logic
-- [ ] Add troubleshooting section for common integration issues
-- [ ] Create diagram of complete data flow
-- [ ] Write comparison section: vanilla vs LoRA generation quality
-
----
-
-## 🤝 External Dependencies
-
-Components that depend on external code:
-
-1. **SALAD implementation**: Need to adapt from https://github.com/serizba/salad
-2. **VPR datasets**: SVOX, Nordland, RobotCar loaders
-3. **GSV-Cities loader**: Parse official dataframes
-4. **IC-Light weights**: Download from HuggingFace
-5. **DINOv2 weights**: Load from torch.hub or local
-
-Make sure all external dependencies are documented in main README.
+正式效果报告应结合实验 config、pool audit、训练产物和独立评估输出。已完成的真实 GPU smoke、恢复核验与回归测试见 [验证报告](VALIDATION.md)，其中的小型 fixture 和有限 query 评估只证明机制可运行。
