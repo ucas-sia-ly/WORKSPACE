@@ -66,6 +66,44 @@ $$m(a)=\overline{s(a,P)}-\mathbb{E}_d[h_d(a)],$$
 
 门限只检查标签是否可信，不能保证"更难"更有用；这一点仍需 final Recall 回答。
 
+## 自适应候选生成（实验入口）
+
+`adaptive_candidates.py` 在同一进程中加载 IC-Light、双指标 verifier 和当前 SALAD 学生。真实正图、负池和真实视图 plausibility 校准只提取一次；每张最终 JPEG 先经过原 Global 验证，再检查 CLIP 天气变化，最后进行学生评分。默认使用诊断中的 `SDEdit 0.85` 和精简天气优先 prompt；这些配置仅用于该实验入口，生产 prompt、adapter API、路由与 Global 阈值保持原协议。
+
+默认天气门槛是固定尺度 CLIP contrast 的 `weather_shift > 6`，不是天气概率。该值是小规模非盲目视诊断得到的探索参数；不能把弱天气过滤或联合通过当作结构真值。用 `--weather-min-shift` 调整，`--disable-weather-gate` 做消融。天气信号复用 verifier 的源图和生成图 embedding，不加载第二份 CLIP。
+
+每个 prompt 最多生成 `--num-candidates` 张。达到 `--min-candidates` 后，只要已经找到一张同时通过 Global、天气与 plausibility，且 `utility > --stop-utility`、`mining_probability >= --stop-mining-probability` 的候选，就停止该组生成。默认分别为 1、0、0.25。达到预算但没有达标时，从已有合格候选中选择一张；没有合格候选则该组退出。停止目标控制搜索预算，最终 hardness/random 选择仍使用所有已看到的合格候选，因此选中图不一定达到 mining 停止目标。`--sampling-policy fixed` 使用完全相同的实验采样器、门槛和 seed，但总是生成 K 张，可用于资源对照。
+
+闭环可直接启用新入口：
+
+```bash
+python AdaptVPR/experiments/vpr_guidance/run_loop.py loop \
+  --root outputs/vpr_guidance_adaptive --arm select \
+  --gsv-root dataset/gsv-cities --cities Bangkok \
+  --prompts dataset/AdaptCities/prompts/adaptcities_160k_prompts.jsonl \
+  --rounds 3 --sources-per-round 500 --candidates 4 \
+  --generation-mode adaptive \
+  --adaptive-args='--min-candidates 1 --weather-min-shift 6 --stop-mining-probability 0.25' \
+  --backbone-repo /home/admin123/.cache/torch/hub/facebookresearch_dinov2_main \
+  --salad-args='--batch-size 32 --images-per-place 4 --num-workers 4 --backbone-weights /home/admin123/.cache/torch/hub/checkpoints/dinov2_vitb14_pretrain.pth'
+```
+
+`random`、`select`、`full` 都可用该模式；默认仍是原固定 K 流程。新模式的候选目录属于各分支当前学生，不能跨学生复用；分支候选预算与分布可能不同。adaptive-vs-fixed 回答资源和接受质量问题；它不能代替共享固定候选池上的 random-vs-hardness 选择消融，matched pools 也不能消除这种搜索差异。正式效果仍需同起点、同训练曝光、real-only 对照、多 seed 与完整独立 Recall 评估。
+
+在线和独立 scorer 现在使用训练数据集最大真实视图数固定正图抽样上下文，保证同一候选逐张评分与批量评分一致。历史评分的 Monte Carlo 正图抽样可能不同；修改代码或参数后须使用新实验 root。
+
+新入口逐张保存 `candidates.jsonl`，包含原 Global verdict、天气 contrast、utility、plausibility、最终 eligibility 和图像/行哈希。完整重跑校验产物后跳过模型加载；中断恢复只补未完成前缀；损坏图像使该组从首个损坏候选开始重生成。`summary.json` 记录每组尝试数、停止原因和相对于 K 的调用节省量。`--plan-only` 打印冻结配置，不加载模型也不写目录。SALAD 可用 `--score-args='--device cpu'` 放在 CPU 上，IC-Light 仍需要 CUDA。
+
+天气校准复现：
+
+```bash
+python AdaptVPR/experiments/generation_diagnosis/calibrate_weather_signal.py \
+  --reviews outputs/gen_diagnosis/manual_reviews_iclight.jsonl \
+  --out outputs/gen_diagnosis/weather_calibration_new
+```
+
+它核对源图和输出哈希，并按源图留一校准；同源图的所有天气/方法都在同一个 fold，避免候选泄漏。现有 non-blind agent 标签仍不是独立人工真值。实现与实测范围见 [自适应验证记录](ADAPTIVE_VALIDATION.md)。
+
 ## 环境与依赖
 
 以下命令均从工作区根目录执行。项目当前可用的环境是 `conda AdaptVPR`，也可以直接使用其绝对解释器路径。

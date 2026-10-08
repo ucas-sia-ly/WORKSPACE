@@ -38,6 +38,9 @@ def parse_args(argv=None):
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--sources-per-round", type=int, default=500)
     parser.add_argument("--candidates", type=int, default=4)
+    parser.add_argument("--generation-mode", choices=["fixed", "adaptive"], default="fixed",
+                        help="adaptive combines experimental generation, weather gate and online student scoring")
+    parser.add_argument("--adaptive-args", default="", help="Extra adaptive sampler/stopping settings")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--student-init-epochs", type=int, default=10)
     parser.add_argument("--student-checkpoint", type=Path,
@@ -112,7 +115,7 @@ def _without_option(flags, option):
     return result
 
 
-def _input_signature(path):
+def _input_signature(path, *, ignore_runtime=False):
     path = Path(path)
     if path.is_file():
         return {"method": "content_sha256", "sha256": file_sha256(path)}
@@ -121,12 +124,16 @@ def _input_signature(path):
     # Large image corpora are checked by inventory/stat; model/manifest files by content.
     digest, count = hashlib.sha256(), 0
     for child in sorted(path.rglob("*")):
+        if ignore_runtime and (any(part in {".git", "__pycache__"} for part in child.relative_to(path).parts)
+                               or child.suffix in {".pyc", ".pyo"}):
+            continue
         if child.is_file():
             stat = child.stat()
             digest.update(json.dumps([str(child.relative_to(path)), stat.st_size, stat.st_mtime_ns],
                                      ensure_ascii=False).encode() + b"\0")
             count += 1
-    return {"method": "file_inventory_size_mtime", "sha256": digest.hexdigest(), "files": count}
+    return {"method": "file_inventory_size_mtime", "sha256": digest.hexdigest(), "files": count,
+            **({"ignored_runtime": [".git", "__pycache__", "*.pyc", "*.pyo"]} if ignore_runtime else {})}
 
 
 def salad_flags(args, output_dir, epochs, manifest=None, init=None, extra=()):
@@ -250,7 +257,8 @@ def _pool_contract(rows):
         key = row["sample_id"]
         if key in groups:
             raise ValueError(f"Duplicate selected prompt group: {key}")
-        if row.get("passed") is not True or row.get("eligible_for_training") is not True:
+        if (row.get("passed") is not True or row.get("eligible_for_training") is not True
+                or row.get("weather_ok", True) is not True or row.get("plausible", True) is not True):
             raise ValueError(f"Pool contains an unverified or ineligible image: {key}")
         source, output = str(Path(row["source_path"]).resolve()), str(Path(row["output_path"]).resolve())
         if output in outputs or source == output:
@@ -295,6 +303,13 @@ def loop(args, run):
                                                  "--miner-margin"])
     lora_extras = _extra_flags(args.lora_args, ["--selected", "--output", "--steps", "--seed", "--init-lora", "--resume",
                                               "--check-data", "--help"])
+    adaptive_extras = _extra_flags(args.adaptive_args, ["--prompts", "--image-root", "--real-data", "--checkpoint",
+                                                      "--output-dir", "--cities", "--conditions", "--offset",
+                                                      "--num-sources", "--num-candidates", "--lora", "--seed",
+                                                      "--score-args", "--selection", "--backbone-repo",
+                                                      "--plan-only", "--help"])
+    if args.generation_mode == "fixed" and adaptive_extras:
+        raise ValueError("--adaptive-args requires --generation-mode adaptive")
     threshold_parser = argparse.ArgumentParser(add_help=False)
     threshold_parser.add_argument("--min-utility", type=float, default=0.0)
     threshold, _ = threshold_parser.parse_known_args(lora_extras)
@@ -312,6 +327,8 @@ def loop(args, run):
                   "salad_args": shlex.split(args.salad_args), "score_args": score_extras,
                   "lora_steps": args.lora_steps, "lora_args": lora_extras,
                   "backbone_repo": str(args.backbone_repo) if args.backbone_repo else None}
+        if args.generation_mode == "adaptive":
+            config.update(generation_mode="adaptive", adaptive_args=adaptive_extras)
         config_path = args.root / "experiment_config.json"
         if config_path.exists() and json.loads(config_path.read_text()) != config:
             raise ValueError(f"Shared arm configuration changed: {config_path}; use a new experiment root")
@@ -327,7 +344,8 @@ def loop(args, run):
     lora, pool = None, []
     for r in range(args.rounds):
         round_dir = arm_root / f"round_{r}"
-        candidates_dir = (shared / f"candidates_released_round_{r}" if lora is None else round_dir / "candidates")
+        candidates_dir = (round_dir / "scoring" if args.generation_mode == "adaptive" else
+                          shared / f"candidates_released_round_{r}" if lora is None else round_dir / "candidates")
         generation = ["--prompts", args.prompts, "--image-root", args.gsv_root / "Images",
                       "--output-dir", candidates_dir, "--cities", *args.cities,
                       "--offset", r * args.sources_per_round, "--num-sources", args.sources_per_round,
@@ -336,7 +354,6 @@ def loop(args, run):
             generation += ["--conditions", *args.conditions]
         if lora is not None:
             generation += ["--lora", lora]
-        run(GUIDANCE_ROOT / "generate_candidates.py", *generation)
         scoring = round_dir / "scoring"
         score = ["--candidates", candidates_dir / "candidates.jsonl", "--checkpoint", student_ckpt,
                  "--real-data", args.gsv_root, "--cities", *args.cities, "--output-dir", scoring,
@@ -346,12 +363,25 @@ def loop(args, run):
                  *score_extras]
         if args.backbone_repo:
             score += ["--backbone-repo", args.backbone_repo]
-        run(GUIDANCE_ROOT / "score_candidates.py", *score, complete=scoring / "scoring_complete.json",
-            outputs=[scoring / "scored.jsonl", scoring / "selected.jsonl", scoring / "summary.json"],
-            inputs=[candidates_dir / "candidates.jsonl", student_ckpt,
-                    *(args.gsv_root / "Dataframes" / f"{city}.csv" for city in args.cities),
-                    *(args.gsv_root / "Images" / city for city in args.cities),
-                    *([args.backbone_repo] if args.backbone_repo else [])])
+        if args.generation_mode == "adaptive":
+            online_score_flags = ["--train-batch-size", effective.batch_size, "--images-per-place", effective.images_per_place,
+                                  "--min-images-per-place", effective.min_images_per_place,
+                                  "--miner-margin", effective.miner_margin, *score_extras]
+            online = [*generation, "--real-data", args.gsv_root, "--checkpoint", student_ckpt,
+                      "--selection", "random" if args.arm == "random" else "hardness",
+                      "--score-args=" + shlex.join(list(map(str, online_score_flags))), *adaptive_extras]
+            if args.backbone_repo:
+                online += ["--backbone-repo", args.backbone_repo]
+            # Candidate prefixes validate their own artifacts even on a completed run.
+            run(GUIDANCE_ROOT / "adaptive_candidates.py", *online)
+        else:
+            run(GUIDANCE_ROOT / "generate_candidates.py", *generation)
+            run(GUIDANCE_ROOT / "score_candidates.py", *score, complete=scoring / "scoring_complete.json",
+                outputs=[scoring / "scored.jsonl", scoring / "selected.jsonl", scoring / "summary.json"],
+                inputs=[candidates_dir / "candidates.jsonl", student_ckpt,
+                        *(args.gsv_root / "Dataframes" / f"{city}.csv" for city in args.cities),
+                        *(args.gsv_root / "Images" / city for city in args.cities),
+                        *([args.backbone_repo] if args.backbone_repo else [])])
         pool_path = round_dir / "pool.jsonl"
         if not run.dry_run:
             pool += read_jsonl(scoring / "selected.jsonl")

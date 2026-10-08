@@ -145,6 +145,7 @@ def score_candidates(
     epsilon: float = 0.1,
     seed: int = 0,
     positives_per_batch: int | None = None,
+    positive_context_width: int | None = None,
 ) -> list[dict[str, float | int]]:
     """Average mined positive utility over batch draws against a real-only pool.
 
@@ -153,6 +154,8 @@ def score_candidates(
     ``mined_pairs`` is an expected count and ``mining_probability`` is the share
     of draws with any mined positive. Shared random draws eliminate Monte Carlo
     differences between duplicate or same-place candidate descriptors.
+    ``positive_context_width`` fixes random positive keys across differently
+    sized candidate batches, required for online and offline score equivalence.
     """
     _descriptor_tensor(candidate_descriptors, "candidate_descriptors", (2,))
     _descriptor_tensor(pool_descriptors, "pool_descriptors", (2, 3))
@@ -174,6 +177,11 @@ def score_candidates(
     if len(candidates) == 0:
         return []
     width = max(len(p) for p in positive_descriptors)
+    if positive_context_width is not None:
+        _positive_integer(positive_context_width, "positive_context_width")
+        if positive_context_width < width:
+            raise ValueError("positive_context_width cannot be smaller than a positive set")
+        width = positive_context_width
     positive_similarity = candidates.new_zeros((len(candidates), width))
     mask = torch.zeros_like(positive_similarity, dtype=torch.bool)
     for i, positives in enumerate(positive_descriptors):
@@ -245,7 +253,8 @@ def select_per_group(rows: Sequence[dict[str, Any]], method: str, seed: int = 0,
         raise ValueError(f"Unknown selection method: {method}")
     groups: dict[Any, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        if row.get("passed") is True and row.get("plausible", True) is True:
+        if (row.get("passed") is True and row.get("plausible", True) is True
+                and row.get("weather_ok", True) is True):
             if group_key not in row:
                 raise ValueError(f"Verified candidate lacks {group_key}")
             if method == "hardness" and any(

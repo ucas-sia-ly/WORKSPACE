@@ -103,6 +103,19 @@ class LoopTests(unittest.TestCase):
         self.assertNotIn('--backbone-weights', fine_tune)
         self.assertIn('--batch-size', fine_tune)
 
+    def test_runtime_cache_files_do_not_change_experimental_source_signature(self):
+        directory = self.root / 'backbone'
+        directory.mkdir()
+        (directory / 'model.py').write_text('model')
+        before = _input_signature(directory, ignore_runtime=True)
+        (directory / '__pycache__').mkdir()
+        (directory / '__pycache__/model.pyc').write_bytes(b'cache')
+        (directory / '.git').mkdir()
+        (directory / '.git/index').write_bytes(b'git cache')
+        self.assertEqual(before, _input_signature(directory, ignore_runtime=True))
+        (directory / 'model.py').write_text('different source')
+        self.assertNotEqual(before, _input_signature(directory, ignore_runtime=True))
+
     def args(self, *extra):
         return parse_args(["loop", "--root", str(self.root / "experiment"), "--arm", "full",
                            "--gsv-root", str(self.root / "gsv"), "--cities", "Bangkok",
@@ -124,6 +137,32 @@ class LoopTests(unittest.TestCase):
             args = self.args("--salad-args=" + raw)
             with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, "managed"):
                 salad_flags(args, self.root / "model", 1)
+
+    def test_adaptive_loop_uses_online_outputs_and_keeps_arm_local_candidates(self):
+        args = self.args('--generation-mode', 'adaptive',
+                         '--salad-args=--batch-size 3 --images-per-place 2 --miner-margin 0.2',
+                         '--adaptive-args=--min-candidates 2')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            loop(args, Runner(dry_run=True))
+        generated = out.getvalue()
+        lines = [line for line in generated.splitlines() if 'adaptive_candidates.py' in line]
+        self.assertEqual(len(lines), 2)
+        self.assertIn('--train-batch-size 3 --images-per-place 2', lines[0])
+        self.assertIn('--miner-margin 0.2', lines[0])
+        self.assertIn('--min-candidates 2', lines[0])
+        self.assertIn('full/round_0/scoring', lines[0])
+        self.assertNotIn('score_candidates.py', generated)
+        self.assertNotIn('generate_candidates.py', generated)
+        self.assertFalse(args.root.exists())
+
+    def test_adaptive_extras_cannot_override_managed_inputs(self):
+        for flags in ('--checkpoint x', '--check=x', '--score-args=x', '--plan-only'):
+            args = self.args('--generation-mode', 'adaptive', '--adaptive-args=' + flags)
+            with patch('run_loop.salad_train') as train:
+                with self.assertRaisesRegex(ValueError, 'managed'):
+                    loop(args, Runner(dry_run=True))
+                train.assert_not_called()
 
     def test_synthetic_fraction_that_exposes_no_synthetic_images_is_rejected_early(self):
         args = self.args("--salad-args", "--images-per-place 2 --synthetic-fraction 0.1")

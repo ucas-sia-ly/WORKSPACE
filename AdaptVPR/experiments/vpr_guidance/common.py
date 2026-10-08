@@ -1,10 +1,10 @@
 """Shared paths and JSONL helpers for the SALAD-feedback generator loop.
 
-Stages run as separate processes. Generation/LoRA stages import AdaptVPR
-packages; the scoring stage imports the SALAD checkout. The two repositories
+Fixed-budget stages run as separate processes; the adaptive experimental stage
+imports both AdaptVPR and SALAD and keeps their inference models resident. The two repositories
 both define top-level packages such as ``tests``, and SALAD's ``datasets``
-package shadows Hugging Face ``datasets``, so each stage adds only the
-repository it needs to ``sys.path``.
+package shadows Hugging Face ``datasets``. Import only the required namespaces
+when both repositories are in one process.
 """
 
 from __future__ import annotations

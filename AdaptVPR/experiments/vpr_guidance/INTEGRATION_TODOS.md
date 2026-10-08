@@ -27,6 +27,8 @@
 
 ## 尚需完成的实验
 
+2026-10-08 续作已增加 `adaptive_candidates.py`、在线评分、复用 CLIP 的天气 signal，以及 `run_loop.py --generation-mode adaptive`。133 项 CPU 回归通过；均衡 6 组 GPU 检查生成 20/24 张，避免 4 次调用。天气分数已在真实图像哈希绑定下重算并作按源图留一验证。范围与限制见 [自适应验证记录](ADAPTIVE_VALIDATION.md)；下面正式效果实验仍待执行。
+
 - [ ] 按同一参数和 seed 跑完三个分支的多轮实验，保存每轮 accepted groups、utility 分布、mining probability、学生数据曝光与 LoRA 更新/跳过记录。
 - [ ] 在三个 `final_pool.jsonl` 完成后执行 `audit --match-pools`，报告每个分支被排除的组及共同组数；以共同组的 matched pools 做公平 final。
 - [ ] 加入同配方的 real-only final 基线，并完成 SVOX 各 condition 的独立 Recall@1/5/10 评估。反馈学生或少量 query 的 smoke 结果不能代替最终比较。

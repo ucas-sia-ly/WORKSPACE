@@ -47,6 +47,16 @@ python AdaptVPR/experiments/generation_diagnosis/report.py --run-dir outputs/gen
 
 ## 产物
 
+接续的天气信号校准脚本为 `calibrate_weather_signal.py`。它复用本地 CLIP，以审核文件中的源图/输出哈希和冻结生成记录核验配对，并按源图留一选门槛：
+
+```bash
+python AdaptVPR/experiments/generation_diagnosis/calibrate_weather_signal.py \
+  --reviews outputs/gen_diagnosis/manual_reviews_iclight.jsonl \
+  --out outputs/gen_diagnosis/weather_calibration_new
+```
+
+本次已重算的结果位于 `outputs/gen_diagnosis/weather_calibration_recomputed/`；固定 `shift > 6` 保留 yes 79.1%、weak 55.3%、no 4.3%，按源图留一 balanced accuracy 为 0.8224。标签仍是原非盲 agent 目视诊断，不是独立真值。`--scores` 可复用脚本产生的哈希绑定缓存；`--legacy-probe` 仅显式导入旧无图像身份的分数，并保留来源不可验证的限制。自适应生成入口与验证范围见 [vpr_guidance 记录](../vpr_guidance/ADAPTIVE_VALIDATION.md)。
+
 完整解释见 `outputs/gen_diagnosis/REPORT.md`；逐图证据、汇总 CSV 和本地 HTML 图库位于 `outputs/gen_diagnosis/report/`。原始旧 grid 与 photometric probe 保留。
 
 CPU 协议检查：

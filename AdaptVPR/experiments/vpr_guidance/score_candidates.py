@@ -104,6 +104,9 @@ def load_verified_candidates(manifests, real_data, place_of, *, real_paths=None)
                 if row.get("passed") is not True:
                     unusable["rejected_by_verifier"] += 1
                     continue
+                if row.get("weather_ok", True) is not True:
+                    unusable["rejected_by_weather"] += 1
+                    continue
                 sample_id, index = row.get("sample_id"), row.get("candidate_index")
                 if not isinstance(sample_id, str) or not sample_id.strip():
                     raise ValueError(f"{location}: verified candidate requires a nonempty sample_id")
@@ -169,6 +172,7 @@ def main(argv=None):
         raise ValueError("Need at least two eligible training places to define negatives")
     place_of = {path: (p.city, p.place_id) for p in dataset.places for path in p.real_paths}
     real_views = {(p.city, p.place_id): p.real_paths for p in dataset.places}
+    positive_context_width = max(len(views) for views in real_views.values())
     verified, unusable, num_candidates = load_verified_candidates(
         args.candidates, args.real_data, place_of,
         real_paths=dataset.source_index)
@@ -195,6 +199,8 @@ def main(argv=None):
             "calibration_places": args.calibration_places,
             "batch_context": "real_only_fixed_negative_views_per_place",
             "positive_views_per_draw": args.images_per_place - 1,
+            "positive_context_width": positive_context_width,
+            "positive_draw_context": "dataset_max_real_views",
             "training_augmentation_simulated": False,
             "partial_tail_batches_simulated": False,
         },
@@ -234,7 +240,8 @@ def main(argv=None):
             same = torch.tensor([[place == key for key in pool_keys] for place in places])
             return score_candidates(anchors, positive_sets, pool_desc, same, negatives_per_batch,
                                     args.negative_draws, args.alpha, args.base, args.miner_margin, args.seed,
-                                    positives_per_batch=args.images_per_place - 1)
+                                    positives_per_batch=args.images_per_place - 1,
+                                    positive_context_width=positive_context_width)
 
         scores = score(descriptors[[index[Path(r["output_path"])] for r in verified]],
                        [descriptors[[index[p] for p in real_views[r["_place"]]]] for r in verified],

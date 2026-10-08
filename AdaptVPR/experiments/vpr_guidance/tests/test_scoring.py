@@ -157,6 +157,18 @@ class ManifestScoringTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_weather_rejections_cannot_be_resurrected_by_standalone_scoring(self):
+        self.write_rows([{**row, 'weather_ok': False, 'eligible_for_training': False} for row in self.rows])
+        verified, unusable, total = scoring.load_verified_candidates(
+            [self.manifest], self.real_data, self.place_of)
+        self.assertEqual(total, 2)
+        self.assertEqual(verified, [])
+        self.assertEqual(unusable, {'rejected_by_weather': 2})
+        rows = [{**row, 'weather_ok': False, 'plausible': True, 'utility': 1.,
+                 'mean_positive_similarity': .2} for row in self.rows]
+        self.assertEqual(select_per_group(rows, 'hardness'), [])
+        self.assertEqual(select_per_group(rows, 'random'), [])
+
     def write_rows(self, rows):
         self.manifest.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
 
