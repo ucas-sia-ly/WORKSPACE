@@ -52,6 +52,20 @@ $$
 
 LoRA 对 selected 中 `passed=True`、`eligible_for_training=True` 且 `utility > --min-utility` 的图像均匀采样，默认阈值为 0，不按 U 加权。冻结 VAE、文本编码器与 IC-Light 基础 UNet，只训练 attention 的 fp32 LoRA 参数。源图使用 VAE posterior mode 作为 8-channel UNet 的条件，目标图使用 sampled latent，按模型 scheduler 的 `epsilon` 或 `v_prediction` 目标做去噪 MSE。SALAD 不参与反向传播。这里没有旧设计中的 `L_identity`、`L_diverse`，也不声称 LoRA 的 MSE 等同于检索损失。
 
+## plausibility gate：为什么 hardness 不能单独使用
+
+Bangkok probe 的实测显示：utility 最高的 4 张合格候选（`adapt_074450` k0/k2、`adapt_074526` k2/k3，U≈1.1–1.25）全部是**内容被改写**的图像：右侧凭空出现一栋殖民式建筑，或高楼立面被重画。它们的 `s_geo` 都过了 0.78。`s_geo` 是 RANSAC inlier *比例*，被替换区域只是不产生匹配，不会拉低比例。对 SALAD 来说，"外观难"和"根本不是这个地方"无法区分，而 hardness 排序恰恰偏好后者。不加约束时，`select` 会系统性地把错误标签的正样本放进训练池，`full` 的 LoRA 也会去学习幻觉结构。
+
+因此评分器先用**真实视图**校准一个下限。对 `--calibration-places` 个训练 place 的每张真实图做 leave-one-out：作为 anchor，与同 place 其他真实图计算 identity margin，
+
+$$m(a)=\overline{s(a,P)}-\mathbb{E}_d[h_d(a)],$$
+
+这里同一学生、同一 batch 模型。真实跨年份、跨朝向视图的标签由数据集保证正确，所以合成候选若满足 `m < quantile_q(m_real)`（默认 `q=0.025`），比 97.5% 的真实正样本还"难"，更可能是内容改变而不是困难外观。这些候选标为 `plausible=false`，**对 random 与 hardness 两个分支都排除**，使两者从同一候选集合中选择。`train_lora.py` 与 loop 的 eligibility 统计也拒绝 `plausible=false` 的行。
+
+实测：真实 margin 中位数 0.308，2.5% 分位为 0.109。门限恰好去掉上述 4 张（margin 0.015–0.051），其余 33 张保留；有 2 个组因无合格候选而退出，最终 16 组。`summary.json` 的 `plausibility_calibration`、`implausible_verified` 和 `groups_where_gate_changed_hardest` 记录了这一效果。`--plausibility-quantile 0` 关闭门限，可用作消融。
+
+门限只检查标签是否可信，不能保证"更难"更有用；这一点仍需 final Recall 回答。
+
 ## 环境与依赖
 
 以下命令均从工作区根目录执行。项目当前可用的环境是 `conda AdaptVPR`，也可以直接使用其绝对解释器路径。
@@ -177,6 +191,16 @@ for VPR_ARM in random select full; do
 done
 ```
 
+默认 `--final-scope synthetic_places`：final SALAD 只在 pool 中有合成图的 place 上训练（`--synthetic-places-only`）。几百张合成图分散在几千个 Bangkok place 上时，合成曝光占比不足 1%，random 与 select 之间即使存在差异也测不出来。需要与 AdaptVPR 原始设置一致时，用 `--final-scope all_places`。
+
+`--final-control real_only` 在**同一批 place** 上训练 synthetic fraction 为 0 的对照模型，输出到 `final_salad_real_only/` 与 `final_eval_real_only/`。没有这一对照，就无法区分"合成数据有用"和"选择方法有用"。最小决策实验为：
+
+| 比较 | 回答的问题 |
+| --- | --- |
+| `random` vs `real_only` | AdaptVPR 式合成正样本在这些 place 上是否有用 |
+| `select` vs `random` | 当前学生的 hardness 反馈是否优于随机选择 |
+| `full` vs `select` | 把反馈蒸馏进生成器是否再带来收益 |
+
 audit 写出 `pool_comparison.json` 和各分支的 `matched_pool.jsonl`，检查重复身份、合格状态以及同组 source/condition/prompt 一致性，报告被排除的组。匹配要求三个分支全部完成且交集非空。每个 final 从预训练 DINOv2 和**新随机 SALAD aggregator** 开始，不沿用反馈学生；相同 seed 和配方使最终训练起点、预算可比。交集控制了最终 pool 组成，不消除前面反馈学生经历不同数据的影响。未设置 `--svox-root` 时只训练 final；其他评估协议见 [SALAD 工作流](../../../salad/WORKFLOW.md)。
 
 只查看预计命令，可在上述 `loop`/`final` 命令末尾加 `--dry-run`。它不会创建输出目录或加载模型；实际数据可读性应通过相应 `--check-data` 另行核验。
@@ -214,7 +238,7 @@ audit 写出 `pool_comparison.json` 和各分支的 `matched_pool.jsonl`，检�
 
 ## 目前的实测范围
 
-2026-10-08 的现有 Bangkok probe：40 组 × 4 = 160 个候选，其中旧 Global verifier 通过 37 个；修正后的 place-grouped 评分选择了 18 组，其中 8 张 selected 的 `U > 0`。合格候选平均 mining probability 为 `0.2179`，selected 平均为 `0.2292`。LoRA `--check-data` 确认可训练样本为 `8/18`，统一分辨率为 `400 × 296`。
+2026-10-08 的现有 Bangkok probe：40 组 × 4 = 160 个候选，其中旧 Global verifier 通过 37 个；未加门限的 place-grouped 评分选择了 18 组，其中 8 张 selected 的 `U > 0`。加入 plausibility gate 后为 16 组，其中 6 张 `U > 0`，见 `outputs/vpr_guidance_smoke/score_probe_gated/`。按 condition 的通过数为 overcast 35/112、rain 2/8、snow 0/24、night 0/12、fog 0/4，失败原因全部是 `s_geo`。合格候选平均 mining probability 为 `0.2179`，selected 平均为 `0.2292`。LoRA `--check-data` 确认可训练样本为 `8/18`，统一分辨率为 `400 × 296`。
 
 来源是工作区的 `outputs/vpr_guidance_smoke/cand_probe/` 和 `outputs/vpr_guidance_smoke/score_probe_codex/summary.json`。这说明数据链路、评分和 mined 输入可用；这些是小规模探查统计，没有据此声称 Recall 提升。完整三分支、多 seed、公平 final 与外部评估仍需要实际跑完，状态见 [集成检查表](INTEGRATION_TODOS.md)。
 

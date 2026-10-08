@@ -23,7 +23,7 @@ use_salad()
 
 import torch  # noqa: E402
 
-from feedback import score_candidates, select_per_group  # noqa: E402
+from feedback import identity_margin, plausibility_floor, score_candidates, select_per_group  # noqa: E402
 
 
 def parse_args(argv=None):
@@ -41,6 +41,11 @@ def parse_args(argv=None):
     parser.add_argument("--negative-pool-size", type=int, default=4096,
                         help="Number of real training places; each supplies images-per-place distinct views")
     parser.add_argument("--negative-draws", type=int, default=16)
+    parser.add_argument("--plausibility-quantile", type=float, default=0.025,
+                        help="Exclude candidates whose identity margin is below this quantile of "
+                             "leave-one-out real-view margins (0 disables the gate)")
+    parser.add_argument("--calibration-places", type=int, default=300,
+                        help="Real training places scored leave-one-out to calibrate the gate")
     parser.add_argument("--miner-margin", type=float, default=0.1, help="Same as train_salad --miner-margin")
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--base", type=float, default=0.0)
@@ -57,6 +62,8 @@ def parse_args(argv=None):
         parser.error("--train-batch-size and --images-per-place must be at least 2")
     if args.min_images_per_place < args.images_per_place:
         parser.error("--min-images-per-place must be at least --images-per-place")
+    if not 0 <= args.plausibility_quantile < 1 or args.calibration_places <= 0:
+        parser.error("--plausibility-quantile must be in [0, 1) and --calibration-places positive")
     if args.num_workers < 0:
         parser.error("--num-workers must be nonnegative")
     if not math.isfinite(args.alpha) or args.alpha <= 0:
@@ -184,6 +191,8 @@ def main(argv=None):
             "negative_draws": args.negative_draws, "miner_margin": args.miner_margin,
             "alpha": args.alpha, "base": args.base, "seed": args.seed,
             "utility": "expected_mined_ms_positive_term",
+            "plausibility_quantile": args.plausibility_quantile,
+            "calibration_places": args.calibration_places,
             "batch_context": "real_only_fixed_negative_views_per_place",
             "positive_views_per_draw": args.images_per_place - 1,
             "training_augmentation_simulated": False,
@@ -197,12 +206,19 @@ def main(argv=None):
     if verified and any(sum(key != row["_place"] for key in pool_keys) < effective_batch_size - 1
                         for row in verified):
         raise ValueError("Negative pool lacks enough other places; increase --negative-pool-size")
-    scored = []
+    gate = args.plausibility_quantile > 0
+    calibration_keys = (random.Random(args.seed + 1).sample(sorted(real_views),
+                                                            min(args.calibration_places, len(real_views)))
+                        if gate else [])
+    scored, floor, calibration = [], None, None
     if verified:
         images = {}
         for row in verified:
             images.setdefault(Path(row["output_path"]), None)
             for path in real_views[row["_place"]]:
+                images.setdefault(path, None)
+        for key in calibration_keys:
+            for path in real_views[key]:
                 images.setdefault(path, None)
         for _, views in pool:
             for path in views:
@@ -212,15 +228,38 @@ def main(argv=None):
         descriptors = extract_descriptors(model, [SimpleNamespace(path=p) for p in paths], model.image_size,
                                           args.device, args.batch_size, args.num_workers)
         index = {path: i for i, path in enumerate(paths)}
-        candidate_desc = descriptors[[index[Path(r["output_path"])] for r in verified]]
-        positives = [descriptors[[index[p] for p in real_views[r["_place"]]]] for r in verified]
         pool_desc = torch.stack([descriptors[[index[p] for p in views]] for _, views in pool])
-        same_place = torch.tensor([[r["_place"] == key for key in pool_keys] for r in verified])
-        scores = score_candidates(candidate_desc, positives, pool_desc, same_place, negatives_per_batch,
-                                  args.negative_draws, args.alpha, args.base, args.miner_margin, args.seed,
-                                  positives_per_batch=args.images_per_place - 1)
-        scored = [{**{k: v for k, v in row.items() if k != "_place"}, **score,
-                   "eligible_for_training": True} for row, score in zip(verified, scores)]
+
+        def score(anchors, positive_sets, places):
+            same = torch.tensor([[place == key for key in pool_keys] for place in places])
+            return score_candidates(anchors, positive_sets, pool_desc, same, negatives_per_batch,
+                                    args.negative_draws, args.alpha, args.base, args.miner_margin, args.seed,
+                                    positives_per_batch=args.images_per_place - 1)
+
+        scores = score(descriptors[[index[Path(r["output_path"])] for r in verified]],
+                       [descriptors[[index[p] for p in real_views[r["_place"]]]] for r in verified],
+                       [r["_place"] for r in verified])
+        if gate:
+            # Leave-one-out: each real view is an anchor against its place's other real views.
+            anchors, positive_sets, places = [], [], []
+            for key in calibration_keys:
+                views = real_views[key]
+                for i, view in enumerate(views):
+                    anchors.append(index[view])
+                    positive_sets.append(descriptors[[index[p] for j, p in enumerate(views) if j != i]])
+                    places.append(key)
+            real_scores = score(descriptors[anchors], positive_sets, places)
+            floor = plausibility_floor(real_scores, args.plausibility_quantile)
+            calibration = {
+                "places": len(calibration_keys), "real_anchors": len(real_scores),
+                "quantile": args.plausibility_quantile, "margin_floor": floor,
+                "real_mined_rate": statistics.fmean(s["mining_probability"] for s in real_scores),
+                "real_margin": _distribution([identity_margin(s) for s in real_scores]),
+            }
+        scored = [{**{k: v for k, v in row.items() if k != "_place"}, **s,
+                   "identity_margin": identity_margin(s),
+                   "plausible": floor is None or identity_margin(s) >= floor,
+                   "eligible_for_training": True} for row, s in zip(verified, scores)]
     selected = select_per_group(scored, args.selection, seed=args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_jsonl(args.output_dir / "scored.jsonl", scored)
@@ -232,6 +271,13 @@ def main(argv=None):
         by_condition[row.get("condition")].append(row["mining_probability"])
     summary.update({
         "status": "complete" if scored else "no_verified_training_candidates",
+        "plausibility_calibration": calibration,
+        "implausible_verified": sum(not r["plausible"] for r in scored),
+        # Would the ungated hardness rule have picked an implausible image in that group?
+        "groups_where_gate_changed_hardest": sum(
+            1 for group in {r["sample_id"] for r in scored}
+            if not max((r for r in scored if r["sample_id"] == group),
+                       key=lambda r: (r["utility"], -r["mean_positive_similarity"]))["plausible"]),
         "groups_selected": len(selected),
         "negatives_per_batch": negatives_per_batch,
         "negative_places_per_batch": effective_batch_size - 1,

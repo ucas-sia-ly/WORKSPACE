@@ -54,6 +54,12 @@ def parse_args(argv=None):
     parser.add_argument("--svox-root", type=Path)
     parser.add_argument("--backbone-repo", type=Path)
     parser.add_argument("--match-pools", action="store_true", help="Use the common verified prompt groups across all arms")
+    parser.add_argument("--final-scope", choices=["synthetic_places", "all_places"], default="synthetic_places",
+                        help="Final SALAD trains only on places that have a pool image (default) or on every place. "
+                             "A few hundred synthetic images among thousands of places give too little exposure "
+                             "for selection differences to be measurable.")
+    parser.add_argument("--final-control", choices=["none", "real_only"], default="none",
+                        help="real_only: same places as the arm's pool, synthetic fraction 0")
     parser.add_argument("--python", type=Path, default=Path(sys.executable), help="Interpreter for every child stage")
     parser.add_argument("--dry-run", action="store_true", help="Print commands; do not write outputs or load models")
     args = parser.parse_args(argv)
@@ -123,13 +129,16 @@ def _input_signature(path):
     return {"method": "file_inventory_size_mtime", "sha256": digest.hexdigest(), "files": count}
 
 
-def salad_flags(args, output_dir, epochs, manifest=None, init=None):
+def salad_flags(args, output_dir, epochs, manifest=None, init=None, extra=()):
     extras = _extra_flags(args.salad_args, ["--real-data", "--output-dir", "--epochs", "--cities", "--seed",
                                            "--synthetic-manifest", "--resume", "--init-checkpoint",
                                            "--backbone-repo", "--check-data", "--synthetic-places-only"])
     if init is not None:
         # Full SALAD weights already contain the DINO backbone.
         extras = _without_option(extras, "--backbone-weights")
+    for token in extra:
+        if str(token).startswith("--"):
+            extras = _without_option(extras, str(token))
     flags = ["--real-data", str(args.gsv_root), "--output-dir", str(output_dir), "--epochs", str(epochs),
              "--cities", *args.cities, "--seed", str(args.seed), *extras]
     if manifest is not None:
@@ -138,7 +147,7 @@ def salad_flags(args, output_dir, epochs, manifest=None, init=None):
         flags += ["--init-checkpoint", str(init)]
     if args.backbone_repo:
         flags += ["--backbone-repo", str(args.backbone_repo)]
-    return flags
+    return flags + [str(token) for token in extra]
 
 
 class Runner:
@@ -196,8 +205,8 @@ class Runner:
             write_json(complete, {"request": request, "outputs": {str(p): file_sha256(p) for p in outputs}})
 
 
-def salad_train(run, args, output_dir, epochs, manifest=None, init=None):
-    original = salad_flags(args, output_dir, epochs, manifest, init)
+def salad_train(run, args, output_dir, epochs, manifest=None, init=None, extra=()):
+    original = salad_flags(args, output_dir, epochs, manifest, init, extra)
     parsed = _salad_module().parse_args(original)
     metadata = [args.gsv_root / "Dataframes" / f"{city}.csv" for city in args.cities]
     inputs = metadata + [args.gsv_root / "Images" / city for city in args.cities]
@@ -217,7 +226,8 @@ def salad_train(run, args, output_dir, epochs, manifest=None, init=None):
         if saved.get("format_version") != 1 or "optimizer_state_dict" not in saved:
             raise ValueError(f"Interrupted SALAD requires a full training checkpoint: {checkpoint}")
         module = _salad_module()
-        resume_flags = _without_option(salad_flags(args, output_dir, epochs, manifest), "--backbone-weights")
+        resume_flags = _without_option(salad_flags(args, output_dir, epochs, manifest, extra=extra),
+                                       "--backbone-weights")
         resume_flags += ["--resume", str(checkpoint)]
         resumed = module.parse_args(resume_flags)
         config, _, provenance = module.resolve_model_initialization(resumed, saved)
@@ -362,6 +372,7 @@ def loop(args, run):
                 rows = [row for p in selected_files for row in read_jsonl(p)]
                 mined = [row for row in rows if row.get("passed") is True
                          and row.get("eligible_for_training") is True
+                         and row.get("plausible", True) is True
                          and row.get("utility", 0) > threshold.min_utility]
                 write_json(round_dir / "feedback.json", {"selected_total": len(rows), "mined_positives": len(mined),
                            "min_utility": threshold.min_utility,
@@ -392,9 +403,15 @@ def final(args, run):
     pool = arm_root / ("matched_pool.jsonl" if args.match_pools else "final_pool.jsonl")
     if args.match_pools and not run.dry_run:
         audit_pools(args.root, match=True)
-    model_dir = arm_root / "final_salad"
+    suffix = "" if args.final_control == "none" else f"_{args.final_control}"
+    model_dir = arm_root / f"final_salad{suffix}"
+    extra = ["--synthetic-places-only"] if args.final_scope == "synthetic_places" else []
+    if args.final_control == "real_only":
+        if args.final_scope != "synthetic_places":
+            raise ValueError("--final-control real_only needs --final-scope synthetic_places to define its places")
+        extra += ["--synthetic-fraction", "0"]
     # Fresh random SALAD aggregator + pretrained DINOv2, independent of the feedback student.
-    salad_train(run, args, model_dir, args.final_epochs, manifest=pool)
+    salad_train(run, args, model_dir, args.final_epochs, manifest=pool, extra=extra)
     if args.svox_root is None:
         print("[final] --svox-root not given; final training finished without evaluation")
         return
@@ -403,7 +420,7 @@ def final(args, run):
     for subdir in args.eval:
         if Path(subdir).name != subdir or subdir in {".", ".."}:
             raise ValueError(f"Invalid SVOX query folder: {subdir}")
-        output = arm_root / "final_eval" / f"svox_{subdir}.json"
+        output = arm_root / f"final_eval{suffix}" / f"svox_{subdir}.json"
         flags = ["--checkpoint", model_dir / "checkpoint.pt", "--dataset", "SVOX",
                  "--dataset-root", args.svox_root, "--query-subdirs", subdir, "--output", output, *extras]
         if args.backbone_repo:

@@ -223,3 +223,27 @@ class LoRATests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlausibilityTests(unittest.TestCase):
+    def test_floor_is_quantile_of_real_margins(self):
+        from feedback import identity_margin, plausibility_floor
+        scores = [{"mean_positive_similarity": m + 0.1, "expected_hardest_negative": 0.1}
+                  for m in (0.0, 0.1, 0.2, 0.3, 0.4)]
+        self.assertAlmostEqual(identity_margin(scores[2]), 0.2)
+        self.assertAlmostEqual(plausibility_floor(scores, 0.25), 0.1)
+        with self.assertRaises(ValueError):
+            plausibility_floor(scores, 0.0)
+
+    def test_implausible_rows_are_excluded_for_every_method(self):
+        rows = [
+            {"sample_id": "a", "candidate_index": 0, "passed": True, "plausible": False,
+             "utility": 1.2, "mean_positive_similarity": 0.1},
+            {"sample_id": "a", "candidate_index": 1, "passed": True, "plausible": True,
+             "utility": 0.3, "mean_positive_similarity": 0.3},
+            {"sample_id": "b", "candidate_index": 0, "passed": True, "plausible": False,
+             "utility": 0.9, "mean_positive_similarity": 0.1},
+        ]
+        for method in ("hardness", "random"):
+            chosen = select_per_group(rows, method)
+            self.assertEqual([(r["sample_id"], r["candidate_index"]) for r in chosen], [("a", 1)])

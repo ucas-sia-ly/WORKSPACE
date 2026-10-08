@@ -213,7 +213,9 @@ class ManifestScoringTests(unittest.TestCase):
                                 for image in images])
         with patch("workflow.model.load_checkpoint_model", return_value=SimpleNamespace(image_size=(2, 2))) as load:
             with patch("workflow.evaluation.extract_descriptors", side_effect=extract):
-                scoring.main(self.arguments())
+                # This test covers manifest plumbing; the fixture candidate is deliberately
+                # off-place, which the plausibility gate (tested below) would reject.
+                scoring.main(self.arguments() + ["--plausibility-quantile", "0"])
         load.assert_called_once()
         output = self.root / "scored"
         summary = json.loads((output / "summary.json").read_text())
@@ -284,6 +286,24 @@ class ManifestScoringTests(unittest.TestCase):
             with self.subTest(flag=flag), self.assertRaises(SystemExit):
                 with patch("sys.stderr"):
                     scoring.parse_args(arguments)
+
+    def test_plausibility_gate_rejects_candidate_harder_than_real_positives(self):
+        def extract(model, images, *args):
+            # Candidate matches the negatives and not its own place: margin far below real views.
+            return torch.stack([unit(0) if image.path.parent == self.generated else
+                                unit(1) if image.path in self.real_paths[0] else unit(0)
+                                for image in images])
+        with patch("workflow.model.load_checkpoint_model", return_value=SimpleNamespace(image_size=(2, 2))):
+            with patch("workflow.evaluation.extract_descriptors", side_effect=extract):
+                scoring.main(self.arguments() + ["--plausibility-quantile", "0.5"])
+        output = self.root / "scored"
+        summary = json.loads((output / "summary.json").read_text())
+        self.assertEqual(summary["groups_selected"], 0)
+        self.assertEqual(summary["implausible_verified"], summary["verified_training_candidates"])
+        self.assertEqual(summary["groups_where_gate_changed_hardest"], 1)
+        self.assertIsNotNone(summary["plausibility_calibration"]["margin_floor"])
+        rows = [json.loads(line) for line in (output / "scored.jsonl").read_text().splitlines()]
+        self.assertTrue(all(row["plausible"] is False and row["identity_margin"] < 0 for row in rows))
 
 
 if __name__ == "__main__":

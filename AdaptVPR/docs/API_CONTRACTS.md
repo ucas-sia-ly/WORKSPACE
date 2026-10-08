@@ -107,6 +107,21 @@ for four denoising steps and guidance scale 1.
 Requests whose `infer_steps` or `guidance_scale` differ from the loaded adapter
 configuration are rejected instead of silently changing the reported setup.
 
+The adapter selects the output canvas from each source image's aspect ratio
+(`canvas_policy: "source_aspect_v1"`), and passes an explicit `target_shape`
+in **[height, width]** order to LightX2V. The target pixel budget is 1472×1104;
+each side is rounded to a multiple of 16 within the pinned runner's 256..1664
+range. A 400×300 source therefore generates at 1472×1104, rather than the
+upstream default 1664×928. Nonstandard ratios have a small alignment rounding
+error; ratios beyond 6.5:1 in either orientation return HTTP 422, since the
+runner would otherwise clamp and change them. No adapter crop or source padding
+is applied. This canvas policy does not guarantee that the model preserves all
+scene contents or the camera viewpoint.
+
+`GET /health` reports `canvas_policy` and a `canvas` object with the pixel
+budget, alignment and side limits. After changing the adapter, restart only
+the Qwen service to apply the code (`systemctl --user restart adaptvpr-lightx2v`).
+
 ## Generation response
 
 Both services return:
@@ -119,6 +134,14 @@ Both services return:
 
 `result_path` must exist and be readable by the AdaptVPR process. LightX2V output
 is resized to the reference resolution if necessary.
+
+LightX2V additionally returns `canvas_policy`, `source_dimensions` and
+`raw_dimensions` in **[width, height]** order, `target_shape` in **[height,
+width]** order, and `metadata_path`. The metadata JSON is saved beside the raw
+PNG and includes the source path and seed. An output whose actual dimensions
+do not match the requested canvas returns HTTP 500, rather than allowing a
+client resize to conceal the mismatch. Existing clients can continue reading
+only `result_path`.
 
 Default request timeout is 300 seconds. Configure it with
 `ICLIGHT_API_TIMEOUT` or `LIGHTX2V_API_TIMEOUT`; configure LightX2V retries with

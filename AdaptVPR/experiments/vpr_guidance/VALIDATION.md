@@ -82,3 +82,12 @@ PyTorch 2.8.0+cu128、RTX 4090。原始数据、下载模型和已发布 SALAD c
 阶段缓存对大型数据目录记录文件清单、大小和 mtime；不是逐张 JPEG 的完整内容哈希。
 历史 Claude 候选没有当时的完整 source/model/code 哈希，兼容迁移会明确标注 legacy 来源，保留原验证分数。
 正式实验应使用稳定、未修改的数据与模型，完整生成流程按 [README](README.md) 运行。
+
+## 2026-10-08 追加：基于 probe 结果的改进
+
+1. **hardness 选中了幻觉内容。** 160 张候选中 utility 最高的 4 张合格图像都改写了场景内容（新增建筑或重画高楼），`s_geo` 仍在 0.78–0.86。inlier 覆盖率（Spearman ρ=0.14）、DINOv2 patch 余弦（ρ=−0.26）都不能把它们与外观变化区分开。可行的判据是用同一学生在真实 leave-one-out 正样本上的 identity margin 做校准：300 个 Bangkok place、2,225 个真实 anchor 的 margin 中位数为 0.31，2.5% 分位为 0.11。这 4 张图的 margin 为 0.015–0.051。已实现为 `score_candidates.py` 的 plausibility gate，对两种选择方式都生效，并接入 LoRA 与 loop 的 eligibility。
+2. **final 的实验敏感度。** 新增 `--final-scope`（默认只在有合成图的 place 上训练）和 `--final-control real_only`。
+3. **回归测试**：93 项通过（新增门限数学、两种选择方式下的排除、端到端评分门限、旧端到端测试显式关闭门限）。`test_implementation.py` 通过。`final` 的两种 control 用 dry-run 核对了命令。
+
+未完成：带门限的 LoRA 训练和完整三分支 + real-only final 尚未运行。
+

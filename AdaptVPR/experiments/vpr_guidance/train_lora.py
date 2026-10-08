@@ -77,7 +77,8 @@ def filter_training_rows(rows, min_utility=0.0):
         raise ValueError("min_utility must be finite")
     usable = []
     for index, row in enumerate(rows):
-        if row.get("passed") is not True or row.get("eligible_for_training", True) is not True:
+        if (row.get("passed") is not True or row.get("eligible_for_training", True) is not True
+                or row.get("plausible", True) is not True):
             continue
         utility = row.get("utility", 0.0)
         if isinstance(utility, bool) or not isinstance(utility, (int, float)) or not math.isfinite(utility):

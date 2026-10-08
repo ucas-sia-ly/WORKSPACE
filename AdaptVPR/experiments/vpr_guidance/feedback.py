@@ -209,18 +209,43 @@ def score_candidates(
     ]
 
 
+def identity_margin(score: dict[str, float | int]) -> float:
+    """Mean similarity to the own place's real views minus the expected hardest negative."""
+    return float(score["mean_positive_similarity"]) - float(score["expected_hardest_negative"])
+
+
+def plausibility_floor(real_anchor_scores: Sequence[dict[str, float | int]], quantile: float) -> float:
+    """Margin below which a positive is harder than all but ``quantile`` of genuine ones.
+
+    ``real_anchor_scores`` come from scoring real GSV views leave-one-out against
+    their own place, under the same student and batch model as the candidates.
+    Real cross-year/heading views are correctly labelled by construction, so a
+    synthetic candidate below this floor is more likely a content change
+    (hallucinated structure) than a hard appearance positive. SALAD alone
+    cannot tell the two apart, and hardness ranking prefers exactly these.
+    """
+    if not 0 < quantile < 1:
+        raise ValueError("quantile must be in (0, 1)")
+    if not real_anchor_scores:
+        raise ValueError("Need real anchor scores to calibrate the plausibility floor")
+    margins = torch.tensor([identity_margin(s) for s in real_anchor_scores], dtype=torch.float64)
+    return float(torch.quantile(margins, quantile))
+
+
 def select_per_group(rows: Sequence[dict[str, Any]], method: str, seed: int = 0,
                      group_key: str = "sample_id") -> list[dict[str, Any]]:
-    """Keep one verified candidate per source/condition/prompt group.
+    """Keep one verified, plausible candidate per source/condition/prompt group.
 
     Hardness maximizes expected utility, then minimizes mean positive similarity.
     Random uses the identical verified pool, groups, and deterministic ordering.
+    Rows with ``plausible`` False are excluded for every method, so both arms
+    draw from the same candidate set.
     """
     if method not in {"hardness", "random"}:
         raise ValueError(f"Unknown selection method: {method}")
     groups: dict[Any, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        if row.get("passed") is True:
+        if row.get("passed") is True and row.get("plausible", True) is True:
             if group_key not in row:
                 raise ValueError(f"Verified candidate lacks {group_key}")
             if method == "hardness" and any(

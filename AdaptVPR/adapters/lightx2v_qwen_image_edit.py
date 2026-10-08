@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import subprocess
 import sys
@@ -11,6 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from PIL import Image
 from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -27,6 +30,37 @@ INFER_STEPS = 4
 GUIDANCE_SCALE = 1.0
 ATTN_MODE = "torch_sdpa"
 SOURCE_REVISION_FILE = ".adaptvpr-source-revision"
+CANVAS_POLICY = "source_aspect_v1"
+# Match the upstream 4:3 canvas budget. Explicit 16-pixel alignment accounts
+# for the 8x VAE compression and the 2x latent packing in the pinned runner.
+CANVAS_TARGET_PIXELS = 1472 * 1104
+CANVAS_MULTIPLE = 16
+CANVAS_MIN_SIDE = 256
+CANVAS_MAX_SIDE = 1664
+
+
+def source_target_shape(width: int, height: int) -> list[int]:
+    """Return [height, width] close to source aspect, without upstream clamping.
+
+    Arbitrary ratios have only the rounding error required by latent packing.
+    Unsupported extreme ratios are rejected rather than stretched by the
+    upstream independent minimum-side clamp.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError("Source image dimensions must be positive")
+    if max(width, height) / min(width, height) > CANVAS_MAX_SIDE / CANVAS_MIN_SIDE:
+        raise ValueError(
+            f"Source aspect ratio cannot fit the supported canvas sides "
+            f"{CANVAS_MIN_SIDE}..{CANVAS_MAX_SIDE} without changing framing"
+        )
+    scale = min(math.sqrt(CANVAS_TARGET_PIXELS / (width * height)),
+                CANVAS_MAX_SIDE / max(width, height))
+
+    def aligned(side: int) -> int:
+        return max(CANVAS_MIN_SIDE, min(CANVAS_MAX_SIDE,
+                   round(side * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE))
+
+    return [aligned(height), aligned(width)]
 
 
 class GenerateRequest(BaseModel):
@@ -135,6 +169,7 @@ def load_pipeline():
     pipe.create_generator(
         attn_mode=ATTN_MODE,
         resize_mode="adaptive",
+        aspect_ratio="",
         infer_steps=INFER_STEPS,
         guidance_scale=GUIDANCE_SCALE,
     )
@@ -176,6 +211,16 @@ def health() -> dict:
             "attn_mode": ATTN_MODE,
             "resize_mode": "adaptive",
         },
+        "canvas_policy": CANVAS_POLICY,
+        "canvas": {
+            "target_shape_order": "height,width",
+            "target_pixels": CANVAS_TARGET_PIXELS,
+            "multiple": CANVAS_MULTIPLE,
+            "min_side": CANVAS_MIN_SIDE,
+            "max_side": CANVAS_MAX_SIDE,
+            "rounding": "nearest_multiple",
+            "unsupported_aspect_ratio": "reject",
+        },
         "error": state.error,
     }
 
@@ -198,6 +243,16 @@ def generate(request: GenerateRequest) -> dict:
             ),
         )
 
+    try:
+        with Image.open(image_path) as source:
+            source_dimensions = list(source.size)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"Source image is unreadable: {exc}") from exc
+    try:
+        target_shape = source_target_shape(*source_dimensions)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     output_dir = Path(os.getenv("LIGHTX2V_OUTPUT_DIR", "/tmp/adaptvpr_lightx2v")).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     result_path = output_dir / f"{uuid.uuid4().hex}.png"
@@ -209,13 +264,37 @@ def generate(request: GenerateRequest) -> dict:
                 prompt=request.prompt,
                 negative_prompt=request.negative_prompt,
                 save_result_path=str(result_path),
+                target_shape=target_shape,
             )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"generation failed: {exc}") from exc
 
     if not result_path.is_file():
         raise HTTPException(status_code=500, detail="LightX2V returned without writing the output")
-    return {"result_path": str(result_path)}
+    try:
+        with Image.open(result_path) as output:
+            output.load()
+            raw_dimensions = list(output.size)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Generated image is unreadable: {exc}") from exc
+    if raw_dimensions != target_shape[::-1]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Generated canvas {raw_dimensions} differs from requested [width,height] {target_shape[::-1]}",
+        )
+    response = {
+        "result_path": str(result_path),
+        "canvas_policy": CANVAS_POLICY,
+        "source_dimensions": source_dimensions,
+        "target_shape": target_shape,
+        "raw_dimensions": raw_dimensions,
+        "metadata_path": str(result_path.with_suffix(".json")),
+    }
+    Path(response["metadata_path"]).write_text(
+        json.dumps({**response, "source_path": str(image_path), "seed": request.seed}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return response
 
 
 if __name__ == "__main__":
