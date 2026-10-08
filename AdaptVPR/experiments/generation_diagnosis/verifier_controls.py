@@ -20,9 +20,9 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
-GUIDANCE_ROOT = Path(__file__).resolve().parents[1] / "vpr_guidance"
-sys.path.insert(0, str(GUIDANCE_ROOT))
-from common import WORKSPACE_ROOT, read_jsonl, use_adaptvpr, write_json
+ADAPTVPR_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ADAPTVPR_ROOT))
+from experiments.qwen_curriculum.common import WORKSPACE_ROOT, read_jsonl, use_adaptvpr, write_json
 
 use_adaptvpr()
 from verification.evaluator import DualTraitEvaluator

@@ -88,7 +88,7 @@ class StrictDemoTest(unittest.TestCase):
                 return ref_image.copy()
 
             with patch.object(agent, "plan_image", side_effect=AssertionError("Strict must bypass planner Skip")), patch.object(
-                agent.iclight, "generate", side_effect=render
+                agent.lightx2v, "generate_global", side_effect=render
             ) as global_generator, patch.object(
                 agent.lightx2v, "generate_local", side_effect=render
             ) as local_generator, patch.object(

@@ -1,7 +1,0 @@
-# On top of AdaptVPR/requirements.txt, adapters/requirements.txt and
-# salad/requirements-workflow.txt (already required by the reused stages).
-torch>=2.0
-diffusers>=0.21
-transformers>=4.30
-safetensors>=0.3
-python-dotenv

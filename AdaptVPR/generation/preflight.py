@@ -31,11 +31,12 @@ def load_environment() -> None:
             os.environ[key] = str((ROOT / path).resolve())
 
 
-def check_environment(*, planner: bool = True) -> list[str]:
+def check_environment(*, planner: bool = True, with_iclight: bool = False) -> list[str]:
     """Return all actionable failures instead of stopping at the first one."""
     load_environment()
     errors = []
-    for module in ("openai", "torch", "transformers", "PIL"):
+    modules = ("torch", "transformers", "PIL") + (("openai",) if planner else ())
+    for module in modules:
         if importlib.util.find_spec(module) is None:
             errors.append(f"{sys.executable}: missing Python package {module}")
     if importlib.util.find_spec("torch"):
@@ -56,7 +57,7 @@ def check_environment(*, planner: bool = True) -> list[str]:
 
     with requests.Session() as session:
         session.trust_env = False
-        for name in ("ICLIGHT", "LIGHTX2V"):
+        for name in (("ICLIGHT", "LIGHTX2V") if with_iclight else ("LIGHTX2V",)):
             url = os.getenv(f"{name}_API_URL", "")
             if not url:
                 errors.append(f"{name}_API_URL is not configured")

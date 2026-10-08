@@ -1,5 +1,7 @@
 # AdaptVPR
 
+本工作区当前推荐使用 [Qwen 困难源图增广流程](experiments/qwen_curriculum/README.md)：离线筛选 GSV-Cities 困难训练图，按 night/snow/fog/rain 预算仅调用 Qwen，再以同源图概率替换接入 SALAD。该入口针对单台 48GB 显存、32GB 内存机器，分阶段加载模型；1000 次新增调用按 night 500、snow 200、fog 200、rain 100 分配，取消 overcast 生成和生成器 LoRA 闭环。`run.py` 的 Global、Local、Dual 路由现在也全部使用 Qwen，但保留独立的路由调度、反思和双指标验证协议。
+
 Official repository for [AdaptVPR: Route-Aware Hard Positive Generation for Robust Visual Place Recognition](https://arxiv.org/abs/2609.04369).
 
 <p align="center">
@@ -36,12 +38,16 @@ Official repository for [AdaptVPR: Route-Aware Hard Positive Generation for Robu
 
 | Route | Edit | Generator | Policy |
 |---|---|---|---|
-| Global | Weather / illumination / time | [IC-Light](https://github.com/lllyasviel/IC-Light) | 1 attempt; reject on failure |
+| Global | Weather / illumination / time | [Qwen-LightX2V](https://github.com/ModelTC/LightX2V) | 1 attempt; reject on failure |
 | Local | Local occlusion | [Qwen-LightX2V](https://github.com/ModelTC/LightX2V) | ≤4 attempts; ≤3 refinements |
 | Dual | Global + local changes | [Qwen-LightX2V](https://github.com/ModelTC/LightX2V) | ≤4 attempts; ≤3 refinements |
 | Skip | Unsuitable input | None | No generation |
 
-Candidates are accepted only when both $s_{\mathrm{geo}} \ge \tau_{\mathrm{geo}}$ and $s_{\mathrm{div}} \ge \tau_{\mathrm{div}}$.
+The table describes the current `run.py` route agent. Its `DualTraitEvaluator`
+accepts candidates when both $s_{\mathrm{geo}} \ge \tau_{\mathrm{geo}}$ and
+$s_{\mathrm{div}} \ge \tau_{\mathrm{div}}$, using the route thresholds below.
+The paper diagram and historical IC-Light diagnosis remain available for
+reproduction.
 
 Scene planning is implemented in `generation/agent.py`, while prompt refinement is handled by `generation/reflection_controller.py`; both are used by the public entry point.
 
@@ -49,6 +55,13 @@ Scene planning is implemented in `generation/agent.py`, while prompt refinement 
 |:---:|:---:|:---:|:---:|:---:|
 | $\tau_{\mathrm{geo}}$ | 0.78 | 0.82 | 0.72 | 0.72 |
 | $\tau_{\mathrm{div}}$ | 0.15 | 0.09 | 0.20 | 0.12 |
+
+The recommended [staged Qwen curriculum](experiments/qwen_curriculum/README.md)
+uses source mining, one weather edit per source and separate structure/weather
+checks. Its acceptance rules include match evidence, spatial coverage,
+homography displacement and CLIP weather contrasts; `s_div` is descriptive.
+Its four-domain generation quota is independent of the route-agent scheduler.
+The configurable first-run checks remain experimental and require visual review.
 
 ## 📁 Expected workspace layout
 
@@ -70,6 +83,9 @@ workspace/
     ├── examples/
     │   ├── generated_prompts.example.jsonl
     │   └── annotations_metadata.example.jsonl
+    ├── experiments/
+    │   ├── qwen_curriculum/           # Recommended staged augmentation workflow
+    │   └── generation_diagnosis/      # Historical generation/verification studies
     ├── generation/                    # Planning, generation, routing and reflection
     ├── preprocessing/                 # Accepted-sample manifest processing
     ├── prompts/                       # Prompt templates and construction rules
@@ -101,23 +117,34 @@ To run the included HTTP adapters, install their service dependencies separately
 pip install -r adapters/requirements.txt
 ```
 
-Install and configure IC-Light, Qwen-LightX2V, VisMatch, and a Qwen3-VL-4B-Instruct endpoint separately. Their implementations and weights are not included. Set local paths, endpoints, and credentials in `.env`.
+Install and configure Qwen-LightX2V, VisMatch and the CLIP weights separately.
+The route-agent planner and reflection also require a Qwen3-VL-4B-Instruct
+endpoint. The staged curriculum uses the SALAD checkout and its released
+checkpoint for source mining and training. IC-Light is optional for historical
+diagnosis. Set local paths, endpoints and credentials in `.env`.
 
 ## 🧩 External components
 
 | Role | Component | Integration | Public default |
 |---|---|---|---|
 | Planner and prompt refiner | [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct) | OpenAI-compatible API | `127.0.0.1:23002/v1` |
-| Global generator | [IC-Light](https://github.com/lllyasviel/IC-Light) | Local HTTP adapter | `127.0.0.1:8002/generate` |
-| Local/Dual generator | [Qwen-LightX2V](https://github.com/ModelTC/LightX2V) | Local HTTP adapter | `127.0.0.1:8001/generate` |
+| Global/Local/Dual generator | [Qwen-LightX2V](https://github.com/ModelTC/LightX2V) | Local HTTP adapter | `127.0.0.1:8001/generate` |
+| Historical generator (optional) | [IC-Light](https://github.com/lllyasviel/IC-Light) | Local HTTP adapter | `127.0.0.1:8002/generate` |
 | Appearance verifier | [CLIP ViT-B/32](https://huggingface.co/openai/clip-vit-base-patch32) | Transformers local loading | `openai/clip-vit-base-patch32` |
 | Geometry verifier | [VisMatch (SuperPoint + LightGlue)](https://github.com/gmberton/vismatch) | Local Python import | `superpoint-lightglue` |
 
-See [Scheduler specification](docs/SCHEDULER.md) for the route-allocation parameters and exact quota rule, [External components](docs/EXTERNAL_COMPONENTS.md) for setup responsibilities, and [API contracts](docs/API_CONTRACTS.md) for the IC-Light and LightX2V interfaces.
+See [Scheduler specification](docs/SCHEDULER.md) for the route-agent quota rule,
+[External components](docs/EXTERNAL_COMPONENTS.md) for setup, and
+[API contracts](docs/API_CONTRACTS.md) for the default Qwen service and optional
+historical IC-Light service. Curriculum commands and quotas are documented in
+[qwen_curriculum](experiments/qwen_curriculum/README.md).
 
 ## ⚡ Quick Demo
 
-Before running a full generation job, use the ten GSV-Cities paths listed in `tests/demo_10.csv` to quickly check the planning, generation, reflection, and verification pipeline. Source images are not included; run:
+Use the ten GSV-Cities paths listed in `tests/demo_10.csv` to check the route
+agent's planning, generation, reflection and dual-trait verification. The
+recommended staged curriculum has its own mining and generation commands.
+Source images are not included; run:
 
 Source-to-generated image comparisons for this 10-image Quick Demo set are
 available in [`tests/output`](tests/output).
@@ -147,13 +174,18 @@ python tests/run_demo_10.py --gsvcities-root /path/to/Gsvcities \
 ```
 It checks input files, CUDA, dependencies, and service health before planning.
 Add `--check-only` to run these checks without loading generation models or starting inference.
-Start the generators with `bash scripts/start_generation_services.sh` and wait
-for both `/health` endpoints to report ready before running the demo. The startup
+Start Qwen with `bash scripts/start_generation_services.sh --wait`; the launcher
+and demo preflight check the LightX2V `/health` endpoint by default. The startup
 script reads `.env` and resolves relative dependency paths against this repository.
+Historical IC-Light runs can add `--with-iclight` to the launcher.
 
 ## 🚀 Generation
 
-Local and Dual routes use one initial generation and up to three reflection rounds; Global uses one generation.
+The commands below exercise the `run.py` route agent, using Qwen for all three
+generation routes. Local and Dual routes use one initial generation and up to
+three reflection rounds; Global uses one generation. For the recommended
+1000-call augmentation and SALAD replacement workflow, follow
+[qwen_curriculum](experiments/qwen_curriculum/README.md).
 
 Accepted final images (`passed=true` and `eligible_for_training=true`) are saved under `<output-root>/<route>/`, while failed candidates are retained for audit under `<output-root>/rejected/<route>/` with a `__rejected.jpg` suffix. Training should use the manifest generated by `scripts/build_manifest.py`, which includes only accepted candidates; generated images are not distributed by this repository.
 

@@ -7,14 +7,20 @@ vendored in this repository.
 | Role | Component used by AdaptVPR | Integration | Public default |
 |---|---|---|---|
 | Planner and prompt refiner | [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct) | OpenAI-compatible HTTP API | model alias `qwen3-vl-4b-instruct-remote`, API base `http://127.0.0.1:23002/v1` |
-| Global generator | [IC-Light](https://github.com/lllyasviel/IC-Light) | Included HTTP adapter | `http://127.0.0.1:8002/generate` |
-| Local/Dual generator | `Qwen/Qwen-Image-Edit-2511` + `Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors`, served by [LightX2V](https://github.com/ModelTC/LightX2V) | Included HTTP adapter | `http://127.0.0.1:8001/generate` |
+| Global/Local/Dual generator | `Qwen/Qwen-Image-Edit-2511` + `Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors`, served by [LightX2V](https://github.com/ModelTC/LightX2V) | Included HTTP adapter | `http://127.0.0.1:8001/generate` |
+| Historical generator (optional) | [IC-Light](https://github.com/lllyasviel/IC-Light) | Included HTTP adapter | `http://127.0.0.1:8002/generate` |
 | Appearance verifier | [CLIP ViT-B/32](https://huggingface.co/openai/clip-vit-base-patch32) | Loaded in the AdaptVPR process with Transformers | `openai/clip-vit-base-patch32` |
 | Geometry verifier | [VisMatch (SuperPoint + LightGlue)](https://github.com/gmberton/vismatch) | Imported as a local Python package | `superpoint-lightglue` |
 
 The Qwen model value is the **served model alias**, not necessarily the model's
 download path. Set `ADAPTVPR_PLANNER_MODEL` to the exact model ID returned by
 your OpenAI-compatible server.
+
+The recommended [Qwen curriculum](../experiments/qwen_curriculum/README.md) uses
+SALAD for offline source mining and subsequent training, and Qwen for its four
+weather domains. Its generation stage uses fixed prompts and does not need the
+planner endpoint. The `run.py` route agent retains its independent scheduler,
+reflection and `DualTraitEvaluator` gates.
 
 ## Expected installation layout
 
@@ -23,8 +29,9 @@ One convenient local layout is:
 ```text
 workspace/
 ├── AdaptVPR/
-├── IC-Light/
+├── IC-Light/       # Optional historical diagnosis
 ├── LightX2V/
+├── salad/          # Source mining and curriculum training
 └── vismatch/
 ```
 
@@ -58,17 +65,11 @@ and Qwen weights are not included.
 
 ## Generators
 
-AdaptVPR talks to IC-Light and LightX2V through the small HTTP adapters under
-`adapters/`. The upstream projects do not expose this API by default. Clone the
-pinned upstream revisions, download the named checkpoints, set their paths in
-`.env`, and start both included adapters with
-`scripts/start_generation_services.sh`.
-
-The IC-Light adapter pins GitHub commit
-`bcf3f29ca85be8a4686215f477b546f5030be8b7`, checkpoint
-`lllyasviel/ic-light@9cad1878695f546a7fb9eaca14e2a89131ba5ffe` file
-`iclight_sd15_fc.safetensors`, and Stable Diffusion v1.5 revision
-`451f4fe16113bff5a5d2269ed5ad43b0592e9a14`.
+AdaptVPR uses the Qwen-LightX2V HTTP adapter under `adapters/` for all generation
+routes. Clone the pinned LightX2V revision, download the named checkpoints, set
+their paths in `.env`, and start Qwen with
+`bash scripts/start_generation_services.sh --wait`. IC-Light is an optional
+service for independent historical diagnosis, enabled with `--with-iclight`.
 The adapters accept either a Git checkout at the pinned commit or the official
 GitHub commit tarball with its commit written to `.adaptvpr-source-revision` in
 the extracted source root. LightX2V reports tracked source modifications in
@@ -93,14 +94,10 @@ run the adapter shipped in this repository:
 ```bash
 pip install -v -e /path/to/LightX2V
 pip install -r adapters/requirements.txt
-export ICLIGHT_ROOT=/path/to/IC-Light
-export ICLIGHT_BASE_MODEL_PATH=/models/stable-diffusion-v1-5
-export ICLIGHT_MODEL_PATH=/models/iclight_sd15_fc.safetensors
 export LIGHTX2V_ROOT=/path/to/LightX2V
 export LIGHTX2V_MODEL_PATH=/models/Qwen-Image-Edit-2511
 export LIGHTX2V_LORA_PATH=/models/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors
-scripts/start_generation_services.sh
-curl http://127.0.0.1:8002/health
+bash scripts/start_generation_services.sh --wait
 curl http://127.0.0.1:8001/health
 ```
 
@@ -109,11 +106,33 @@ The adapter exposes the exact `/health` and `/generate` contract consumed by
 instead of allowing the orchestration layer to mistake an unloaded service for
 a ready generator.
 
-`scripts/start_generation_services.sh` launches the two adapters from this
-repository while adding each configured upstream checkout to its Python import
-path. It does not expect or execute a third-party `app.py`. If services are
-managed outside AdaptVPR, set `ICLIGHT_AUTO_START=0` and
-`LIGHTX2V_AUTO_START=0` and provide only their URLs.
+`scripts/start_generation_services.sh` launches Qwen by default and adds its
+configured upstream checkout to the Python import path. `--with-iclight` also
+launches the historical adapter. It does not execute a third-party `app.py`.
+For an externally managed Qwen service, set `LIGHTX2V_AUTO_START=0` and configure
+`LIGHTX2V_API_URL`.
+
+### Optional historical IC-Light service
+
+The IC-Light adapter pins GitHub commit
+`bcf3f29ca85be8a4686215f477b546f5030be8b7`, checkpoint
+`lllyasviel/ic-light@9cad1878695f546a7fb9eaca14e2a89131ba5ffe` file
+`iclight_sd15_fc.safetensors`, and Stable Diffusion v1.5 revision
+`451f4fe16113bff5a5d2269ed5ad43b0592e9a14`.
+Configure its checkout and weights only when using the historical diagnostic
+runner or its adapter directly:
+
+```bash
+export ICLIGHT_ROOT=/path/to/IC-Light
+export ICLIGHT_BASE_MODEL_PATH=/models/stable-diffusion-v1-5
+export ICLIGHT_MODEL_PATH=/models/iclight_sd15_fc.safetensors
+bash scripts/start_generation_services.sh --with-iclight --wait
+curl http://127.0.0.1:8002/health
+```
+
+This flag adds the service to the launcher; the route agent continues to use
+Qwen for Global, Local and Dual generation. Historical tools are retained under
+[`experiments/generation_diagnosis`](../experiments/generation_diagnosis/README.md).
 
 ### BF16 generation with limited host RAM
 
@@ -171,4 +190,9 @@ matcher = get_matcher(name, device=device, max_num_keypoints=n_kpts)
 ```
 
 The returned matcher must provide `load_image(...)` and return `matched_kpts0`
-and `num_inliers` when called on a pair of images.
+and `num_inliers` for the route agent's geometric score. The curriculum's
+structure checks also require `matched_kpts1`, paired `inlier_kpts0` /
+`inlier_kpts1` and a fitted `H`, so match count, spatial coverage and displacement
+can be checked. Its requested matcher fails explicitly without silent
+substitution. Curriculum CLIP defaults to CPU and supplies fixed-scale weather
+contrasts; route-agent CLIP supplies the independent appearance-diversity score.

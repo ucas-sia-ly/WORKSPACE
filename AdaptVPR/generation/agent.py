@@ -16,7 +16,6 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 from generation.router import Route, normalize_decision
 from verification.evaluator import DualTraitEvaluator
-from generation.iclight import ICLightGenerator
 from generation.lightx2v import Lightx2vGenerator
 from generation.reflection_controller import ReflectionController
 from generation.llm_client import build_llm_client
@@ -26,8 +25,6 @@ from prompts.rules import (
     NEGATIVE_PROMPT,
     build_structured_prompt,
     choose_occlusion_from_context,
-    ensure_global_iclight_constraints,
-    global_negative_prompt,
     normalize_weather,
     predict_bad_image,
 )
@@ -145,8 +142,6 @@ GLOBAL_SAFE_WEATHERS = tuple(
     if weather in GLOBAL_WEATHER_ORDER
 ) or ("overcast", "fog")
 GLOBAL_MAX_SINGLE_WEATHER_RATIO = float(os.getenv("ADAPTVPR_GLOBAL_MAX_WEATHER_RATIO", "0.50"))
-GLOBAL_ICLIGHT_HIGHRES_DENOISE = float(os.getenv("ADAPTVPR_GLOBAL_ICLIGHT_DENOISE", "0.30"))
-GLOBAL_RAIN_ICLIGHT_HIGHRES_DENOISE = float(os.getenv("ADAPTVPR_GLOBAL_RAIN_ICLIGHT_DENOISE", "0.22"))
 
 
 def scheduler_manifest() -> dict:
@@ -154,6 +149,8 @@ def scheduler_manifest() -> dict:
 
     return {
         "algorithm": "online_capability_quota_v1",
+        "workflow_scope": "public_capability_scheduler_independent_of_frozen_qwen_curriculum_plan",
+        "global_generator": "Qwen-Image-Edit-2511",
         "target_route_ratios": dict(TARGET_ROUTE_RATIOS),
         "target_lightx2v_ratio": TARGET_LIGHTX2V_RATIO,
         "weather_threshold": WEATHER_THRESHOLD,
@@ -285,11 +282,9 @@ class SceneAugmentAgent:
         self.global_weather_pass_counts = {weather: 0 for weather in GLOBAL_WEATHER_ORDER}
         self.occlusion_counts = {"vehicle": 0, "person": 0}
         self.negative_prompt = NEGATIVE_PROMPT
-        self.iclight = None
         self.lightx2v = None
         self.evaluator = None
         if not planning_only:
-            self.iclight = ICLightGenerator(api_url="" if mock else None)
             self.lightx2v = Lightx2vGenerator(api_url="" if mock else None)
             self.evaluator = DualTraitEvaluator(mock=mock)
             if reflection_enabled:
@@ -891,19 +886,10 @@ Return this JSON schema:
     ) -> Image.Image:
         generation_seed = 42 if seed is None else int(seed)
         if route == Route.GLOBAL.value:
-            if not (decision or {}).get("frozen_prompt"):
-                prompt = ensure_global_iclight_constraints(prompt)
-            weather = (decision or {}).get("weather")
-            highres_denoise = (
-                GLOBAL_RAIN_ICLIGHT_HIGHRES_DENOISE
-                if weather == "rain"
-                else GLOBAL_ICLIGHT_HIGHRES_DENOISE
-            )
-            return self.iclight.generate(
+            return self.lightx2v.generate_global(
                 ref_image,
                 prompt,
-                negative_prompt=global_negative_prompt(),
-                highres_denoise=highres_denoise,
+                negative_prompt="",
                 seed=generation_seed,
             )
         elif route == Route.LOCAL.value:
@@ -975,7 +961,7 @@ Return this JSON schema:
             decision["route"] = Route.GLOBAL.value
             decision["weather"] = self._choose_weather(decision.get("weather"))
             decision["occlusion"] = None
-            decision["selected_model"] = "IC-Light"
+            decision["selected_model"] = "Qwen-Image-Edit-2511"
             decision["prompt"] = build_structured_prompt(
                 route=decision["route"],
                 weather=decision["weather"],
@@ -1317,7 +1303,7 @@ Return this JSON schema:
         original_weather = decision.get("weather")
         decision["weather"] = selected_weather
         decision["occlusion"] = None
-        decision["selected_model"] = "IC-Light"
+        decision["selected_model"] = "Qwen-Image-Edit-2511"
         decision["selected_weather"] = selected_weather
         decision["weather_selection_reason"] = (
             "scene_restricted_safe_pool_quota" if scene_restricted else "target_ratio_quota"
@@ -1331,11 +1317,6 @@ Return this JSON schema:
         decision["global_weather_candidate_pool"] = pool
         decision["global_weather_deficits"] = {key: round(value, 4) for key, value in deficits.items()}
         decision["global_weather_quota_basis"] = "passed_global_weather_counts"
-        decision["global_iclight_highres_denoise"] = (
-            GLOBAL_RAIN_ICLIGHT_HIGHRES_DENOISE
-            if selected_weather == "rain"
-            else GLOBAL_ICLIGHT_HIGHRES_DENOISE
-        )
         decision["global_scene_policy"] = {
             "action": "restrict_weather" if scene_restricted else "quota_select_weather",
             "risk": "high" if scene_high_risk else "medium" if scene_medium_risk else "low",

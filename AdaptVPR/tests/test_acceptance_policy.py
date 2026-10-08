@@ -1,9 +1,4 @@
 import unittest
-import sys
-import types
-
-sys.modules.setdefault("numpy", types.ModuleType("numpy"))
-
 from generation.reflection_controller import ReflectionController
 
 

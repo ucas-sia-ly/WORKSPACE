@@ -21,7 +21,7 @@ from PIL import Image, ImageDraw
 
 ADAPTVPR_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ADAPTVPR_ROOT))
-from experiments.vpr_guidance.common import file_sha256, use_adaptvpr, write_json
+from experiments.qwen_curriculum.common import file_sha256, use_adaptvpr, write_json
 
 use_adaptvpr()
 from experiments.generation_diagnosis.inspect_generated import select_records

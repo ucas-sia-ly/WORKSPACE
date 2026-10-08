@@ -1,13 +1,17 @@
 # Generator service API contracts
 
-IC-Light and LightX2V are integrated as local HTTP services. The current public
-client uses shared filesystem paths: the AdaptVPR process and both services must
-be able to read and write the same paths. The FastAPI adapters are distributed
-in this repository; the upstream source checkouts and model weights are not.
+Qwen-LightX2V is the default local HTTP generator for Global, Local and Dual
+routes, and for the [staged Qwen curriculum](../experiments/qwen_curriculum/README.md).
+IC-Light remains available for historical diagnosis. Clients and the service
+they call must share readable filesystem paths. The FastAPI adapters are
+distributed in this repository; upstream checkouts and model weights are not.
+
+`bash scripts/start_generation_services.sh --wait` starts and checks Qwen only.
+Add `--with-iclight` when an independent historical IC-Light run needs that service.
 
 ## Health checks
 
-### IC-Light
+### IC-Light (optional historical service)
 
 ```http
 GET /health
@@ -35,7 +39,7 @@ Expected response:
 
 If `generator_ready` is omitted, it is treated as equal to `model_loaded`.
 
-## IC-Light generation
+## IC-Light generation (historical)
 
 ```http
 POST /generate
@@ -59,9 +63,9 @@ Request:
 
 The four high-resolution fields are optional.
 
-For VPR-guidance LoRA inference, set `ADAPTVPR_LORA_CHECKPOINT` in `.env` or the
+For historical IC-Light LoRA inference, set `ADAPTVPR_LORA_CHECKPOINT` in `.env` or the
 service environment to a checkpoint saved by
-`experiments/vpr_guidance/lora_utils.py`. The adapter reads rank and alpha from
+`adapters/iclight_lora.py`. The adapter reads rank and alpha from
 the checkpoint metadata and applies it to the shared UNet used by both sampling
 stages. An unset or empty value uses vanilla IC-Light. Relative paths in `.env`
 are resolved against the AdaptVPR root by the startup script. Invalid checkpoints
@@ -71,16 +75,17 @@ launcher, from the AdaptVPR directory:
 
 ```bash
 export ADAPTVPR_LORA_CHECKPOINT=/absolute/path/to/lora_final.safetensors
-ADAPTVPR_FORCE_RESTART=1 bash scripts/start_generation_services.sh --wait
+ADAPTVPR_FORCE_RESTART=1 bash scripts/start_generation_services.sh --with-iclight --wait
 ```
 
-The launcher restarts both configured generation services. This option loads the
+With `--with-iclight`, the launcher restarts both requested services. This option loads the
 project's custom LoRA format; external Diffusers/PEFT checkpoints need conversion.
 
 ## LightX2V generation
 
-Local and Dual routes use the same endpoint and are distinguished by the prompt
-constructed by AdaptVPR.
+Global, Local and Dual routes use the same endpoint and are distinguished by
+the prompt constructed by AdaptVPR. The staged curriculum calls this endpoint
+directly with its frozen weather prompt and an empty negative prompt.
 
 ```http
 POST /generate
@@ -132,8 +137,10 @@ Both services return:
 }
 ```
 
-`result_path` must exist and be readable by the AdaptVPR process. LightX2V output
-is resized to the reference resolution if necessary.
+`result_path` must exist and be readable by the AdaptVPR process. The route-agent
+client resizes LightX2V output to the reference resolution if necessary. The
+staged curriculum preserves the raw PNG and saves a separate LANCZOS-resized
+training image at the source dimensions, with hashes for both artifacts.
 
 LightX2V additionally returns `canvas_policy`, `source_dimensions` and
 `raw_dimensions` in **[width, height]** order, `target_shape` in **[height,
@@ -143,6 +150,10 @@ do not match the requested canvas returns HTTP 500, rather than allowing a
 client resize to conceal the mismatch. Existing clients can continue reading
 only `result_path`.
 
-Default request timeout is 300 seconds. Configure it with
-`ICLIGHT_API_TIMEOUT` or `LIGHTX2V_API_TIMEOUT`; configure LightX2V retries with
-`LIGHTX2V_API_RETRIES`.
+Route-agent clients use a default request timeout of 300 seconds. Configure it
+with `ICLIGHT_API_TIMEOUT` or `LIGHTX2V_API_TIMEOUT`; configure the route-agent
+LightX2V retry count with `LIGHTX2V_API_RETRIES`. The staged curriculum uses
+`--request-timeout` (default 600 seconds), reserves its call budget before each
+POST, and makes no automatic generation retry. Its experimental structure and
+weather gates are separate from the route agent's `DualTraitEvaluator` thresholds;
+the curriculum records `s_div` without imposing a minimum of 0.15.

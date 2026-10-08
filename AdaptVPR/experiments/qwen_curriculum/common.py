@@ -1,11 +1,4 @@
-"""Shared paths and JSONL helpers for the SALAD-feedback generator loop.
-
-Fixed-budget stages run as separate processes; the adaptive experimental stage
-imports both AdaptVPR and SALAD and keeps their inference models resident. The two repositories
-both define top-level packages such as ``tests``, and SALAD's ``datasets``
-package shadows Hugging Face ``datasets``. Import only the required namespaces
-when both repositories are in one process.
-"""
+"""Paths and atomic records for staged Qwen-only data construction."""
 
 from __future__ import annotations
 
@@ -17,7 +10,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
-GUIDANCE_ROOT = Path(__file__).resolve().parent
+CURRICULUM_ROOT = Path(__file__).resolve().parent
+GUIDANCE_ROOT = CURRICULUM_ROOT
 ADAPTVPR_ROOT = GUIDANCE_ROOT.parents[1]
 WORKSPACE_ROOT = ADAPTVPR_ROOT.parent
 SALAD_ROOT = WORKSPACE_ROOT / "salad"
@@ -99,6 +93,11 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def fingerprint(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                    allow_nan=False, separators=(",", ":")).encode()).hexdigest()
 
 
 def candidate_seed(base_seed: int, sample_id: str, index: int) -> int:

@@ -25,12 +25,17 @@ os.execv("/bin/bash", ["bash", str(root / "scripts/start_generation_services.sh"
 PY
 fi
 WAIT_FOR_READY=0
-if [ "${1:-}" = "--wait" ] && [ "$#" = "1" ]; then
-  WAIT_FOR_READY=1
-elif [ "$#" != "0" ]; then
-  echo "Usage: bash scripts/start_generation_services.sh [--wait]" >&2
-  exit 2
-fi
+WITH_ICLIGHT=0
+for argument in "$@"; do
+  case "$argument" in
+    --wait) WAIT_FOR_READY=1 ;;
+    --with-iclight) WITH_ICLIGHT=1 ;;
+    *)
+      echo "Usage: bash scripts/start_generation_services.sh [--wait] [--with-iclight]" >&2
+      exit 2
+      ;;
+  esac
+done
 LOG_DIR=${ADAPTVPR_SERVICE_LOG_DIR:-$ADAPTVPR_ROOT/tmp/logs}
 TMP_DIR=${ADAPTVPR_TMP_DIR:-$ADAPTVPR_ROOT/tmp}
 HEALTHCHECK_PYTHON=${ADAPTVPR_HEALTHCHECK_PYTHON:-python}
@@ -147,12 +152,14 @@ start_service() {
   fi
 }
 
-start_service iclight "${ICLIGHT_PORT:-8002}" "$ICLIGHT_ROOT" "$ICLIGHT_PYTHON" "$ICLIGHT_ADAPTER"
+if [ "$WITH_ICLIGHT" = "1" ]; then
+  start_service iclight "${ICLIGHT_PORT:-8002}" "$ICLIGHT_ROOT" "$ICLIGHT_PYTHON" "$ICLIGHT_ADAPTER"
+fi
 start_service lightx2v "${LIGHTX2V_PORT:-8001}" "$LIGHTX2V_ROOT" "$LIGHTX2V_PYTHON" "$LIGHTX2V_ADAPTER"
 
 echo "Generation service startup requested. Check /health until model_loaded and generator_ready are true."
 if [ "$WAIT_FOR_READY" = "1" ]; then
-  "$HEALTHCHECK_PYTHON" - "$ADAPTVPR_ROOT" "$LOG_DIR" <<'PY'
+  "$HEALTHCHECK_PYTHON" - "$ADAPTVPR_ROOT" "$LOG_DIR" "$WITH_ICLIGHT" <<'PY'
 import os
 import sys
 import time
@@ -163,7 +170,8 @@ from generation.service_health import probe_service
 
 pending = {
     name: os.getenv(f"{name}_API_URL", f"http://127.0.0.1:{os.getenv(name + '_PORT', port)}/generate")
-    for name, port in (("ICLIGHT", "8002"), ("LIGHTX2V", "8001"))
+    for name, port in ((("ICLIGHT", "8002"), ("LIGHTX2V", "8001"))
+                       if sys.argv[3] == "1" else (("LIGHTX2V", "8001"),))
 }
 deadline = time.monotonic() + float(os.getenv("ADAPTVPR_SERVICE_READY_TIMEOUT", "900"))
 with requests.Session() as session:

@@ -15,7 +15,7 @@ from generation.service_health import probe_service
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
-DEFAULT_START_SCRIPT = "/path/to/LightX2V/start_server.sh"
+DEFAULT_START_SCRIPT = str(Path(__file__).resolve().parents[1] / "scripts/start_generation_services.sh")
 SERVICE_LOG_DIR = Path(
     os.getenv(
         "ADAPTVPR_SERVICE_LOG_DIR",
@@ -175,6 +175,24 @@ class Lightx2vGenerator:
         finally:
             if temp_path and os.path.exists(temp_path):
                 os.unlink(temp_path)
+
+    def generate_global(
+        self,
+        ref_image: Image.Image,
+        prompt: str,
+        seed: int = 42,
+        negative_prompt: str = "",
+        **kwargs,
+    ) -> Image.Image:
+        """Apply the released Qwen weather edit with its four-step API recipe."""
+        result = self._call_api(ref_image, prompt, seed=seed, negative_prompt=negative_prompt, **kwargs)
+        if result is not None:
+            return result
+        if _mock_disabled():
+            raise RuntimeError("[Lightx2v] The API returned no result and strict mode forbids Global mock fallback")
+        from PIL import ImageEnhance
+
+        return ImageEnhance.Brightness(ref_image).enhance(0.8)
 
     def generate_local(
         self,

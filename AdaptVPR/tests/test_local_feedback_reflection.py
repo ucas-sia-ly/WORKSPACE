@@ -1,13 +1,8 @@
 import json
-import sys
-import types
 import unittest
 from unittest.mock import patch
 
 from PIL import Image
-
-# This unit exercises prompt wiring only; numeric image comparison is not used.
-sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 
 from generation.reflection_controller import ReflectionController
 

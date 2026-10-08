@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class GenerationServiceStartupTest(unittest.TestCase):
-    def check_launcher(self, use_tmux, wait=False, existing_server=False, has_lora=True):
+    def check_launcher(self, use_tmux, wait=False, existing_server=False, has_lora=True, with_iclight=False):
         with tempfile.TemporaryDirectory(prefix="adaptvpr-startup-") as directory:
             temporary = Path(directory)
             project = temporary / "AdaptVPR's test"
@@ -27,7 +27,7 @@ class GenerationServiceStartupTest(unittest.TestCase):
             shutil.copy2(ROOT / "scripts/start_generation_services.sh", project / "scripts")
             for name in ("__init__.py", "preflight.py", "service_health.py"):
                 shutil.copy2(ROOT / "generation" / name, project / "generation")
-            for name in ("IC-Light", "LightX2V"):
+            for name in (("IC-Light", "LightX2V") if with_iclight else ("LightX2V",)):
                 (temporary / name).mkdir()
             for name in ("iclight_sd15_fc.py", "lightx2v_qwen_image_edit.py"):
                 (project / "adapters" / name).write_text(
@@ -83,21 +83,30 @@ class GenerationServiceStartupTest(unittest.TestCase):
                     subprocess.run([tmux, "-L", server, "-f", str(config), "new-session", "-d", "-s", "keeper",
                                     "/bin/sleep", "8"], env=stale, check=True, timeout=3)
                 result = subprocess.run(
-                    ["bash", str(project / "scripts/start_generation_services.sh"), *(["--wait"] if wait else [])],
+                    ["bash", str(project / "scripts/start_generation_services.sh"),
+                     *(["--wait"] if wait else []), *(["--with-iclight"] if with_iclight else [])],
                     cwd=temporary, env=env, capture_output=True, text=True, timeout=10,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 if wait:
-                    self.assertIn("ICLIGHT ready", result.stdout)
+                    if with_iclight:
+                        self.assertIn("ICLIGHT ready", result.stdout)
+                    else:
+                        self.assertNotIn("ICLIGHT ready", result.stdout)
                     self.assertIn("LIGHTX2V ready", result.stdout)
+                services = (("iclight", ports[0], "IC-Light"), ("lightx2v", ports[1], "LightX2V")) if with_iclight else (
+                    ("lightx2v", ports[1], "LightX2V"),
+                )
                 logs = [project / "tmp/logs" / f"{name}_{port}.log"
-                        for name, port in zip(("iclight", "lightx2v"), ports)]
+                        for name, port, _ in services]
                 deadline = time.monotonic() + 3
                 while time.monotonic() < deadline:
                     if all(log.exists() and log.stat().st_size for log in logs):
                         break
                     time.sleep(0.05)
-                for log, upstream in zip(logs, ("IC-Light", "LightX2V")):
+                if not with_iclight:
+                    self.assertFalse((project / "tmp/logs" / f"iclight_{ports[0]}.log").exists())
+                for log, (_, _, upstream) in zip(logs, services):
                     self.assertTrue(log.exists(), f"Missing {log}: {result.stdout} {result.stderr}")
                     data = json.loads(log.read_text())
                     self.assertEqual(data["LIGHTX2V_ROOT"], str(temporary / "LightX2V"))
@@ -113,6 +122,12 @@ class GenerationServiceStartupTest(unittest.TestCase):
 
     def test_nohup_launches_adapters_with_dotenv_paths(self):
         self.check_launcher(use_tmux=False)
+
+    def test_historical_iclight_requires_explicit_opt_in(self):
+        self.check_launcher(use_tmux=False, wait=True, with_iclight=True)
+
+    def test_default_wait_requires_only_qwen_service(self):
+        self.check_launcher(use_tmux=False, wait=True)
 
     @unittest.skipUnless(shutil.which("tmux") and shutil.which("fish"), "requires tmux and fish")
     def test_tmux_launches_adapters_when_default_shell_is_fish(self):

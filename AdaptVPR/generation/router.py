@@ -8,7 +8,6 @@ from prompts.rules import (
     OCCLUSIONS,
     build_structured_prompt,
     choose_occlusion_from_context,
-    ensure_global_iclight_constraints,
     has_person_surface,
     has_vehicle_surface,
     normalize_weather,
@@ -36,7 +35,7 @@ ROUTE_ALIASES = {
 
 ROUTE_TO_MODEL = {
     Route.SKIP.value: "None",
-    Route.GLOBAL.value: "IC-Light",
+    Route.GLOBAL.value: "Qwen-Image-Edit-2511",
     Route.LOCAL.value: "LightX2V-Local",
     Route.DUAL.value: "LightX2V-Dual",
 }
@@ -160,7 +159,7 @@ def normalize_decision(raw: dict[str, Any], image_path: str | Path | None = None
         skip_reason = "invalid_or_unsuitable_scene"
 
     if _is_structured_prompt(raw_prompt):
-        prompt = ensure_global_iclight_constraints(raw_prompt) if route == Route.GLOBAL.value else raw_prompt
+        prompt = raw_prompt
     elif route == Route.SKIP.value:
         prompt = build_structured_prompt(
             route=route,

@@ -55,7 +55,7 @@ python AdaptVPR/experiments/generation_diagnosis/calibrate_weather_signal.py \
   --out outputs/gen_diagnosis/weather_calibration_new
 ```
 
-本次已重算的结果位于 `outputs/gen_diagnosis/weather_calibration_recomputed/`；固定 `shift > 6` 保留 yes 79.1%、weak 55.3%、no 4.3%，按源图留一 balanced accuracy 为 0.8224。标签仍是原非盲 agent 目视诊断，不是独立真值。`--scores` 可复用脚本产生的哈希绑定缓存；`--legacy-probe` 仅显式导入旧无图像身份的分数，并保留来源不可验证的限制。自适应生成入口与验证范围见 [vpr_guidance 记录](../vpr_guidance/ADAPTIVE_VALIDATION.md)。
+本次已重算的结果位于 `outputs/gen_diagnosis/weather_calibration_recomputed/`；历史 IC-Light 诊断的固定 `shift > 6` 保留 yes 79.1%、weak 55.3%、no 4.3%，按源图留一 balanced accuracy 为 0.8224。标签仍是原非盲 agent 目视诊断，不是独立真值。`--scores` 可复用脚本产生的哈希绑定缓存；`--legacy-probe` 仅显式导入旧无图像身份的分数，并保留来源不可验证的限制。IC-Light 的阈值不用于新的 Qwen 质量门限。原闭环生成与生成器 LoRA 训练实验已由 [分阶段 Qwen 数据构建](../qwen_curriculum/README.md) 替代；本目录保留历史诊断工具。
 
 完整解释见 `outputs/gen_diagnosis/REPORT.md`；逐图证据、汇总 CSV 和本地 HTML 图库位于 `outputs/gen_diagnosis/report/`。原始旧 grid 与 photometric probe 保留。
 

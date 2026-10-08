@@ -160,7 +160,7 @@ def main() -> None:
         "require_generated": args.require_generated,
         "planner_model": os.getenv("ADAPTVPR_PLANNER_MODEL", "qwen3-vl-4b-instruct-remote"),
         "planner_api_base": os.getenv("ADAPTVPR_PLANNER_API_BASE", "http://127.0.0.1:23002/v1"),
-        "iclight_api_url": os.getenv("ICLIGHT_API_URL", "http://127.0.0.1:8002/generate"),
+        "global_generator": "Qwen-Image-Edit-2511",
         "lightx2v_api_url": os.getenv("LIGHTX2V_API_URL", "http://127.0.0.1:8001/generate"),
         "scheduler": scheduler_manifest(),
         "scheduler_runtime": {

@@ -22,7 +22,7 @@ from pathlib import Path
 ADAPTVPR_ROOT = Path(__file__).resolve().parents[2]
 WORKSPACE_ROOT = ADAPTVPR_ROOT.parent
 sys.path.insert(0, str(ADAPTVPR_ROOT))
-from experiments.vpr_guidance.common import (  # noqa: E402
+from experiments.qwen_curriculum.common import (  # noqa: E402
     candidate_seed, file_sha256, read_jsonl, use_adaptvpr, write_json, write_jsonl,
 )
 

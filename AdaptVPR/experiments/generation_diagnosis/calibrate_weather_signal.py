@@ -31,11 +31,15 @@ from PIL import Image
 ADAPTVPR_ROOT = Path(__file__).resolve().parents[2]
 if str(ADAPTVPR_ROOT) not in sys.path:
     sys.path.insert(0, str(ADAPTVPR_ROOT))
-from experiments.vpr_guidance.common import file_sha256, read_jsonl, use_adaptvpr, write_json, write_jsonl
-from experiments.vpr_guidance.weather_signal import (
-    EXPLORATORY_MIN_WEATHER_SHIFT, WEATHER_TEXT, WeatherSignal,
+from experiments.qwen_curriculum.common import file_sha256, read_jsonl, use_adaptvpr, write_json, write_jsonl
+from experiments.qwen_curriculum.weather_signal import (
+    WEATHER_TEXT, WeatherSignal,
     WeatherSignalEvaluator, weather_definition,
 )
+
+# Historical IC-Light diagnosis only; QwenQualityVerifier has its own explicitly
+# experimental per-condition settings and does not consume this threshold.
+EXPLORATORY_MIN_WEATHER_SHIFT = 6.0
 
 
 def fingerprint(payload: dict) -> str:
@@ -160,7 +164,14 @@ def join_scores(reviews: list[dict], *, legacy_probe: Path | None = None,
             key = (row["source_sha256"], row["output_sha256"], row["condition"])
             if key in keyed:
                 raise ValueError("Duplicate source/output/condition in hash-keyed weather score cache")
-            if row.get("weather_signal_definition") != definition:
+            cached_definition = row.get("weather_signal_definition")
+            # Older historical caches included an exploratory IC-Light threshold
+            # in the shared signal metadata. It did not affect their embeddings;
+            # compare the unchanged model/text/scale definitions instead.
+            canonical_definition = ({key: value for key, value in cached_definition.items()
+                                     if key not in {"exploratory_min_weather_shift", "threshold_status"}}
+                                    if isinstance(cached_definition, dict) else None)
+            if canonical_definition != definition:
                 raise ValueError("Weather score cache signal definition differs")
             if row.get("weather_score_provenance") not in {
                 "recomputed_on_hash_verified_images", "legacy_ordered_import_unverified_embedding_provenance"
@@ -328,7 +339,7 @@ def main(argv=None):
         "schema_version": 1, "inputs": inputs, "scores": score_metadata,
         "signal_definition": weather_definition(), "thresholds": args.thresholds,
         "implementation_sha256": {str(path.relative_to(ADAPTVPR_ROOT)): file_sha256(path)
-                                  for path in (Path(__file__), ADAPTVPR_ROOT / "experiments/vpr_guidance/weather_signal.py",
+                                  for path in (Path(__file__), ADAPTVPR_ROOT / "experiments/qwen_curriculum/weather_signal.py",
                                                ADAPTVPR_ROOT / "verification/evaluator.py")},
     }
     config["fingerprint"] = fingerprint(config)

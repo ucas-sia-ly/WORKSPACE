@@ -27,7 +27,6 @@ WEATHER_TEXT = {
 }
 WEATHER_NEUTRAL_TEXT = "a street photo on a clear sunny day"
 WEATHER_LOGIT_SCALE = 100.0
-EXPLORATORY_MIN_WEATHER_SHIFT = 6.0
 SIGNAL_DEFINITION = {
     "version": 1,
     "weather_signal_model": "openai/clip-vit-base-patch32",
@@ -37,8 +36,6 @@ SIGNAL_DEFINITION = {
     "formula": "scale * (cos(image, condition_text) - cos(image, neutral_text))",
     "shift_formula": "generated_logit - source_logit",
     "interpretation": "fixed-scale surrogate logits; not calibrated probabilities",
-    "exploratory_min_weather_shift": EXPLORATORY_MIN_WEATHER_SHIFT,
-    "threshold_status": "exploratory small-sample IC-Light diagnosis",
 }
 
 

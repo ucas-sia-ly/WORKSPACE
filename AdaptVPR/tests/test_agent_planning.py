@@ -12,7 +12,6 @@ from PIL import Image
 dotenv = types.ModuleType("dotenv")
 dotenv.load_dotenv = lambda *_args, **_kwargs: None
 sys.modules.setdefault("dotenv", dotenv)
-sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 
 from generation.agent import SceneAugmentAgent, _ratios_from_env, scheduler_manifest
 from generation.inputs import parse_condition

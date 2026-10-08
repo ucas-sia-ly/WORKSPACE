@@ -18,8 +18,8 @@ if str(ADAPTVPR_ROOT) not in sys.path:
     sys.path.insert(0, str(ADAPTVPR_ROOT))
 
 from experiments.generation_diagnosis import calibrate_weather_signal as calibration
-from experiments.vpr_guidance.common import file_sha256
-from experiments.vpr_guidance.weather_signal import (
+from experiments.qwen_curriculum.common import file_sha256
+from experiments.qwen_curriculum.weather_signal import (
     SIGNAL_DEFINITION, WEATHER_NEUTRAL_TEXT, WEATHER_TEXT, WeatherSignal,
     WeatherSignalEvaluator, weather_definition,
 )
@@ -230,6 +230,24 @@ class CalibrationTests(unittest.TestCase):
             probe.write_text(json.dumps([{"cond": "rain", "label": "no", "passed": True, "src": -3, "gen": 4}]))
             with self.assertRaisesRegex(ValueError, "order"):
                 calibration.join_scores(reviews, legacy_probe=probe)
+
+    def test_historical_threshold_metadata_does_not_change_hash_cached_embeddings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "scores.jsonl"
+            row = reviewed("a", "yes", 7)
+            definition = weather_definition()
+            definition.update(exploratory_min_weather_shift=6.0,
+                              threshold_status="exploratory small-sample IC-Light diagnosis")
+            cached = {**row, "weather_signal_model": definition["weather_signal_model"],
+                      "weather_signal_definition": definition,
+                      "weather_score_provenance": "recomputed_on_hash_verified_images"}
+            cache.write_text(json.dumps(cached) + "\n")
+            scores, _ = calibration.join_scores([row], scores_path=cache)
+            self.assertEqual(scores[0]["weather_shift"], 7)
+            cached["weather_signal_definition"]["scale"] = 1.0
+            cache.write_text(json.dumps(cached) + "\n")
+            with self.assertRaisesRegex(ValueError, "definition differs"):
+                calibration.join_scores([row], scores_path=cache)
 
 
 if __name__ == "__main__":

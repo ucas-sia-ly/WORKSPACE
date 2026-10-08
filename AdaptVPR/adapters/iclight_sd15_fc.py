@@ -193,7 +193,7 @@ def load_pipeline() -> tuple[object, object, object]:
     if os.getenv("ADAPTVPR_LORA_CHECKPOINT", "").strip():
         import sys
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-        from experiments.vpr_guidance.lora_utils import (
+        from adapters.iclight_lora import (
             inject_lora_into_unet, load_lora_checkpoint, lora_config_from_metadata, read_lora_metadata,
         )
         lora_checkpoint = _required_path("ADAPTVPR_LORA_CHECKPOINT")
