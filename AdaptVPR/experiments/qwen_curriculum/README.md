@@ -1,8 +1,32 @@
 # Qwen 困难样本增广
 
+当前正式训练任务已改为 **700 张生成图、8:1 和 4:1 的两组配对对照，共四次训练、六个 SVOX 子集评估**。四组保留 DINOv2 预训练、SALAD 随机初始化，从新的 VPR 训练开始（50轮，学习率6e-5，训练最后4个 backbone block 和聚合器），不加载预训练 VPR checkpoint。使用 [test_700_ratio_experiment.py](test_700_ratio_experiment.py)，配置和查看方式见 [RATIO_700_EXPERIMENT.md](RATIO_700_EXPERIMENT.md)。此前的微调和全城市池任务已停止。下文保留生成管线说明和历史全池训练方案。
+
+生成目标已扩展为 **累计 2000 张，包含此前的生成图**。按当前安排，保持上述训练运行，等四组训练及全部评测成功结束、训练进程退出后，再启动 Qwen 续生成。`campaign.py` 检查实验指纹、完整完成报告、四个 checkpoint 和服务退出状态；训练失败或不完整时保持生成停止。
+
+累计计划使用原有困难度缓存，四城市各 500 个源图，覆盖 1491 个地点，每地点最多 2 个源图，源路径和内容均不重复。域配额为 night=1000、snow=400、fog=400、rain=200。先完成原 `generation_1000`，再完成独立的 `generation_2000/additional_1000`；原计划、图片、结果校验和与调用账本保持有效，汇总清单引用原图片路径，不复制图片。
+
+排队时已有 757 条生成记录，另有 1 张已落盘的中断输出可零调用恢复；因此预计还需要 1242 次新调用。2000 是生成图片总数，自动验收通过数另行统计。续跑沿用 Qwen-Image-Edit-2511、4 步、guidance=1 和 `source_aspect_v1`，不重新生成已完成的图片，不重复发起结果不明的调用，也不自动启动另一轮训练。
+
+查看本次排队任务与累计进度：
+
+```bash
+systemctl --user status qwen-curriculum-2000.service
+cat outputs/qwen_curriculum/generation_2000/summary.json
+tail -f outputs/qwen_curriculum/generation_2000/worker.log
+```
+
+`summary.json` 的 `waiting_for_training` 表示正在等待完整训练；进入生成后可查看同目录的 `stage_1.log`、`stage_2.log`。生成全部完成并核验后会停止 Qwen 服务释放资源。聊天关闭不会终止 systemd 用户任务；机器重启后可依据原目录恢复：
+
+```bash
+/home/admin123/miniconda3/envs/AdaptVPR/bin/python \
+  AdaptVPR/experiments/qwen_curriculum/campaign.py run \
+  --output-dir outputs/qwen_curriculum/generation_2000
+```
+
 当前推荐入口。流程固定为 **真实训练图难度挖掘 → Qwen 单次天气编辑 → 结构/天气筛选 → 同一源图概率替换训练**。不生成 overcast，不运行生成器 LoRA 训练，不在每张生成图上重载 SALAD，不根据验收失败连续加码编辑。
 
-本轮使用 Bangkok、LosAngeles、Medellin、BuenosAires 四个训练城市；新增预算为 1000 次生成调用，默认分配如下。
+初始冻结阶段使用 Bangkok、LosAngeles、Medellin、BuenosAires 四个训练城市，预算为 1000 次生成调用，分配如下；扩展阶段沿用相同比例。
 
 | 域 | 张数 | 比例 |
 |---|---:|---:|
@@ -88,7 +112,7 @@ $PYTHON AdaptVPR/experiments/qwen_curriculum/run.py import-existing \
 
 可用 `--include-positive` 将另一套 prompt 一并验收。历史复用图片来自随机源图，不算作新增的 1000 张困难源图；该 pilot 主要用于新验收规则诊断。
 
-## 生成后的正式对照
+## 历史全池对照方案（本次不执行）
 
 `train_compare.py` 串行完成两个匹配的训练组：REAL 使用四城市完整真实池，REPLACE 在相同数据池中按源图替换。两组均使用同一个已发布 checkpoint、seed=42、4 epochs、冻结 backbone、学习率 1e-6、无额外图像增强、FP32、batch=8 地点 × 4 图、workers=0。仅比较最终第四轮 checkpoint，不用测试结果筛选超参数或 checkpoint。
 
@@ -107,7 +131,7 @@ $PYTHON AdaptVPR/experiments/qwen_curriculum/train_compare.py run \
 
 本地完整 SVOX 测试协议可用：gallery 17,166，日间 queries 14,278，夜间 queries 823；25m UTM 正例、FP32 224×224、同一 gallery 顺序与精确检索。每个 checkpoint 只提取一次共用 gallery。`comparison.json` 保存 REAL、REPLACE 的 Recall@1/5/10 和百分点差值。未出结果前不宣称 Recall 改善。
 
-当前后台任务及查看方式：
+历史后台任务及查看方式（当前生成入口见本文开头）：
 
 ```bash
 systemctl --user status qwen-curriculum-1000.service qwen-curriculum-compare.service
