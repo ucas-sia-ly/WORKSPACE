@@ -1,5 +1,7 @@
 # Qwen 困难样本增广
 
+新增模块实验使用 `--reliability-ot`，沿用已完成原版实验的700张固定图片池，重新训练两组配对共四个模型，自动输出原版/新版 SVOX 比较表。训练指令和辅助 source 计数见 [RELIABILITY_700_EXPERIMENT.md](RELIABILITY_700_EXPERIMENT.md)。当前先继续生成，由用户执行训练命令，不自动启动训练。
+
 当前正式训练任务已改为 **700 张生成图、8:1 和 4:1 的两组配对对照，共四次训练、六个 SVOX 子集评估**。四组保留 DINOv2 预训练、SALAD 随机初始化，从新的 VPR 训练开始（50轮，学习率6e-5，训练最后4个 backbone block 和聚合器），不加载预训练 VPR checkpoint。使用 [test_700_ratio_experiment.py](test_700_ratio_experiment.py)，配置和查看方式见 [RATIO_700_EXPERIMENT.md](RATIO_700_EXPERIMENT.md)。此前的微调和全城市池任务已停止。下文保留生成管线说明和历史全池训练方案。
 
 生成目标已扩展为 **累计 2000 张，包含此前的生成图**。按当前安排，保持上述训练运行，等四组训练及全部评测成功结束、训练进程退出后，再启动 Qwen 续生成。`campaign.py` 检查实验指纹、完整完成报告、四个 checkpoint 和服务退出状态；训练失败或不完整时保持生成停止。

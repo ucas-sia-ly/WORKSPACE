@@ -10,16 +10,19 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+from contextlib import contextmanager
+import fcntl
 import gc
 import hashlib
 import json
 import math
 from pathlib import Path
 import random
-import subprocess
+import shutil
 import sys
 import unittest
 import tempfile
+import time
 from unittest.mock import patch
 
 from PIL import Image
@@ -144,7 +147,21 @@ def request_definition(args):
             "backbone_repo": str(args.backbone_repo), "dataset_root": str(args.dataset_root),
             "epochs": args.epochs, "learning_rate": args.learning_rate,
             "trainable_blocks": args.trainable_blocks, "batch_size": args.batch_size,
-            "seed": args.seed, "device": args.device}
+            "seed": args.seed, "device": args.device,
+            "reliability": reliability_definition(args),
+            "baseline_dir": str(args.baseline_dir) if getattr(args, "baseline_dir", None) else None}
+
+
+def reliability_definition(args):
+    if not getattr(args, "reliability_ot", False):
+        return {"enabled": False}
+    return {"enabled": True, "lambda": args.reliability_lambda,
+            "hidden_dim": args.reliability_hidden_dim,
+            "head_learning_rate": args.reliability_head_lr or args.learning_rate,
+            "loss_weight": args.reliability_loss_weight,
+            "real_prior_weight": args.reliability_real_prior_weight,
+            "coverage_weight": args.reliability_coverage_weight,
+            "coverage_floor": args.reliability_coverage_floor}
 
 
 def validate(config, directory):
@@ -156,6 +173,9 @@ def validate(config, directory):
     for name, digest in config["files_sha256"].items():
         if common.file_sha256(directory / name) != digest:
             raise ValueError(f"Frozen experiment input changed: {name}")
+    for name, digest in config.get("baseline", {}).get("snapshot_files_sha256", {}).items():
+        if common.file_sha256(directory / "baseline" / name) != digest:
+            raise ValueError(f"Historical baseline snapshot changed: {name}")
     for row in common.read_jsonl(directory / "image_inventory.jsonl"):
         if common.file_sha256(Path(row["path"])) != row["sha256"]:
             raise ValueError(f"Frozen image bytes changed: {row['path']}")
@@ -175,23 +195,45 @@ def prepare(args):
         validate(config, args.output_dir)
         return config
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    rows, execution, plan = load_successful(args)
+    baseline = None
+    if getattr(args, "reliability_ot", False):
+        from experiments.qwen_curriculum.reliability_comparison import freeze_baseline
+        baseline = freeze_baseline(args.baseline_dir, args.output_dir, args)
+        old = config_file(args.output_dir / "baseline/experiment_config.json")
+        for name in old["files_sha256"]:
+            destination = args.output_dir / name
+            if destination.exists() and common.file_sha256(destination) != old["files_sha256"][name]:
+                raise ValueError("Partial snapshot differs from historical fixed image pool")
+            shutil.copyfile(args.baseline_dir / name, destination)
+        rows = common.read_jsonl(args.output_dir / "generated_700.jsonl")
+        execution, plan = old["generation_execution_fingerprint"], old["generation_plan_fingerprint"]
+    else:
+        rows, execution, plan = load_successful(args)
     common.use_salad()
     from workflow.training_data import MixedGSVCitiesDataset
     dataset = MixedGSVCitiesDataset(args.real_data, cities=list(CITIES), augment=False)
     places = {(p.city, p.place_id): p.real_paths for p in dataset.places}
-    groups = build_groups(places, rows, args.num_images, args.seed)
+    groups = ({ratio: common.read_jsonl(args.output_dir / f"groups_{ratio}to1.jsonl") for ratio in (4, 8)}
+              if baseline else build_groups(places, rows, args.num_images, args.seed))
     generated = {row["source_path"]: row for row in rows}
     labels = {key: index for index, key in enumerate(sorted(places))}
     for ratio, bags in groups.items():
         for index, bag in enumerate(bags):
-            bag.update(group_id=index, label=labels[(bag["city"], bag["place_id"])])
-        common.write_jsonl(args.output_dir / f"groups_{ratio}to1.jsonl", bags)
-    common.write_jsonl(args.output_dir / "generated_700.jsonl", rows)
+            key = (bag["city"], bag["place_id"])
+            if baseline:
+                if bag["group_id"] != index or bag["label"] != labels[key] or not set(bag["sources"]) <= set(map(str, places[key])):
+                    raise ValueError("Frozen baseline source slots differ from current CSV metadata")
+            else:
+                bag.update(group_id=index, label=labels[key])
+        if not baseline:
+            common.write_jsonl(args.output_dir / f"groups_{ratio}to1.jsonl", bags)
+    if not baseline:
+        common.write_jsonl(args.output_dir / "generated_700.jsonl", rows)
     source_paths = {p for bag in groups[8] for p in bag["sources"]}
     inventory = [{"path": p, "sha256": common.file_sha256(Path(p)), "kind": "source"} for p in sorted(source_paths)]
     inventory += [{"path": row["output_path"], "sha256": row["output_sha256"], "kind": "generated"} for row in rows]
-    common.write_jsonl(args.output_dir / "image_inventory.jsonl", inventory)
+    if not baseline:
+        common.write_jsonl(args.output_dir / "image_inventory.jsonl", inventory)
     # Validate every selected source label independently of filenames or retrieval.
     for row in rows:
         if dataset.source_index[Path(row["source_path"])] != (row["city"], row["place_id"]):
@@ -208,8 +250,12 @@ def prepare(args):
             common.SALAD_ROOT / "train_salad.py", *sorted((common.SALAD_ROOT / "workflow").glob("*.py"))]
     code += sorted((common.SALAD_ROOT / "models").rglob("*.py"))
     code += sorted(args.backbone_repo.rglob("*.py"))
+    if baseline:
+        from experiments.qwen_curriculum import reliability_comparison
+        code.append(Path(reliability_comparison.__file__))
     names = ["groups_4to1.jsonl", "groups_8to1.jsonl", "generated_700.jsonl", "image_inventory.jsonl"]
-    definition = {"schema_version": 2, "request": request_definition(args),
+    definition = {"schema_version": 3, "request": request_definition(args),
+                  "reliability": reliability_definition(args),
                   "generation_execution_fingerprint": execution, "generation_plan_fingerprint": plan,
                   "selection": "first N completed successful outputs in execution order, including automatic quality rejects",
                   "quality_counts": dict(Counter(row["status"] for row in rows)),
@@ -227,6 +273,10 @@ def prepare(args):
                                "sampling": "one pass over fixed source groups per epoch; identical DataLoader seed within each pair"},
                   "svox_domains": DOMAINS, "evaluation_protocol": "full native test; 25m UTM positives; final checkpoint only"}
     definition["svox_inventory"] = svox_inventory(args.dataset_root)
+    if baseline:
+        definition["baseline"] = baseline
+        if definition["files_sha256"] != old["files_sha256"] or definition["svox_inventory"] != old["svox_inventory"]:
+            raise ValueError("New module experiment changed the historical image pool or SVOX protocol")
     config = seal(definition)
     common.write_json(path, config)
     print(json.dumps({"arms": config["arms"], "quality_counts": config["quality_counts"]}, indent=2), flush=True)
@@ -240,6 +290,7 @@ class FixedPairedDataset:
         self.groups = common.read_jsonl(directory / spec["schedule"])
         self.generated = {row["source_path"]: row for row in common.read_jsonl(directory / "generated_700.jsonl")}
         self.replace = spec["replace"]
+        self.reliability_pairs = config.get("reliability", {}).get("enabled", False)
         self.summary = {"fixed_experiment": "700_source_paired_ratios", "arm": arm,
                         "source_identity_sha256": common.fingerprint(self.groups),
                         "num_groups": len(self.groups), "num_source_images": spec["source_slots"],
@@ -247,6 +298,10 @@ class FixedPairedDataset:
                         "synthetic_exposure_per_epoch": spec["generated_per_epoch"],
                         "schedule_sha256": config["files_sha256"][spec["schedule"]],
                         "image_inventory_sha256": config["files_sha256"]["image_inventory.jsonl"]}
+        if self.reliability_pairs:
+            self.summary.update(reliability_pairs=True, reliability_pair_source="exact_fixed_source_slot",
+                                paired_synthetic_exposure_per_epoch=spec["generated_per_epoch"],
+                                companions_enter_metric_loss=False)
 
     def __len__(self):
         return len(self.groups)
@@ -258,17 +313,25 @@ class FixedPairedDataset:
     def __getitem__(self, index):
         import numpy as np
         import torch
-        tensors, flags = [], []
+        tensors, flags, companions = [], [], []
         mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-        for path, flag in self.selected(index):
+        def read_tensor(path):
             with Image.open(path) as image:
                 pixels = np.asarray(image.convert("RGB").resize((224, 224), Image.Resampling.BILINEAR),
                                     dtype=np.float32).copy() / 255.0
-            tensors.append((torch.from_numpy(pixels).permute(2, 0, 1) - mean) / std)
+            return (torch.from_numpy(pixels).permute(2, 0, 1) - mean) / std
+        for source, (path, flag) in zip(self.groups[index]["sources"], self.selected(index)):
+            tensor = read_tensor(path)
+            tensors.append(tensor)
             flags.append(flag)
-        return (torch.stack(tensors), torch.full((4,), self.groups[index]["label"], dtype=torch.long),
-                torch.tensor(flags, dtype=torch.bool))
+            if self.reliability_pairs:
+                companions.append(read_tensor(source) if flag else tensor)
+        result = (torch.stack(tensors), torch.full((4,), self.groups[index]["label"], dtype=torch.long),
+                  torch.tensor(flags, dtype=torch.bool))
+        if self.reliability_pairs:
+            return (*result, torch.stack(companions), torch.tensor(flags, dtype=torch.bool))
+        return result
 
 
 def train_arm(args, config):
@@ -284,6 +347,7 @@ def train_arm(args, config):
     checkpoint = directory / "checkpoint.pt"
     if checkpoint.exists():
         saved = verify_checkpoint(args, config, arm)
+        reconcile_training_log(args, config, arm, saved)
         if saved["dataset_summary"] != FixedPairedDataset(args.output_dir, config, arm).summary:
             raise ValueError("Checkpoint belongs to another fixed source schedule")
         if saved["epoch"] == args.epochs:
@@ -300,6 +364,9 @@ def train_arm(args, config):
             "--backbone", BACKBONE, "--init-policy", INIT_POLICY]
     argv += (["--resume", str(checkpoint)] if checkpoint.exists()
              else ["--backbone-weights", str(args.backbone_weights)])
+    reliability = config.get("reliability", {"enabled": False})
+    if reliability["enabled"]:
+        argv += reliability_arguments(reliability)
     # Scoped injection leaves SALAD source files unchanged. Its normal optimizer,
     # loss, checkpoint/resume and DataLoader are used with the fixed dataset.
     original = data.MixedGSVCitiesDataset
@@ -307,6 +374,8 @@ def train_arm(args, config):
     def dataset_factory(**kwargs):
         if kwargs["images_per_place"] != 4 or kwargs["augment"]:
             raise ValueError("Fixed paired training requires four views and no augmentation")
+        if kwargs.get("reliability_pairs", False) != reliability["enabled"]:
+            raise ValueError("Reliability training must request exact-source companions")
         return FixedPairedDataset(args.output_dir, config, arm)
     data.MixedGSVCitiesDataset = dataset_factory
     def model_factory(*model_args, **kwargs):
@@ -314,10 +383,20 @@ def train_arm(args, config):
         if not checkpoint.exists():
             if not kwargs["pretrained_backbone"] or kwargs["backbone_weights"] != args.backbone_weights:
                 raise ValueError("Fresh VPR training must use only the specified DINOv2 backbone weights")
+            standard_state = {name: tensor for name, tensor in model.aggregator.state_dict().items()
+                              if not name.startswith("reliability_")}
+            standard_sha = tensor_state_sha256(standard_state)
+            backbone_sha = tensor_state_sha256(model.backbone.state_dict())
+            if "baseline" in config:
+                old = config_file(args.output_dir / "baseline" / f"{arm}_initialization.json")
+                if (standard_sha != old["initial_aggregator_state_sha256"]
+                        or backbone_sha != old["initial_backbone_state_sha256"]):
+                    raise ValueError("New module run changed original SALAD/backbone initialization")
             common.write_json(directory / "initialization.json", seal({
                 "experiment_fingerprint": config["fingerprint"], "init_policy": INIT_POLICY,
                 "backbone_weights_sha256": config["backbone_weights_sha256"],
-                "initial_backbone_state_sha256": tensor_state_sha256(model.backbone.state_dict()),
+                "initial_backbone_state_sha256": backbone_sha,
+                "standard_aggregator_state_sha256": standard_sha,
                 "initial_aggregator_state_sha256": tensor_state_sha256(model.aggregator.state_dict())}))
         return model
     model_api.SALADModel = model_factory
@@ -328,6 +407,14 @@ def train_arm(args, config):
         model_api.SALADModel = original_model
     check_exposure(args, config, arm)
     verify_checkpoint(args, config, arm)
+
+
+def reliability_arguments(reliability):
+    names = {"lambda": "lambda", "hidden_dim": "hidden-dim", "head_learning_rate": "head-lr",
+             "loss_weight": "loss-weight", "real_prior_weight": "real-prior-weight",
+             "coverage_weight": "coverage-weight", "coverage_floor": "coverage-floor"}
+    return ["--reliability-ot", *[part for key, flag in names.items()
+                                   for part in (f"--reliability-{flag}", str(reliability[key]))]]
 
 
 def tensor_state_sha256(state):
@@ -349,7 +436,7 @@ def verify_initialization(args, config, arm):
 
 def check_shared_initialization(args, config):
     rows = [verify_initialization(args, config, arm) for arm in ARMS]
-    for key in ("initial_backbone_state_sha256", "initial_aggregator_state_sha256"):
+    for key in ("initial_backbone_state_sha256", "initial_aggregator_state_sha256", "standard_aggregator_state_sha256"):
         if len({row[key] for row in rows}) != 1:
             raise ValueError(f"Four arms did not start with identical weights: {key}")
     return rows[0]
@@ -369,8 +456,54 @@ def verify_checkpoint(args, config, arm):
             or saved["model_config"]["backbone_arch"] != BACKBONE
             or saved["dataset_summary"] != FixedPairedDataset(args.output_dir, config, arm).summary):
         raise ValueError("Saved checkpoint differs from this arm's fixed training protocol")
+    reliability = config.get("reliability", {"enabled": False})
+    agg = saved["model_config"]["agg_config"]
+    if agg.get("reliability_ot", False) != reliability["enabled"]:
+        raise ValueError("Checkpoint did not train the requested reliability module")
+    if reliability["enabled"]:
+        from workflow.model import checkpoint_state_and_config
+        checkpoint_state_and_config(saved)
+        expected_reliability = {
+            "loss_weight": reliability["loss_weight"], "real_prior_weight": reliability["real_prior_weight"],
+            "coverage_weight": reliability["coverage_weight"], "coverage_floor": reliability["coverage_floor"],
+            "head_learning_rate": reliability["head_learning_rate"],
+            "teacher": "detached_local_self_similarity_reciprocal_structure_v1"}
+        if (agg.get("reliability_lambda") != reliability["lambda"]
+                or agg.get("reliability_hidden_dim") != reliability["hidden_dim"]
+                or training.get("reliability") != expected_reliability):
+            raise ValueError("Checkpoint module settings differ from the fixed experiment")
     verify_initialization(args, config, arm)
     return saved
+
+
+def reconcile_training_log(args, config, arm, saved):
+    """Repair only the checkpoint-before-log crash window from trusted metrics."""
+    path = args.output_dir / arm / "training_log.jsonl"
+    lines = path.read_text().splitlines() if path.exists() else []
+    logs = []
+    truncated = False
+    for index, line in enumerate(lines):
+        try:
+            logs.append(json.loads(line))
+        except json.JSONDecodeError:
+            if index != len(lines) - 1:
+                raise ValueError("Training log has an interior malformed record")
+            truncated = True
+    epoch = saved["epoch"]
+    epochs = [row["epoch"] for row in logs]
+    if not truncated and epochs == list(range(1, epoch + 1)):
+        if logs[-1] != saved["metrics"]:
+            raise ValueError("Latest training log differs from checkpoint metrics")
+        return
+    metrics, spec = saved["metrics"], config["arms"][arm]
+    if (epochs != list(range(1, epoch)) or metrics["epoch"] != epoch
+            or (metrics["real_exposure"], metrics["synthetic_exposure"]) !=
+               (spec["true_per_epoch"], spec["generated_per_epoch"])
+            or config.get("reliability", {}).get("enabled", False) and
+               metrics.get("reliability", {}).get("paired_synthetic_exposure") != spec["generated_per_epoch"]):
+        raise ValueError("Training log gap cannot be recovered from the checkpoint's final epoch")
+    common.write_jsonl(path, [*logs, metrics])
+    print(f"[{arm}] Recovered epoch {epoch} log from its saved checkpoint metrics", flush=True)
 
 
 def check_exposure(args, config, arm):
@@ -381,6 +514,9 @@ def check_exposure(args, config, arm):
     for row in logs:
         if (row["real_exposure"], row["synthetic_exposure"]) != (spec["true_per_epoch"], spec["generated_per_epoch"]):
             raise ValueError("Observed training exposure does not match the exact requested ratio")
+        if config.get("reliability", {}).get("enabled", False):
+            if row.get("reliability", {}).get("paired_synthetic_exposure") != spec["generated_per_epoch"]:
+                raise ValueError("Reliability teacher did not see every generated view's exact source")
 
 
 def evaluate_arm(args, config, arm):
@@ -412,6 +548,8 @@ def evaluate_arm(args, config, arm):
             results[domain] = row
     if len(results) < len(DOMAINS):
         model = load_checkpoint_model(checkpoint, device=args.device, backbone_repo=args.backbone_repo)
+        if model.aggregator.reliability_ot != config.get("reliability", {}).get("enabled", False):
+            raise ValueError("SVOX inference loaded a different model variant")
         gallery = extract_descriptors(model, datasets["day"].references, (224, 224), args.device, 32, 0)
         for domain, dataset in datasets.items():
             if domain in results:
@@ -442,53 +580,111 @@ def run_all(args, config):
             for arm, digest in saved["checkpoint_sha256"].items():
                 if common.file_sha256(args.output_dir / arm / "checkpoint.pt") != digest:
                     raise ValueError("Reported final checkpoint changed")
+            publish_module_comparison(config, saved, args.output_dir)
             print(f"Already complete: {report}", flush=True)
             return
-        if args.wait_for_generation:
-            common.write_json(args.output_dir / "progress.json", {
-                "stage": "waiting_for_generation", "experiment_fingerprint": config["fingerprint"],
-                "frozen_generated_images": args.num_images, "planned_training_runs": len(ARMS),
-                "generation_service": "qwen-curriculum-1000.service"})
-            wait_args = argparse.Namespace(run_dir=args.generation_run_dir,
-                                           generation_service="qwen-curriculum-1000.service")
-            train_compare.wait_for_generation(wait_args)
-        elif subprocess.run(["systemctl", "--user", "is-active", "qwen-curriculum-1000.service"],
-                            capture_output=True).returncode == 0:
-            raise RuntimeError("Qwen generation is active; use --wait-for-generation for sequential resource use")
-        if args.stop_qwen_service:
-            train_compare.stop_qwen_service()
-        # Fixed configuration was prepared while generation was still running.
-        validate(config, args.output_dir)
-        common_args = ["--generation-run-dir", str(args.generation_run_dir), "--output-dir", str(args.output_dir),
-                       "--num-images", str(args.num_images), "--real-data", str(args.real_data),
-                       "--backbone-weights", str(args.backbone_weights), "--backbone-repo", str(args.backbone_repo),
-                       "--dataset-root", str(args.dataset_root), "--epochs", str(args.epochs),
-                       "--learning-rate", str(args.learning_rate), "--trainable-blocks", str(args.trainable_blocks),
-                       "--batch-size", str(args.batch_size), "--seed", str(args.seed), "--device", args.device]
-        for arm in ARMS:
-            common.write_json(args.output_dir / "progress.json", {"stage": "training", "arm": arm})
-            train_compare._subprocess([sys.executable, str(Path(__file__).resolve()), "train-arm", *common_args,
-                                       "--arm", arm], args.output_dir / f"{arm}.log", 4)
-            check_exposure(args, config, arm)
-        initialization = check_shared_initialization(args, config)
-        results = {}
-        for arm in ARMS:
-            common.write_json(args.output_dir / "progress.json", {"stage": "evaluation", "arm": arm})
-            results[arm] = evaluate_arm(args, config, arm)
-        comparisons = {}
-        for ratio in (8, 4):
-            generated, real = results[f"generated_{ratio}to1"], results[f"true_{ratio}to1"]
-            comparisons[str(ratio)] = {domain: {"true": real[domain]["recall"],
-                "generated": generated[domain]["recall"], "delta_percentage_points": {
-                    metric: 100 * (generated[domain]["recall"][metric] - value)
-                    for metric, value in real[domain]["recall"].items()}} for domain in DOMAINS}
-        validate(config, args.output_dir)
-        common.write_json(args.output_dir / "comparison.json", seal({"experiment_fingerprint": config["fingerprint"],
-                          "state": "complete", "comparisons": comparisons,
-                          "shared_initialization": initialization,
-                          "checkpoint_sha256": {arm: common.file_sha256(args.output_dir / arm / "checkpoint.pt") for arm in ARMS}}))
-        common.write_json(args.output_dir / "progress.json", {"stage": "complete"})
+        with generation_guard(args, config):
+            if args.stop_qwen_service:
+                train_compare.stop_qwen_service()
+            execute_experiment(args, config)
 
+
+@contextmanager
+def generation_guard(args, config):
+    """Use the generator's own flock; this also detects foreground workers."""
+    with (args.generation_run_dir / ".run.lock").open("a") as handle:
+        locked = False
+        try:
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                except BlockingIOError:
+                    pass
+                path = args.generation_run_dir / "summary.json"
+                summary = json.loads(path.read_text()) if path.exists() else {}
+                if locked:
+                    if args.wait_for_generation and summary.get("state") != "complete":
+                        raise RuntimeError("Generation worker exited before completing; resume generation first or omit --wait-for-generation")
+                    break
+                if not args.wait_for_generation:
+                    raise RuntimeError("Qwen generation is active (including foreground workers); use --wait-for-generation")
+                common.write_json(args.output_dir / "progress.json", {
+                    "stage": "waiting_for_generation", "experiment_fingerprint": config["fingerprint"],
+                    "frozen_generated_images": args.num_images, "planned_training_runs": len(ARMS)})
+                print(f"Waiting for generation: {summary.get('completed', 0)}/{summary.get('planned', '?')}", flush=True)
+                time.sleep(30)
+            yield
+        finally:
+            if locked:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def publish_module_comparison(config, report, directory):
+    if "baseline" not in config:
+        return
+    from experiments.qwen_curriculum.reliability_comparison import build_module_comparison
+    comparison = build_module_comparison(config, report, directory)
+    common.write_json(directory / "module_comparison.json", comparison)
+    lines = ["# 新 reliability_ot 模块与原版 SALAD 比较", "",
+             "R@1 为百分比；差值为百分点。R@5/10 的完整数据见 module_comparison.json。", ""]
+    for ratio in ("8", "4"):
+        lines += [f"## {ratio}:1", "",
+                  "| SVOX | 原版全真 | 新版全真 | 原版生成 | 新版生成 | 全真变化 | 生成变化 | 生成配对收益变化 |",
+                  "|---|---:|---:|---:|---:|---:|---:|---:|"]
+        for domain, row in comparison["comparisons"][ratio].items():
+            real, generated = row["arms"]["true"], row["arms"]["generated"]
+            benefit = row["paired_benefit_percentage_points"]["benefit_change"]["R@1"]
+            lines.append(f"| {domain} | {100 * real['old']['R@1']:.2f} | {100 * real['new']['R@1']:.2f} "
+                         f"| {100 * generated['old']['R@1']:.2f} | {100 * generated['new']['R@1']:.2f} "
+                         f"| {real['delta_percentage_points']['R@1']:+.2f} "
+                         f"| {generated['delta_percentage_points']['R@1']:+.2f} | {benefit:+.2f} |")
+        lines.append("")
+    common._atomic_write(directory / "module_comparison.md", ["\n".join(lines)])
+
+
+def execute_experiment(args, config):
+    # Fixed configuration was prepared while generation was still running.
+    validate(config, args.output_dir)
+    common_args = ["--generation-run-dir", str(args.generation_run_dir), "--output-dir", str(args.output_dir),
+                   "--num-images", str(args.num_images), "--real-data", str(args.real_data),
+                   "--backbone-weights", str(args.backbone_weights), "--backbone-repo", str(args.backbone_repo),
+                   "--dataset-root", str(args.dataset_root), "--epochs", str(args.epochs),
+                   "--learning-rate", str(args.learning_rate), "--trainable-blocks", str(args.trainable_blocks),
+                   "--batch-size", str(args.batch_size), "--seed", str(args.seed), "--device", args.device]
+    if config.get("reliability", {}).get("enabled", False):
+        common_args += ["--baseline-dir", str(args.baseline_dir), *reliability_arguments(config["reliability"])]
+    for arm in ARMS:
+        common.write_json(args.output_dir / "progress.json", {"stage": "training", "arm": arm})
+        train_compare._subprocess([sys.executable, str(Path(__file__).resolve()), "train-arm", *common_args,
+                                   "--arm", arm], args.output_dir / f"{arm}.log", 4)
+        check_exposure(args, config, arm)
+    initialization = check_shared_initialization(args, config)
+    results = {}
+    for arm in ARMS:
+        common.write_json(args.output_dir / "progress.json", {"stage": "evaluation", "arm": arm})
+        results[arm] = evaluate_arm(args, config, arm)
+    comparisons = {}
+    for ratio in (8, 4):
+        generated, real = results[f"generated_{ratio}to1"], results[f"true_{ratio}to1"]
+        comparisons[str(ratio)] = {domain: {"true": real[domain]["recall"],
+            "generated": generated[domain]["recall"], "delta_percentage_points": {
+                metric: 100 * (generated[domain]["recall"][metric] - value)
+                for metric, value in real[domain]["recall"].items()}} for domain in DOMAINS}
+    validate(config, args.output_dir)
+    report = seal({"experiment_fingerprint": config["fingerprint"],
+                      "state": "complete", "comparisons": comparisons,
+                      "shared_initialization": initialization,
+                      "reliability": config.get("reliability", {"enabled": False}),
+                      "checkpoint_sha256": {arm: common.file_sha256(args.output_dir / arm / "checkpoint.pt") for arm in ARMS}})
+    if config.get("reliability", {}).get("enabled", False):
+        report.pop("fingerprint")
+        report["final_reliability_diagnostics"] = {arm: common.read_jsonl(
+            args.output_dir / arm / "training_log.jsonl")[-1]["reliability"] for arm in ARMS}
+        report = seal(report)
+    common.write_json(args.output_dir / "comparison.json", report)
+    publish_module_comparison(config, report, args.output_dir)
+    common.write_json(args.output_dir / "progress.json", {"stage": "complete"})
 
 class FixedRatioTests(unittest.TestCase):
     def fixture(self):
@@ -616,12 +812,70 @@ class FixedRatioTests(unittest.TestCase):
         self.assertNotEqual(tensor_state_sha256({"scalar": torch.tensor(1.)}),
                             tensor_state_sha256({"scalar": torch.tensor(2.)}))
 
+    def test_foreground_generation_lock_blocks_training_and_incomplete_wait(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            common.write_json(root / "summary.json", {"state": "running", "completed": 1, "planned": 2})
+            args = argparse.Namespace(generation_run_dir=root, output_dir=root, wait_for_generation=False,
+                                      num_images=700)
+            with (root / ".run.lock").open("a") as worker:
+                fcntl.flock(worker, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaisesRegex(RuntimeError, "including foreground workers"):
+                    with generation_guard(args, {"fingerprint": "fixture"}):
+                        self.fail("Active foreground generator must block training")
+                fcntl.flock(worker, fcntl.LOCK_UN)
+            args.wait_for_generation = True
+            with self.assertRaisesRegex(RuntimeError, "exited before completing"):
+                with generation_guard(args, {"fingerprint": "fixture"}):
+                    self.fail("An interrupted generation cannot satisfy an explicit completion wait")
+
+    def test_waiting_for_foreground_generation_then_reserving_gpu_slot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            common.write_json(root / "summary.json", {"state": "running", "completed": 1, "planned": 2})
+            args = argparse.Namespace(generation_run_dir=root, output_dir=root, wait_for_generation=True,
+                                      num_images=700)
+            with (root / ".run.lock").open("a") as worker:
+                fcntl.flock(worker, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                def finish(_seconds):
+                    common.write_json(root / "summary.json", {"state": "complete", "completed": 2, "planned": 2})
+                    fcntl.flock(worker, fcntl.LOCK_UN)
+                with patch.object(time, "sleep", side_effect=finish) as sleep:
+                    with generation_guard(args, {"fingerprint": "fixture"}):
+                        sleep.assert_called_once()
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(worker, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_checkpoint_log_gap_is_repaired_but_other_gaps_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = argparse.Namespace(output_dir=root)
+            spec = {"true_per_epoch": 8, "generated_per_epoch": 1}
+            config = {"arms": {"arm": spec}}
+            one = {"epoch": 1, "real_exposure": 8, "synthetic_exposure": 1}
+            two = {"epoch": 2, "real_exposure": 8, "synthetic_exposure": 1}
+            saved = {"epoch": 2, "metrics": two}
+            path = root / "arm/training_log.jsonl"
+            common.write_jsonl(path, [one])
+            reconcile_training_log(args, config, "arm", saved)
+            self.assertEqual(common.read_jsonl(path), [one, two])
+            path.write_text(json.dumps(one) + '\n{"epoch": 2')
+            reconcile_training_log(args, config, "arm", saved)
+            self.assertEqual(common.read_jsonl(path), [one, two])
+            common.write_jsonl(path, [])
+            with self.assertRaisesRegex(ValueError, "cannot be recovered"):
+                reconcile_training_log(args, config, "arm", saved)
+            common.write_jsonl(path, [one, one])
+            with self.assertRaisesRegex(ValueError, "cannot be recovered"):
+                reconcile_training_log(args, config, "arm", saved)
+
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     p.add_argument("command", choices=["prepare", "run", "train-arm", "self-test"])
     p.add_argument("--generation-run-dir", type=Path, default=common.WORKSPACE_ROOT / "outputs/qwen_curriculum/generation_1000")
-    p.add_argument("--output-dir", type=Path, default=common.WORKSPACE_ROOT / "outputs/qwen_curriculum/ratio_700_vpr_scratch_8to1_4to1")
+    p.add_argument("--output-dir", type=Path)
+    p.add_argument("--baseline-dir", type=Path, help="Completed original-SALAD fixed experiment; required for module comparison")
     p.add_argument("--real-data", type=Path, default=common.WORKSPACE_ROOT / "dataset/gsv-cities")
     p.add_argument("--backbone-weights", type=Path, default=Path.home() / ".cache/torch/hub/checkpoints/dinov2_vitb14_pretrain.pth",
                    help="DINOv2-only weights; SALAD is initialized randomly, without a VPR checkpoint")
@@ -634,10 +888,26 @@ def parse_args(argv=None):
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--reliability-ot", action="store_true", help="Enable the new module in every arm and compare with historical SALAD")
+    p.add_argument("--reliability-lambda", type=float, default=2.0)
+    p.add_argument("--reliability-hidden-dim", type=int, default=64)
+    p.add_argument("--reliability-head-lr", type=float)
+    p.add_argument("--reliability-loss-weight", type=float, default=0.1)
+    p.add_argument("--reliability-real-prior-weight", type=float, default=0.01)
+    p.add_argument("--reliability-coverage-weight", type=float, default=0.1)
+    p.add_argument("--reliability-coverage-floor", type=float, default=0.5)
     p.add_argument("--arm", choices=list(ARMS))
     p.add_argument("--wait-for-generation", action="store_true")
     p.add_argument("--stop-qwen-service", action="store_true")
     args = p.parse_args(argv)
+    if args.reliability_ot:
+        args.baseline_dir = args.baseline_dir or common.WORKSPACE_ROOT / "outputs/qwen_curriculum/ratio_700_vpr_scratch_8to1_4to1"
+    elif args.baseline_dir:
+        p.error("--baseline-dir requires --reliability-ot")
+    args.output_dir = args.output_dir or common.WORKSPACE_ROOT / "outputs/qwen_curriculum" / (
+        "ratio_700_reliability_ot_8to1_4to1" if args.reliability_ot else "ratio_700_vpr_scratch_8to1_4to1")
+    if args.baseline_dir:
+        args.baseline_dir = args.baseline_dir.expanduser().resolve()
     for name in ("generation_run_dir", "output_dir", "real_data", "backbone_weights", "backbone_repo", "dataset_root"):
         setattr(args, name, getattr(args, name).expanduser().resolve())
     if (args.num_images <= 0 or args.num_images % 4 or args.epochs <= 0 or args.batch_size < 2
@@ -645,6 +915,14 @@ def parse_args(argv=None):
         p.error("Positive counts/finite lr required; generated count divisible by 4, batch >=2, trainable blocks in [0,12]")
     if args.command == "train-arm" and not args.arm:
         p.error("train-arm requires --arm")
+    if (args.reliability_hidden_dim < 1 or not math.isfinite(args.reliability_lambda) or args.reliability_lambda < 0
+            or any(not math.isfinite(v) or v < 0 for v in (args.reliability_loss_weight,
+                args.reliability_real_prior_weight, args.reliability_coverage_weight))
+            or not math.isfinite(args.reliability_coverage_floor) or not 0 <= args.reliability_coverage_floor <= 1
+            or args.reliability_head_lr is not None and (not math.isfinite(args.reliability_head_lr) or args.reliability_head_lr <= 0)):
+        p.error("Invalid reliability module settings")
+    if args.output_dir == args.baseline_dir:
+        p.error("New module output must differ from the historical baseline directory")
     return args
 
 
