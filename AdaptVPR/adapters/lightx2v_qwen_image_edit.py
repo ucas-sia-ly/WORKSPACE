@@ -77,6 +77,7 @@ class AdapterState:
     error: str | None = None
     source_commit: str | None = None
     source_modified: bool | None = None
+    performance: dict | None = None
 
 
 state = AdapterState()
@@ -173,6 +174,9 @@ def load_pipeline():
         infer_steps=INFER_STEPS,
         guidance_scale=GUIDANCE_SCALE,
     )
+    if os.getenv("LIGHTX2V_MEMORY_PROFILE", "disk") == "resident_bf16_48g":
+        from generation.qwen_resident import install_resident_cache
+        state.performance = install_resident_cache(pipe, int(os.getenv("LIGHTX2V_RESIDENT_BLOCKS", "32")))
     return pipe
 
 
@@ -191,7 +195,7 @@ app = FastAPI(title="AdaptVPR LightX2V Qwen adapter", lifespan=lifespan)
 @app.get("/health")
 def health() -> dict:
     ready = state.pipe is not None
-    return {
+    result = {
         "status": "ok" if ready else "error",
         "model_loaded": ready,
         "generator_ready": ready,
@@ -223,6 +227,12 @@ def health() -> dict:
         },
         "error": state.error,
     }
+    if state.performance is not None:
+        from hashlib import sha256
+        performance_source = Path(__file__).resolve().parents[1] / "generation/qwen_resident.py"
+        result["performance"] = {**state.performance,
+                                 "implementation_sha256": sha256(performance_source.read_bytes()).hexdigest()}
+    return result
 
 
 @app.post("/generate")

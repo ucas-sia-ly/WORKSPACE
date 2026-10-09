@@ -1,16 +1,20 @@
 # Qwen 困难样本增广
 
+**当前 2000 张续跑使用 [fast_campaign.py](fast_campaign.py)**，后台服务为 `qwen-curriculum-2000-fast.service`。4090 48 GiB 配置保持原 BF16、4 步、guidance=1、源比例大画布，将文本编码器/VAE 和前32个 DiT block 常驻 GPU，其余 block 双缓冲分块加载。单张同图同种子对照实测 63.53s → 26.99s，原始 PNG 内容 SHA-256 相同；首次请求需要加载显存缓存，不代表稳定速度。完整配置、恢复方法和 **2000 张训练终端指令**见 [GENERATION_2000_FAST.md](GENERATION_2000_FAST.md)。
+
+原阶段已完成 998 张，另外两张中断时已落盘的输出转入独立零调用恢复阶段，原始错误账本保留。再生成原扩展计划的1000张，累计目标仍为2000张。累计进度在 `outputs/qwen_curriculum/generation_2000/summary.json`，生成日志为 `fast_generation.log`；原 `qwen-curriculum-2000.service` 已失败停止，不能再使用下文的旧协调器恢复命令。当前700张训练已经结束，2000张训练由用户在生成完成后启动。
+
 新增模块实验使用 `--reliability-ot`，沿用已完成原版实验的700张固定图片池，重新训练两组配对共四个模型，自动输出原版/新版 SVOX 比较表。训练指令和辅助 source 计数见 [RELIABILITY_700_EXPERIMENT.md](RELIABILITY_700_EXPERIMENT.md)。当前先继续生成，由用户执行训练命令，不自动启动训练。
 
 当前正式训练任务已改为 **700 张生成图、8:1 和 4:1 的两组配对对照，共四次训练、六个 SVOX 子集评估**。四组保留 DINOv2 预训练、SALAD 随机初始化，从新的 VPR 训练开始（50轮，学习率6e-5，训练最后4个 backbone block 和聚合器），不加载预训练 VPR checkpoint。使用 [test_700_ratio_experiment.py](test_700_ratio_experiment.py)，配置和查看方式见 [RATIO_700_EXPERIMENT.md](RATIO_700_EXPERIMENT.md)。此前的微调和全城市池任务已停止。下文保留生成管线说明和历史全池训练方案。
 
-生成目标已扩展为 **累计 2000 张，包含此前的生成图**。按当前安排，保持上述训练运行，等四组训练及全部评测成功结束、训练进程退出后，再启动 Qwen 续生成。`campaign.py` 检查实验指纹、完整完成报告、四个 checkpoint 和服务退出状态；训练失败或不完整时保持生成停止。
+以下为此前排队方案的历史说明：生成目标扩展为累计2000张，在700张训练结束后由 `campaign.py` 续跑。该旧任务随后因冻结配置类型不一致退出，目前由上述独立性能配置续跑阶段接替。
 
 累计计划使用原有困难度缓存，四城市各 500 个源图，覆盖 1491 个地点，每地点最多 2 个源图，源路径和内容均不重复。域配额为 night=1000、snow=400、fog=400、rain=200。先完成原 `generation_1000`，再完成独立的 `generation_2000/additional_1000`；原计划、图片、结果校验和与调用账本保持有效，汇总清单引用原图片路径，不复制图片。
 
 排队时已有 757 条生成记录，另有 1 张已落盘的中断输出可零调用恢复；因此预计还需要 1242 次新调用。2000 是生成图片总数，自动验收通过数另行统计。续跑沿用 Qwen-Image-Edit-2511、4 步、guidance=1 和 `source_aspect_v1`，不重新生成已完成的图片，不重复发起结果不明的调用，也不自动启动另一轮训练。
 
-查看本次排队任务与累计进度：
+旧排队任务的历史日志：
 
 ```bash
 systemctl --user status qwen-curriculum-2000.service
@@ -18,11 +22,11 @@ cat outputs/qwen_curriculum/generation_2000/summary.json
 tail -f outputs/qwen_curriculum/generation_2000/worker.log
 ```
 
-`summary.json` 的 `waiting_for_training` 表示正在等待完整训练；进入生成后可查看同目录的 `stage_1.log`、`stage_2.log`。生成全部完成并核验后会停止 Qwen 服务释放资源。聊天关闭不会终止 systemd 用户任务；机器重启后可依据原目录恢复：
+旧日志的 `waiting_for_training` 表示当时正在等待完整训练。当前恢复使用新的协调器，并保留相同累计目录：
 
 ```bash
 /home/admin123/miniconda3/envs/AdaptVPR/bin/python \
-  AdaptVPR/experiments/qwen_curriculum/campaign.py run \
+  AdaptVPR/experiments/qwen_curriculum/fast_campaign.py run \
   --output-dir outputs/qwen_curriculum/generation_2000
 ```
 

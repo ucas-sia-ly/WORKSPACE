@@ -65,6 +65,9 @@ def config_file(path):
 
 
 def load_successful(args):
+    if (args.generation_run_dir / "fast_campaign_config.json").exists():
+        from experiments.qwen_curriculum.fast_campaign import load_collection
+        return load_collection(args.generation_run_dir, args.num_images)
     execution = config_file(args.generation_run_dir / "execution_config.json")
     plan = config_file(args.generation_run_dir / "plan_config.json")
     if execution["plan_fingerprint"] != plan["fingerprint"]:
