@@ -196,11 +196,20 @@ def _validate_results(config, report, directory):
             raise ValueError(f"Baseline arms did not share initial weights: {key}")
 
 
-def freeze_baseline(directory: Path, output: Path, args) -> dict:
+def _snapshot_root(output, snapshot_subdir):
+    if (not isinstance(snapshot_subdir, str) or not snapshot_subdir
+            or Path(snapshot_subdir).name != snapshot_subdir
+            or snapshot_subdir in {".", ".."}):
+        raise ValueError("Baseline snapshot subdirectory must be a single directory name")
+    return Path(output) / snapshot_subdir
+
+
+def freeze_baseline(directory: Path, output: Path, args, *, snapshot_subdir="baseline") -> dict:
     """Verify the old experiment and create immutable provenance snapshots."""
     directory, output = Path(directory).resolve(), Path(output).resolve()
     if directory == output or directory in output.parents:
         raise ValueError("Baseline snapshots need a separate new experiment directory")
+    snapshot_root = _snapshot_root(output, snapshot_subdir)
     config = _read_sealed(directory / "experiment_config.json")
     report = _read_sealed(directory / "comparison.json")
     _same_request(config["request"], _request_from_args(args))
@@ -213,28 +222,29 @@ def freeze_baseline(directory: Path, output: Path, args) -> dict:
     hashes = {}
     # Check all existing files before making any new snapshot writes.
     for name, source in names.items():
-        target = output / "baseline" / name
+        target = snapshot_root / name
         digest = common.file_sha256(source)
         if target.exists():
             _verify_sha(target, digest, f"existing baseline snapshot {name}")
         hashes[name] = digest
     for name, source in names.items():
-        target = output / "baseline" / name
+        target = snapshot_root / name
         if not target.exists():
             # Preserve the actual sealed JSON and its formatting/bytes exactly.
             common._atomic_write(target, [source.read_text(encoding="utf-8")])
         _verify_sha(target, hashes[name], f"baseline snapshot {name}")
-    return {"source_directory": str(directory), "experiment_fingerprint": config["fingerprint"],
+    return {"source_directory": str(directory), "snapshot_subdir": snapshot_subdir,
+            "experiment_fingerprint": config["fingerprint"],
             "report_fingerprint": report["fingerprint"], "snapshot_files_sha256": hashes}
 
 
-def build_module_comparison(config: dict, report: dict, output: Path) -> dict:
+def build_module_comparison(config: dict, report: dict, output: Path, *, descriptor_key="baseline") -> dict:
     """Compare each arm and the change in generated-minus-real paired benefit."""
     _verify_sealed(config, "new experiment config")
     _verify_sealed(report, "new experiment report")
     _validate_report(config, report)
-    descriptor = config["baseline"]
-    root = Path(output) / "baseline"
+    descriptor = config[descriptor_key]
+    root = _snapshot_root(output, descriptor.get("snapshot_subdir", "baseline"))
     expected_names = {"experiment_config.json", "comparison.json",
                       *(f"{arm}_initialization.json" for arm in ARMS)}
     if set(descriptor["snapshot_files_sha256"]) != expected_names:
@@ -257,7 +267,10 @@ def build_module_comparison(config: dict, report: dict, output: Path) -> dict:
     standard = initial.get("standard_aggregator_state_sha256", config.get("standard_aggregator_state_sha256"))
     if standard is None:
         standard = config.get("shared_initialization", {}).get("standard_aggregator_state_sha256")
-    if (standard != old["shared_initialization"]["initial_aggregator_state_sha256"]
+    old_initial = old["shared_initialization"]
+    old_standard = old_initial.get("standard_aggregator_state_sha256",
+                                   old_initial["initial_aggregator_state_sha256"])
+    if (standard != old_standard
             or initial["initial_backbone_state_sha256"] != old["shared_initialization"]["initial_backbone_state_sha256"]):
         raise ValueError("Original SALAD/DINOv2 initial weights differ from baseline")
     comparisons = {}

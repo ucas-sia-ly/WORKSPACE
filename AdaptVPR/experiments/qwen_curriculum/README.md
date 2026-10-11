@@ -4,7 +4,7 @@
 
 原阶段已完成 998 张，另外两张中断时已落盘的输出转入独立零调用恢复阶段，原始错误账本保留。再生成原扩展计划的1000张，累计目标仍为2000张。累计进度在 `outputs/qwen_curriculum/generation_2000/summary.json`，生成日志为 `fast_generation.log`；原 `qwen-curriculum-2000.service` 已失败停止，不能再使用下文的旧协调器恢复命令。当前700张训练已经结束，2000张训练由用户在生成完成后启动。
 
-新增模块实验使用 `--reliability-ot`，沿用已完成原版实验的700张固定图片池，重新训练两组配对共四个模型，自动输出原版/新版 SVOX 比较表。训练指令和辅助 source 计数见 [RELIABILITY_700_EXPERIMENT.md](RELIABILITY_700_EXPERIMENT.md)。当前先继续生成，由用户执行训练命令，不自动启动训练。
+当前新版模块实验使用 `--reliability-v2`，沿用相同700张固定图片池和四组50轮设置，加入context、detached head、全部700对raw DINO固定教师缓存及局部几何负监督，输出与原版SALAD和上一版模块的SVOX比较表。启动与恢复指令见 [RELIABILITY_V2_700_EXPERIMENT.md](RELIABILITY_V2_700_EXPERIMENT.md)；上一版 `--reliability-ot` 说明保留在 [RELIABILITY_700_EXPERIMENT.md](RELIABILITY_700_EXPERIMENT.md)。由用户执行训练命令，不自动启动正式训练。
 
 当前正式训练任务已改为 **700 张生成图、8:1 和 4:1 的两组配对对照，共四次训练、六个 SVOX 子集评估**。四组保留 DINOv2 预训练、SALAD 随机初始化，从新的 VPR 训练开始（50轮，学习率6e-5，训练最后4个 backbone block 和聚合器），不加载预训练 VPR checkpoint。使用 [test_700_ratio_experiment.py](test_700_ratio_experiment.py)，配置和查看方式见 [RATIO_700_EXPERIMENT.md](RATIO_700_EXPERIMENT.md)。此前的微调和全城市池任务已停止。下文保留生成管线说明和历史全池训练方案。
 
