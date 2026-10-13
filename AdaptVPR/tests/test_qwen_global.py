@@ -17,13 +17,11 @@ from generation.router import normalize_decision
 
 
 class QwenGlobalTests(unittest.TestCase):
-    def test_public_constructor_never_constructs_iclight(self):
+    def test_public_constructor_uses_only_qwen_generator(self):
         client, evaluator = Mock(), Mock()
-        with patch("generation.iclight.ICLightGenerator") as historical_ic:
-            with patch("generation.agent.Lightx2vGenerator", return_value=client) as qwen:
-                with patch("generation.agent.DualTraitEvaluator", return_value=evaluator):
-                    agent = SceneAugmentAgent(planning_enabled=False, reflection_enabled=False)
-        historical_ic.assert_not_called()
+        with patch("generation.agent.Lightx2vGenerator", return_value=client) as qwen:
+            with patch("generation.agent.DualTraitEvaluator", return_value=evaluator):
+                agent = SceneAugmentAgent(planning_enabled=False, reflection_enabled=False)
         qwen.assert_called_once_with(api_url=None)
         self.assertIs(agent.lightx2v, client)
 
@@ -78,7 +76,7 @@ class QwenGlobalTests(unittest.TestCase):
 
 
 class QwenPreflightTests(unittest.TestCase):
-    def preflight(self, *, with_iclight=False):
+    def preflight(self):
         torch = types.ModuleType("torch")
         torch.cuda = types.SimpleNamespace(is_available=lambda: True)
         torch.__version__, torch.version = "test", types.SimpleNamespace(cuda="test")
@@ -92,7 +90,7 @@ class QwenPreflightTests(unittest.TestCase):
                     with patch("generation.preflight.importlib.util.find_spec", return_value=object()) as modules:
                         with patch("generation.preflight.requests.Session", return_value=session):
                             with patch("generation.preflight.probe_service", return_value=(True, "ready")) as probe:
-                                errors = check_environment(planner=False, with_iclight=with_iclight)
+                                errors = check_environment(planner=False)
         return errors, probe, modules
 
     def test_default_preflight_requires_only_qwen_and_no_planner_sdk(self):
@@ -102,10 +100,6 @@ class QwenPreflightTests(unittest.TestCase):
         self.assertEqual(probe.call_args.args[1], "http://qwen.example/generate")
         self.assertNotIn("openai", [call.args[0] for call in modules.call_args_list])
 
-    def test_historical_iclight_check_is_explicit_opt_in(self):
-        errors, probe, _ = self.preflight(with_iclight=True)
-        self.assertEqual(errors, ["ICLIGHT_API_URL is not configured"])
-        self.assertEqual(probe.call_count, 1)
 
 
 if __name__ == "__main__":

@@ -1,221 +1,76 @@
-# AdaptVPR
+# AdaptVPR：Qwen 数据增广
 
-本工作区当前推荐使用 [Qwen 困难源图增广流程](experiments/qwen_curriculum/README.md)：离线筛选 GSV-Cities 困难训练图，按 night/snow/fog/rain 预算仅调用 Qwen，再以同源图概率替换接入 SALAD。该入口针对单台 48GB 显存、32GB 内存机器，分阶段加载模型；1000 次新增调用按 night 500、snow 200、fog 200、rain 100 分配，取消 overcast 生成和生成器 LoRA 闭环。`run.py` 的 Global、Local、Dual 路由现在也全部使用 Qwen，但保留独立的路由调度、反思和双指标验证协议。
+本工作区的主流程是 **GSV-Cities 困难源图筛选 → Qwen 天气编辑 → 结构与天气审核 → SALAD 训练与评估**。面向单台 48 GB 显卡、32 GB 内存，生成与训练分阶段运行。天气域为 night、snow、fog、rain。
 
-Official repository for [AdaptVPR: Route-Aware Hard Positive Generation for Robust Visual Place Recognition](https://arxiv.org/abs/2609.04369).
+## 从这里开始
 
-<p align="center">
-  <a href="https://arxiv.org/abs/2609.04369"><img src="https://img.shields.io/badge/arXiv-2609.04369-D32F2F?style=flat-square&amp;labelColor=444444" alt="arXiv"></a>
-  <a href="https://huggingface.co/datasets/shunpeng/AdaptCities"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-AdaptCities-FFD21E?style=flat-square&amp;labelColor=444444" alt="Hugging Face Dataset"></a>
-</p>
+- [Qwen 工作流](experiments/qwen_curriculum/README.md)：当前全部 23 城市挖掘、分批生成、训练入口及命令。
+- [SALAD 工作流](../salad/docs/workflow.md)：真实图与合成图的训练、评估和对照。
+- [可靠性 OT](../salad/docs/reliability_v2.md)：可选的 patch 可靠性模块。
+- [依赖与资源配置](docs/EXTERNAL_COMPONENTS.md)：Qwen、VisMatch、CLIP 的安装和显存设置。
+- [生成 API](docs/API_CONTRACTS.md)：服务健康检查、源图比例画布及请求协议。
 
-<p align="center">
-  <img src="assets/matching_demos/01_global16_prague_5s_loop.gif" width="48%" />
-  <img src="assets/matching_demos/02_local08_madrid_5s_loop.gif" width="48%" />
-</p>
+## 目录职责
 
-<p align="center">
-  <img src="assets/matching_demos/03_local00007_bangkok_5s_loop.gif" width="48%" />
-  <img src="assets/matching_demos/04_dual_demo02_bangkok_5s_loop.gif" width="48%" />
-</p>
+| 路径 | 用途 |
+|---|---|
+| `experiments/qwen_curriculum/` | 当前数据构建、生成恢复、训练对照及测试 |
+| `adapters/lightx2v_qwen_image_edit.py` | Qwen HTTP 服务 |
+| `generation/qwen_disk_weights.py`、`qwen_resident.py` | 低内存 BF16 权重准备和 GPU 常驻缓存 |
+| `verification/` | 结构匹配与 CLIP 图像特征 |
+| `generation/`、`prompts/`、`run.py` | 原论文路线规划、提示反思与 Global/Local/Dual 生成入口 |
+| `preprocessing/`、`scripts/build_manifest.py` | 原路线生成结果的训练清单导出 |
+| `configs/`、`scripts/` | 公共配置、依赖准备、服务启动 |
+| `tests/` | 单元测试与可重跑的十图 demo 输入 |
+| `experiments/generation_diagnosis/` | 既有生成结果诊断和冻结实验兼容代码 |
 
-<p align="center">
-  <img src="assets/matching_demos/05_dual_demo07_bangkok_5s_loop.gif" width="48%" />
-  <img src="assets/matching_demos/06_dual06_lisbon_5s_loop.gif" width="48%" />
-</p>
+现行服务启动器、环境预检及公共配置只使用 Qwen。`adapters/iclight_sd15_fc.py`、`adapters/iclight_lora.py` 和历史诊断 `runner.py` 保留本次清理前的源码，因为用户认可的 `outputs/gen_diagnosis/qwen_source_aspect_100src/` 配置绑定了它们的源码哈希；改名或删除会破坏历史诊断依赖。旧阶段冻结的版本以其配置哈希为准，已有实现升级后的目录不能直接恢复旧阶段。它们不进入当前困难源图生成主流程。
 
-## 📢 News
+## 安装与服务
 
-- **2026-09-10** — ⚡ Improved planning reproducibility and verification efficiency with fully documented scheduler configuration and content-validated CLIP reference-feature caching.
-- **2026-09** — 📄 Paper released on arXiv: [AdaptVPR: Route-Aware Hard Positive Generation for Robust Visual Place Recognition](https://arxiv.org/abs/2609.04369).
-- **2026-09** — 🚀 Released the AdaptVPR generation code, verification pipeline, prompt templates, and reproducibility documentation.
-- **2026-09** — 📦 Released the AdaptCities prompts, annotations, and metadata on [Hugging Face](https://huggingface.co/datasets/shunpeng/AdaptCities).
-
-## 📝 Method overview
-
-![Overview of the AdaptVPR framework](assets/Method.png)
-> **Method overview.** AdaptVPR combines scene understanding, generation tailored to each route, selective prompt reflection, and verification of geometric consistency and appearance diversity to improve VPR robustness under changes in weather, illumination, and occlusion.
-
-| Route | Edit | Generator | Policy |
-|---|---|---|---|
-| Global | Weather / illumination / time | [Qwen-LightX2V](https://github.com/ModelTC/LightX2V) | 1 attempt; reject on failure |
-| Local | Local occlusion | [Qwen-LightX2V](https://github.com/ModelTC/LightX2V) | ≤4 attempts; ≤3 refinements |
-| Dual | Global + local changes | [Qwen-LightX2V](https://github.com/ModelTC/LightX2V) | ≤4 attempts; ≤3 refinements |
-| Skip | Unsuitable input | None | No generation |
-
-The table describes the current `run.py` route agent. Its `DualTraitEvaluator`
-accepts candidates when both $s_{\mathrm{geo}} \ge \tau_{\mathrm{geo}}$ and
-$s_{\mathrm{div}} \ge \tau_{\mathrm{div}}$, using the route thresholds below.
-The paper diagram and historical IC-Light diagnosis remain available for
-reproduction.
-
-Scene planning is implemented in `generation/agent.py`, while prompt refinement is handled by `generation/reflection_controller.py`; both are used by the public entry point.
-
-| Threshold | Global | Local | Dual | Dual (rain + vehicle) |
-|:---:|:---:|:---:|:---:|:---:|
-| $\tau_{\mathrm{geo}}$ | 0.78 | 0.82 | 0.72 | 0.72 |
-| $\tau_{\mathrm{div}}$ | 0.15 | 0.09 | 0.20 | 0.12 |
-
-The recommended [staged Qwen curriculum](experiments/qwen_curriculum/README.md)
-uses source mining, one weather edit per source and separate structure/weather
-checks. Its acceptance rules include match evidence, spatial coverage,
-homography displacement and CLIP weather contrasts; `s_div` is descriptive.
-Its four-domain generation quota is independent of the route-agent scheduler.
-The configurable first-run checks remain experimental and require visual review.
-
-## 📁 Expected workspace layout
-
-```text
-workspace/
-├── Gsvcities/
-│   ├── Images/
-│   └── Dataframes/
-└── AdaptVPR/
-    ├── adapters/                      # Generator HTTP services and dependencies
-    ├── assets/
-    │   └── Method.png                 # Paper method overview
-    ├── configs/
-    │   └── default.env.example        # Public configuration template
-    ├── docs/
-    │   ├── EXTERNAL_COMPONENTS.md     # Third-party setup and integration map
-    │   ├── API_CONTRACTS.md           # Generator HTTP service contracts
-    │   └── SCHEDULER.md               # Route quotas, parameters, and run semantics
-    ├── examples/
-    │   ├── generated_prompts.example.jsonl
-    │   └── annotations_metadata.example.jsonl
-    ├── experiments/
-    │   ├── qwen_curriculum/           # Recommended staged augmentation workflow
-    │   └── generation_diagnosis/      # Historical generation/verification studies
-    ├── generation/                    # Planning, generation, routing and reflection
-    ├── preprocessing/                 # Accepted-sample manifest processing
-    ├── prompts/                       # Prompt templates and construction rules
-    ├── requirements.txt               # Main AdaptVPR dependencies
-    ├── run.py                         # Planner and frozen-prompt batch entry point
-    ├── scripts/
-    │   ├── build_manifest.py          # Export accepted training candidates
-    │   └── start_generation_services.sh
-    ├── tests/                         # Unit tests and 10-source demo files
-    └── verification/                  # Geometry and appearance verification
-```
-
-## 🛠️ Installation
-
-Python 3.10 or newer is recommended.
+在本工作区的 AdaptVPR 目录中执行：
 
 ```bash
-git clone https://github.com/chenshunpeng/AdaptVPR.git
-cd AdaptVPR
-python -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
+pip install -r adapters/requirements.txt
 cp configs/default.env.example .env
 ```
 
-To run the included HTTP adapters, install their service dependencies separately:
+根据 [依赖说明](docs/EXTERNAL_COMPONENTS.md) 配置现有 LightX2V、模型权重、VisMatch 和 CLIP。数据与权重由本地路径提供。主流程使用固定天气提示，不需要规划器服务；原论文 `run.py` 规划与反思模式另需 Qwen3-VL 端点。
 
 ```bash
-pip install -r adapters/requirements.txt
+bash scripts/start_generation_services.sh --wait
+curl --noproxy '*' http://127.0.0.1:8001/health
 ```
 
-Install and configure Qwen-LightX2V, VisMatch and the CLIP weights separately.
-The route-agent planner and reflection also require a Qwen3-VL-4B-Instruct
-endpoint. The staged curriculum uses the SALAD checkout and its released
-checkpoint for source mining and training. IC-Light is optional for historical
-diagnosis. Set local paths, endpoints and credentials in `.env`.
+持久化 Qwen 服务安装见 [systemd 配置](configs/systemd/README.md)。修改配置后仅重启已选用的服务管理方式，避免重复加载生成模型。
 
-## 🧩 External components
+## 原论文路线入口
 
-| Role | Component | Integration | Public default |
-|---|---|---|---|
-| Planner and prompt refiner | [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct) | OpenAI-compatible API | `127.0.0.1:23002/v1` |
-| Global/Local/Dual generator | [Qwen-LightX2V](https://github.com/ModelTC/LightX2V) | Local HTTP adapter | `127.0.0.1:8001/generate` |
-| Historical generator (optional) | [IC-Light](https://github.com/lllyasviel/IC-Light) | Local HTTP adapter | `127.0.0.1:8002/generate` |
-| Appearance verifier | [CLIP ViT-B/32](https://huggingface.co/openai/clip-vit-base-patch32) | Transformers local loading | `openai/clip-vit-base-patch32` |
-| Geometry verifier | [VisMatch (SuperPoint + LightGlue)](https://github.com/gmberton/vismatch) | Local Python import | `superpoint-lightglue` |
-
-See [Scheduler specification](docs/SCHEDULER.md) for the route-agent quota rule,
-[External components](docs/EXTERNAL_COMPONENTS.md) for setup, and
-[API contracts](docs/API_CONTRACTS.md) for the default Qwen service and optional
-historical IC-Light service. Curriculum commands and quotas are documented in
-[qwen_curriculum](experiments/qwen_curriculum/README.md).
-
-## ⚡ Quick Demo
-
-Use the ten GSV-Cities paths listed in `tests/demo_10.csv` to check the route
-agent's planning, generation, reflection and dual-trait verification. The
-recommended staged curriculum has its own mining and generation commands.
-Source images are not included; run:
-
-Source-to-generated image comparisons for this 10-image Quick Demo set are
-available in [`tests/output`](tests/output).
-
-```bash
-python tests/run_demo_10.py \
-  --gsvcities-root /path/to/Gsvcities \
-  --output ./outputs/demo_10
-```
-
-This command uses Qwen3-VL-4B planning and enables up to three prompt-reflection attempts by default.
-The planner may legitimately choose Skip. By default the demo validates that
-all ten sources have completed records and any generated images exist, and
-reports generation/Skip counts and observed routes. Add `--strict` to generate
-all ten sources through the public released-prompt path: it uses the bundled
-official prompts instead of replanning routes, so planner Skip cannot prevent
-generation. These prompts cover 2 Global, 4 Local, and 4 Dual tasks. Their dataset
-revision and SHA-256 are recorded in `tests/demo_10_prompts.source.json`.
-Strict outputs go to `strict_released_reflection_on/` (or `_off/`), independently
-of earlier planning runs. `--resume` reuses completed outputs within that run.
-Image verification and acceptance thresholds are unchanged: a generated image
-can still fail verification and be retained under `rejected/`.
+`run.py` 保留路线规划、Global/Local/Dual 提示与双指标验证。三个生成路线均调用 Qwen。其路线配额和验收门限独立于当前困难源图工作流，详见 [调度规则](docs/SCHEDULER.md)。十图 demo 可以检查该入口：
 
 ```bash
 python tests/run_demo_10.py --gsvcities-root /path/to/Gsvcities \
-  --output ./outputs/demo_10 --strict --resume
-```
-It checks input files, CUDA, dependencies, and service health before planning.
-Add `--check-only` to run these checks without loading generation models or starting inference.
-Start Qwen with `bash scripts/start_generation_services.sh --wait`; the launcher
-and demo preflight check the LightX2V `/health` endpoint by default. The startup
-script reads `.env` and resolves relative dependency paths against this repository.
-Historical IC-Light runs can add `--with-iclight` to the launcher.
-
-## 🚀 Generation
-
-The commands below exercise the `run.py` route agent, using Qwen for all three
-generation routes. Local and Dual routes use one initial generation and up to
-three reflection rounds; Global uses one generation. For the recommended
-1000-call augmentation and SALAD replacement workflow, follow
-[qwen_curriculum](experiments/qwen_curriculum/README.md).
-
-Accepted final images (`passed=true` and `eligible_for_training=true`) are saved under `<output-root>/<route>/`, while failed candidates are retained for audit under `<output-root>/rejected/<route>/` with a `__rejected.jpg` suffix. Training should use the manifest generated by `scripts/build_manifest.py`, which includes only accepted candidates; generated images are not distributed by this repository.
-
-```bash
-# Plan routes and prompts with Qwen3-VL-4B-Instruct.
-python run.py /path/to/Gsvcities/Images --mode plan --output ./outputs/planner \
-  --reflection on --max-reflections 3
-
-# Generate directly from released initial prompts.
-python run.py /path/to/AdaptCities/prompts/by_city/Bangkok.jsonl --mode prompt \
-  --image-root ./Gsvcities/Images \
-  --output ./outputs/prompt \
-  --reflection on --max-reflections 3
+  --output /path/to/demo_10 --check-only
+python tests/run_demo_10.py --gsvcities-root /path/to/Gsvcities \
+  --output /path/to/demo_10 --strict --resume
 ```
 
-## 📦 Data Availability and License
+输入清单和官方提示保留在 `tests/demo_10*`；生成展示图由上述命令重新生成。
 
-We release the AdaptVPR generation code, processing pipeline, and prompt templates. Original GSV-Cities and generated AdaptCities images are not redistributed; obtain [GSV-Cities](https://github.com/amaralibey/gsv-cities) separately for reproduction.
+## 方法来源与许可
 
-The released AdaptCities prompts, annotations, and metadata are available on [Hugging Face](https://huggingface.co/datasets/shunpeng/AdaptCities).
+本目录基于 [AdaptVPR: Route-Aware Hard Positive Generation for Robust Visual Place Recognition](https://arxiv.org/abs/2609.04369) 的公开实现，工作区增加了 Qwen 困难源图工作流和 SALAD 对照实验。原始论文方法图保留如下：
 
-## 🙏 Acknowledgements
+![AdaptVPR 方法图](assets/Method.png)
+
+原始 GSV-Cities 图片和生成训练图不随源码分发；公开 AdaptCities 提示、标注与元数据见 [Hugging Face](https://huggingface.co/datasets/shunpeng/AdaptCities)。许可见 [LICENSE](LICENSE)。
 
 This project builds on [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct), [IC-Light](https://github.com/lllyasviel/IC-Light), [Qwen-LightX2V](https://github.com/ModelTC/LightX2V), [VisMatch](https://github.com/gmberton/vismatch), [CLIP](https://huggingface.co/openai/clip-vit-base-patch32), and [GSV-Cities](https://github.com/amaralibey/gsv-cities).
 
 We also thank the authors of [BoQ](https://github.com/amaralibey/Bag-of-Queries), [ImAge](https://github.com/buptzjy/ImAge), [SALAD](https://github.com/serizba/salad), and [EDTFormer](https://github.com/buptzjy/EDTFormer) for their public implementations.
 
-## 📌 Citation
-
-If you find this repository useful for your research, please consider giving it a ⭐ and citing our [paper](https://arxiv.org/abs/2609.04369):
+引用原方法：
 
 ```bibtex
 @article{chen2026adaptvpr,

@@ -102,6 +102,10 @@ node_modules/
 .vscode/
 .idea/
 .marscode/
+.agents/
+.codex/
+.aws/
+.claude/
 .gitnexus/
 *.swp
 *.swo

@@ -14,8 +14,6 @@ from generation.service_health import probe_service
 
 ROOT = Path(__file__).resolve().parents[1]
 PATH_KEYS = (
-    "ICLIGHT_ROOT", "ICLIGHT_BASE_MODEL_PATH", "ICLIGHT_MODEL_PATH",
-    "ADAPTVPR_LORA_CHECKPOINT",
     "LIGHTX2V_ROOT", "LIGHTX2V_MODEL_PATH", "LIGHTX2V_LORA_PATH", "VISMATCH_ROOT",
     "LIGHTX2V_DISK_MODEL_PATH",
 )
@@ -31,7 +29,7 @@ def load_environment() -> None:
             os.environ[key] = str((ROOT / path).resolve())
 
 
-def check_environment(*, planner: bool = True, with_iclight: bool = False) -> list[str]:
+def check_environment(*, planner: bool = True) -> list[str]:
     """Return all actionable failures instead of stopping at the first one."""
     load_environment()
     errors = []
@@ -57,7 +55,7 @@ def check_environment(*, planner: bool = True, with_iclight: bool = False) -> li
 
     with requests.Session() as session:
         session.trust_env = False
-        for name in (("ICLIGHT", "LIGHTX2V") if with_iclight else ("LIGHTX2V",)):
+        for name in ("LIGHTX2V",):
             url = os.getenv(f"{name}_API_URL", "")
             if not url:
                 errors.append(f"{name}_API_URL is not configured")

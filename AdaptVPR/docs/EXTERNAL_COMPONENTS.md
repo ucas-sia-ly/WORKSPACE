@@ -1,14 +1,14 @@
 # External components
 
 AdaptVPR publishes the orchestration, routing, prompt construction, reflection,
-and verification policy. Third-party implementations and model weights are not
-vendored in this repository.
+and verification policy. This workspace also retains trimmed LightX2V and
+VisMatch runtime source copies with their licenses. Downloaded model weights
+are local files excluded from Git.
 
 | Role | Component used by AdaptVPR | Integration | Public default |
 |---|---|---|---|
 | Planner and prompt refiner | [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct) | OpenAI-compatible HTTP API | model alias `qwen3-vl-4b-instruct-remote`, API base `http://127.0.0.1:23002/v1` |
 | Global/Local/Dual generator | `Qwen/Qwen-Image-Edit-2511` + `Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors`, served by [LightX2V](https://github.com/ModelTC/LightX2V) | Included HTTP adapter | `http://127.0.0.1:8001/generate` |
-| Historical generator (optional) | [IC-Light](https://github.com/lllyasviel/IC-Light) | Included HTTP adapter | `http://127.0.0.1:8002/generate` |
 | Appearance verifier | [CLIP ViT-B/32](https://huggingface.co/openai/clip-vit-base-patch32) | Loaded in the AdaptVPR process with Transformers | `openai/clip-vit-base-patch32` |
 | Geometry verifier | [VisMatch (SuperPoint + LightGlue)](https://github.com/gmberton/vismatch) | Imported as a local Python package | `superpoint-lightglue` |
 
@@ -29,7 +29,6 @@ One convenient local layout is:
 ```text
 workspace/
 ├── AdaptVPR/
-├── IC-Light/       # Optional historical diagnosis
 ├── LightX2V/
 ├── salad/          # Source mining and curriculum training
 └── vismatch/
@@ -68,9 +67,8 @@ and Qwen weights are not included.
 AdaptVPR uses the Qwen-LightX2V HTTP adapter under `adapters/` for all generation
 routes. Clone the pinned LightX2V revision, download the named checkpoints, set
 their paths in `.env`, and start Qwen with
-`bash scripts/start_generation_services.sh --wait`. IC-Light is an optional
-service for independent historical diagnosis, enabled with `--with-iclight`.
-The adapters accept either a Git checkout at the pinned commit or the official
+`bash scripts/start_generation_services.sh --wait`.
+The Qwen adapter accepts either a Git checkout at the pinned commit or the official
 GitHub commit tarball with its commit written to `.adaptvpr-source-revision` in
 the extracted source root. LightX2V reports tracked source modifications in
 `/health` so compatibility patches remain visible rather than being mistaken
@@ -107,32 +105,19 @@ instead of allowing the orchestration layer to mistake an unloaded service for
 a ready generator.
 
 `scripts/start_generation_services.sh` launches Qwen by default and adds its
-configured upstream checkout to the Python import path. `--with-iclight` also
-launches the historical adapter. It does not execute a third-party `app.py`.
+configured upstream checkout to the Python import path. It does not execute a
+third-party `app.py`.
 For an externally managed Qwen service, set `LIGHTX2V_AUTO_START=0` and configure
 `LIGHTX2V_API_URL`.
 
-### Optional historical IC-Light service
+### Historical diagnosis source compatibility
 
-The IC-Light adapter pins GitHub commit
-`bcf3f29ca85be8a4686215f477b546f5030be8b7`, checkpoint
-`lllyasviel/ic-light@9cad1878695f546a7fb9eaca14e2a89131ba5ffe` file
-`iclight_sd15_fc.safetensors`, and Stable Diffusion v1.5 revision
-`451f4fe16113bff5a5d2269ed5ad43b0592e9a14`.
-Configure its checkout and weights only when using the historical diagnostic
-runner or its adapter directly:
-
-```bash
-export ICLIGHT_ROOT=/path/to/IC-Light
-export ICLIGHT_BASE_MODEL_PATH=/models/stable-diffusion-v1-5
-export ICLIGHT_MODEL_PATH=/models/iclight_sd15_fc.safetensors
-bash scripts/start_generation_services.sh --with-iclight --wait
-curl http://127.0.0.1:8002/health
-```
-
-This flag adds the service to the launcher; the route agent continues to use
-Qwen for Global, Local and Dual generation. Historical tools are retained under
-[`experiments/generation_diagnosis`](../experiments/generation_diagnosis/README.md).
+The old IC-Light adapter and LoRA helper are unchanged by this cleanup because historical
+Qwen diagnosis configurations also include their source hashes. They are not
+part of the current service configuration or launch command. This preserves
+the source dependencies of the 100-source Qwen study without loading an
+IC-Light model. Earlier frozen stages require their own recorded source
+revision; current files do not automatically satisfy older implementation hashes. See [diagnosis records](../experiments/generation_diagnosis/README.md).
 
 ### BF16 generation with limited host RAM
 

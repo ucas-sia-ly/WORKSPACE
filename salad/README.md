@@ -1,8 +1,14 @@
-I k![DINOv2 SALAD](assets/dino_salad_title.png)
+![DINOv2 SALAD](assets/dino_salad_title.png)
 # Optimal Transport Aggregation for Visual Place Recognition
 Sergio Izquierdo, Javier Civera
 
 Code and models for Optimal Transport Aggregation for Visual Place Recognition (DINOv2 SALAD).
+
+## 本项目使用说明
+
+本目录保留原版 DINOv2 + SALAD 代码，并提供真实图 / Qwen 生成图训练和可选
+Reliability OT。项目入口、模型配置、训练和评估文档见 [文档索引](docs/README.md)。
+以下内容为原版 SALAD 的环境、数据集和论文说明。
 
 ## Summary
 

@@ -1,15 +1,16 @@
 # 生成端与验证器诊断
 
-本目录延续 `outputs/gen_diagnosis/strategy_grid.py` 的诊断。实验代码独立于生产生成器、prompt 规则和验证门槛；保留原有工作区修改。
+本目录保存既有生成结果的诊断工具和实验来源。当前生成入口为 [Qwen 困难源图工作流](../qwen_curriculum/README.md)。
+
+`runner.py` 及其 IC-Light adapter/LoRA 依赖保留本次清理前的版本：用户认可的 `outputs/gen_diagnosis/qwen_source_aspect_100src/generation_config.json` 记录了这些文件的 SHA-256。历史生成配置、源图、输出图和审核记录保持原样。旧阶段以其冻结哈希对应的源码版本为准，已有实现升级后的目录需要原版本才能继续旧阶段；当前启动器与公共配置不再启动 IC-Light。`verifier_controls.py` 的匹配覆盖与几何统计仍被当前质量审核使用，并非可删除的演示代码。
 
 比较对象是固定的 8 张 Bangkok 源图 × 5 种天气，每个源图/天气只有一个 seed。源图取自原候选清单的 `sorted(unique(source_path))[::5][:8]`；seed 与旧实验相同。结果只能解释这个小样本诊断，不能代表跨城市效果或 VPR Recall 改善。
 
-## 运行
+## 已有记录诊断
 
-在工作区根目录、AdaptVPR 环境中执行：
+在工作区根目录、AdaptVPR 环境中执行；以下 Qwen runner 命令仅用于独立历史对照，新生成使用困难源图工作流：
 
 ```bash
-python AdaptVPR/experiments/generation_diagnosis/runner.py --mode iclight --output-dir outputs/gen_diagnosis/prompt_ablation
 python AdaptVPR/experiments/generation_diagnosis/runner.py --mode qwen --num-sources 2 --output-dir outputs/gen_diagnosis/qwen_comparison_2src
 python AdaptVPR/experiments/generation_diagnosis/verifier_controls.py
 python AdaptVPR/experiments/generation_diagnosis/inspect_generated.py --run-dir outputs/gen_diagnosis/prompt_ablation --out outputs/gen_diagnosis/generated_geometry_iclight

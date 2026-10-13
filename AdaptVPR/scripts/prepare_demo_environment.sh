@@ -65,7 +65,6 @@ snapshot_download("openai/clip-vit-base-patch32")
 for key, value in {
     "LIGHTX2V_ROOT": str(source),
     "LIGHTX2V_LORA_PATH": str(Path(lora).resolve()),
-    "ICLIGHT_PYTHON": sys.executable,
     "LIGHTX2V_PYTHON": sys.executable,
 }.items():
     set_key(str(env_file), key, value)
@@ -79,7 +78,6 @@ sys.path.insert(0, str(source))
 from lightx2v import LightX2VPipeline
 from vismatch import get_matcher
 from transformers import CLIPModel, CLIPProcessor
-from diffusers import StableDiffusionPipeline
 
 # Download/check the small matcher weights without loading generation models.
 get_matcher("superpoint-lightglue", device="cpu", max_num_keypoints=2048)

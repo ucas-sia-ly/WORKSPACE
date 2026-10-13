@@ -2,24 +2,13 @@
 
 Qwen-LightX2V is the default local HTTP generator for Global, Local and Dual
 routes, and for the [staged Qwen curriculum](../experiments/qwen_curriculum/README.md).
-IC-Light remains available for historical diagnosis. Clients and the service
-they call must share readable filesystem paths. The FastAPI adapters are
+Clients and the service they call must share readable filesystem paths. The FastAPI adapters are
 distributed in this repository; upstream checkouts and model weights are not.
 
 `bash scripts/start_generation_services.sh --wait` starts and checks Qwen only.
-Add `--with-iclight` when an independent historical IC-Light run needs that service.
+The public launcher manages only this Qwen service.
 
 ## Health checks
-
-### IC-Light (optional historical service)
-
-```http
-GET /health
-```
-
-Expected response includes `status: "ok"`, `model_loaded: true`, and
-`generator_ready: true`. A `200 OK` response from an unloaded adapter is not
-treated as ready.
 
 ### LightX2V
 
@@ -38,48 +27,6 @@ Expected response:
 ```
 
 If `generator_ready` is omitted, it is treated as equal to `model_loaded`.
-
-## IC-Light generation (historical)
-
-```http
-POST /generate
-Content-Type: application/json
-```
-
-Request:
-
-```json
-{
-  "image_path": "/shared/path/input.jpg",
-  "prompt": "generation prompt",
-  "negative_prompt": "negative prompt",
-  "seed": 42,
-  "highres_scale": 1.0,
-  "highres_denoise": 0.3,
-  "num_inference_steps": 20,
-  "highres_steps": 20
-}
-```
-
-The four high-resolution fields are optional.
-
-For historical IC-Light LoRA inference, set `ADAPTVPR_LORA_CHECKPOINT` in `.env` or the
-service environment to a checkpoint saved by
-`adapters/iclight_lora.py`. The adapter reads rank and alpha from
-the checkpoint metadata and applies it to the shared UNet used by both sampling
-stages. An unset or empty value uses vanilla IC-Light. Relative paths in `.env`
-are resolved against the AdaptVPR root by the startup script. Invalid checkpoints
-fail initialization and are reported by `/health`; they do not silently fall back.
-Restart the IC-Light service after changing the checkpoint. For the bundled
-launcher, from the AdaptVPR directory:
-
-```bash
-export ADAPTVPR_LORA_CHECKPOINT=/absolute/path/to/lora_final.safetensors
-ADAPTVPR_FORCE_RESTART=1 bash scripts/start_generation_services.sh --with-iclight --wait
-```
-
-With `--with-iclight`, the launcher restarts both requested services. This option loads the
-project's custom LoRA format; external Diffusers/PEFT checkpoints need conversion.
 
 ## LightX2V generation
 
@@ -129,7 +76,7 @@ the Qwen service to apply the code (`systemctl --user restart adaptvpr-lightx2v`
 
 ## Generation response
 
-Both services return:
+The Qwen service returns:
 
 ```json
 {
@@ -151,9 +98,19 @@ client resize to conceal the mismatch. Existing clients can continue reading
 only `result_path`.
 
 Route-agent clients use a default request timeout of 300 seconds. Configure it
-with `ICLIGHT_API_TIMEOUT` or `LIGHTX2V_API_TIMEOUT`; configure the route-agent
+with `LIGHTX2V_API_TIMEOUT`; configure the route-agent
 LightX2V retry count with `LIGHTX2V_API_RETRIES`. The staged curriculum uses
 `--request-timeout` (default 600 seconds), reserves its call budget before each
 POST, and makes no automatic generation retry. Its experimental structure and
 weather gates are separate from the route agent's `DualTraitEvaluator` thresholds;
 the curriculum records `s_div` without imposing a minimum of 0.15.
+
+## Frozen historical dependencies
+
+The IC-Light adapter and LoRA helper remain as source dependencies of
+historical diagnosis, including the Qwen 100-source comparison. Their files
+are unchanged by this cleanup. Each historical configuration records its own
+implementation hashes; an earlier run may require the corresponding earlier
+source revision. They
+are excluded from the public launcher and configuration template; current
+weather generation uses only Qwen. See [diagnosis provenance](../experiments/generation_diagnosis/README.md).
