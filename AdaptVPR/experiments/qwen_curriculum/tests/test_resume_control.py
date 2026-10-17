@@ -109,6 +109,26 @@ class ResumeControlTests(unittest.TestCase):
                 control.resume(Path(temp) / "other-output")
             ctl.assert_not_called()
 
+    def test_default_status_and_resume_follow_migrated_service_binding(self):
+        import json
+        with tempfile.TemporaryDirectory() as temp, patch.object(control.Path, "home", return_value=Path(temp)):
+            output = Path(temp) / "generation_23city_v2"
+            output.mkdir()
+            (output / "migration_config.json").write_text('{}')
+            override = control.install_systemd_override(output, python="/env/bin/python")
+            self.assertIn("v2_campaign.py", override.read_text())
+            (output / "summary.json").write_text(json.dumps({"generated_images": 16892, "quality_version": 2}))
+            with patch.object(control, "unit_state", side_effect=lambda unit: state(unit)):
+                report = control.status()
+            self.assertEqual(report["output_dir"], str(output))
+            self.assertEqual(report["summary"]["quality_version"], 2)
+            with patch.object(control, "unit_state", side_effect=[state(control.COORDINATOR_UNIT),
+                    state(control.COORDINATOR_UNIT, "active", 91)]), \
+                    patch.object(control, "systemctl", return_value=command_result()) as ctl:
+                report = control.resume()
+            self.assertEqual(report["output_dir"], str(output))
+            ctl.assert_called_once_with("start", control.COORDINATOR_UNIT)
+
 
 if __name__ == "__main__":
     unittest.main()

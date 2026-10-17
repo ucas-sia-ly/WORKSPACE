@@ -1,6 +1,6 @@
 # 全部23城市：不限总张数的困难源图生成和原始SALAD训练
 
-本文对应已有冻结任务，尚未迁移到当前最少16个匹配点的审核规则 v2。恢复限制与迁移要求见 [RESUME.md](RESUME.md)；下列恢复命令以原实现及配置通过冻结校验为前提。
+已有任务已独立迁入 `generation_23city_v2`，采用当前最少16个匹配点、无空间覆盖率门限的审核规则。旧图片和账本保留，新结果记录旧审核来源。暂停、继续和进度命令见 [RESUME.md](RESUME.md)。
 
 本地已逐城市核对CSV对应图片文件、地点标签及至少4张真实视角的要求：23城市共有524701张有效真实图片、62514个地点。城市名自动从`dataset/gsv-cities/Dataframes/*.csv`发现，保留OSL、PRG、PRS、TRT等原始CSV名称。
 
@@ -34,17 +34,18 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 HF_HUB_OFFLINE=1 \
 
 ## 2. 生成全部候选并审核
 
-源图筛选完成后先准备计划，核对最终数量和磁盘估算；该命令不启动Qwen：
+原全量计划已经准备完成。以下命令迁移并检查已有任务；迁移已在本机完成，重复执行只校验，不启动Qwen：
 
 ```bash
 /home/admin123/miniconda3/envs/AdaptVPR/bin/python \
-  AdaptVPR/experiments/qwen_curriculum/all_city_campaign.py prepare \
-  --output-dir outputs/qwen_curriculum/generation_23city
+  AdaptVPR/experiments/qwen_curriculum/v2_campaign.py migrate \
+  --source-dir outputs/qwen_curriculum/generation_23city \
+  --output-dir outputs/qwen_curriculum/generation_23city_v2
 
-cat outputs/qwen_curriculum/generation_23city/summary.json
+cat outputs/qwen_curriculum/generation_23city_v2/summary.json
 ```
 
-累计天气比例保持night50%、snow20%、fog20%、rain10%，按累计目标精确整数分配。Qwen仍为同一2511模型、Lightning 4steps BF16、guidance1、source_aspect_v1高分辨率画布和32个常驻DiT blocks；本冻结任务记录原结构与天气验收门限。训练PNG仍LANCZOS缩回源尺寸，原始PNG保留。
+累计天气比例保持night50%、snow20%、fog20%、rain10%，按累计目标精确整数分配。Qwen仍为同一2511模型、Lightning 4steps BF16、guidance1、source_aspect_v1高分辨率画布和32个常驻DiT blocks。审核按当前代码执行；训练PNG仍LANCZOS缩回源尺寸，原始PNG保留。
 
 不限张数可能需要比当前磁盘剩余空间更多的容量。`summary.json`中`required_free_bytes_estimate`为剩余图片预留估算（约3MB/图加5GB余量），`available_free_bytes`为实际可用空间；不足时生成入口在任何POST之前停止。若需要较大磁盘，在第一次生成前用该磁盘上的新`--output-dir`重新prepare/run；原四城图片继续引用原路径。单张稳定约27秒，可用最终新增数量估算总耗时。描述子缓存另约20GB，数字不包含已占用的旧数据。
 
@@ -54,13 +55,13 @@ cat outputs/qwen_curriculum/generation_23city/summary.json
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 HF_HUB_OFFLINE=1 \
 ADAPTVPR_CLIP_LOCAL_FILES_ONLY=1 \
 /home/admin123/miniconda3/envs/AdaptVPR/bin/python -u \
-  AdaptVPR/experiments/qwen_curriculum/resume_campaign.py run \
-  --output-dir outputs/qwen_curriculum/generation_23city
+  AdaptVPR/experiments/qwen_curriculum/v2_campaign.py run \
+  --output-dir outputs/qwen_curriculum/generation_23city_v2
 ```
 
 所有新增任务被自动拆成不超过1000次调用的阶段。全局域和源图计划不因分批而重排。已完成图片不重复生成；已保存但未审核的图先补审核；中断且没有完整输出的任务在下次显式恢复时独立重试，原失败记录保留。每次恢复时同一任务最多新调用一次，再失败就停，避免无限重试。全部任务验证后发布`state=complete`并停止Qwen服务，`training_manifest.jsonl`只含通过审核的图。
 
-使用默认输出目录时可执行以下后台命令，关闭终端后继续运行；不要同时执行前台run。当前任务继续运行，新恢复入口在下一次暂停、恢复时接管：
+后台服务已绑定新的v2目录，执行以下命令继续生成；关闭终端后继续运行，不要同时执行前台run：
 
 ```bash
 /home/admin123/miniconda3/envs/AdaptVPR/bin/python \
@@ -79,7 +80,7 @@ ADAPTVPR_CLIP_LOCAL_FILES_ONLY=1 \
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 HF_HUB_OFFLINE=1 \
 /home/admin123/miniconda3/envs/AdaptVPR/bin/python \
   AdaptVPR/experiments/qwen_curriculum/finetune_all_cities.py check-data \
-  --generation-dir outputs/qwen_curriculum/generation_23city \
+  --generation-dir outputs/qwen_curriculum/generation_23city_v2 \
   --output-dir outputs/qwen_curriculum/finetune_salad_pretrained_23city \
   --epochs 10
 ```
@@ -90,7 +91,7 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 HF_HUB_OFFLINE=1 \
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 HF_HUB_OFFLINE=1 \
 /home/admin123/miniconda3/envs/AdaptVPR/bin/python -u \
   AdaptVPR/experiments/qwen_curriculum/finetune_all_cities.py run \
-  --generation-dir outputs/qwen_curriculum/generation_23city \
+  --generation-dir outputs/qwen_curriculum/generation_23city_v2 \
   --output-dir outputs/qwen_curriculum/finetune_salad_pretrained_23city \
   --epochs 10
 ```

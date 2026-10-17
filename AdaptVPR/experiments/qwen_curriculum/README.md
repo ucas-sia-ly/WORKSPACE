@@ -1,10 +1,10 @@
 # Qwen 困难样本增广
 
-**当前入口：全部23城市，不限制困难源图总数。** [mine_all_cities.py](mine_all_cities.py)复用已有四城7277张，逐城筛选其余19城的全部合格困难源图；[all_city_campaign.py](all_city_campaign.py)按冻结配置分批生成；[finetune_all_cities.py](finetune_all_cities.py)使用全部23城真实数据与各城审核通过图，微调原始预训练SALAD并自动测试六域SVOX。完整命令、磁盘预估及恢复方式见 [ALL_23_CITIES.md](ALL_23_CITIES.md)。
+**当前入口：全部23城市，不限制困难源图总数。** [mine_all_cities.py](mine_all_cities.py)复用已有四城7277张，逐城筛选其余19城的全部合格困难源图；[v2_campaign.py](v2_campaign.py)保留原计划和图片，按最新代码审核并接续生成；[finetune_all_cities.py](finetune_all_cities.py)使用全部23城真实数据与各城审核通过图，微调原始预训练SALAD并自动测试六域SVOX。完整命令、磁盘预估及恢复方式见 [ALL_23_CITIES.md](ALL_23_CITIES.md)。
 
-**当前审核规则 v2：** 最少匹配点数为16，保留内点率、homography 位移及天气审核。已有23城市任务冻结的是旧规则，不会自动采用当前实现；切换需要独立新运行或显式迁移，并保留旧配置和账本，详见 [RESUME.md](RESUME.md)。
+**当前审核规则 v2：** 最少匹配点数为16，移除空间覆盖率门限，保留内点率、homography 位移及天气审核。[v2_campaign.py](v2_campaign.py)将已有图片和诊断数据迁入独立的 `generation_23city_v2`，旧配置、图片和账本保留，新结果明确记录来源，详见 [RESUME.md](RESUME.md)。
 
-**长期生成的暂停与恢复：** 使用 [resume_control.py](resume_control.py) 的 `pause` / `resume` / `status`。新协调器 [resume_campaign.py](resume_campaign.py) 接续冻结计划，恢复已落盘的图片，独立重试中断失败的任务；暂停同时退出常驻 Qwen 以释放显存。具体命令见 [RESUME.md](RESUME.md)。
+**长期生成的暂停与恢复：** 使用 [resume_control.py](resume_control.py) 的 `pause` / `resume` / `status`，自动跟随后台服务当前绑定的 v2 目录。当前协调器 [v2_campaign.py](v2_campaign.py)接续原计划，恢复已落盘图片，独立重试中断任务；暂停同时退出常驻 Qwen 以释放显存。具体命令见 [RESUME.md](RESUME.md)。
 
 本地23城训练池已核对：524701张真实图、62514个地点。生成量和审核通过量由数据决定。新入口不固定城市列表、不固定5004/7277训练图数；旧实验目录保留为历史结果。
 
@@ -13,7 +13,7 @@
 按阶段执行，生成和训练分别加载模型。完整命令以 [全部城市操作说明](ALL_23_CITIES.md) 为准。
 
 1. [mine_all_cities.py](mine_all_cities.py)：逐城挖掘困难真实源图，复用已冻结的四城市记录。
-2. [all_city_campaign.py](all_city_campaign.py) 准备计划，[resume_campaign.py](resume_campaign.py) 接续生成 night / snow / fog / rain 图像，审核并保存清单。
+2. [all_city_campaign.py](all_city_campaign.py) 保留原计划，[v2_campaign.py](v2_campaign.py)迁移并按当前代码接续生成 night / snow / fog / rain 图像，审核并保存清单。
 3. [finetune_all_cities.py](finetune_all_cities.py)：使用真实图与审核通过的对应生成图微调 SALAD，评估 SVOX 六域。
 
 ## 目录与职责

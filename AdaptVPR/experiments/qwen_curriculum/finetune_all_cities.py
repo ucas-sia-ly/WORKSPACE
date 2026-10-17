@@ -35,8 +35,12 @@ def prepare(directory, generation, epochs):
             raise ValueError("Use a new experiment directory for different generation/epochs")
         base.check_inputs(cfg)
         return cfg
+    current_quality = (generation / "migration_config.json").exists()
     resumed = (generation / "resume_config.json").exists()
-    if resumed:
+    if current_quality:
+        from experiments.qwen_curriculum import v2_campaign, history_v2, requalify_v2
+        rows, campaign = v2_campaign.load_collection(generation)
+    elif resumed:
         from experiments.qwen_curriculum import resume_campaign, resume_recovery
         rows, campaign = resume_campaign.load_collection(generation)
     else:
@@ -75,8 +79,14 @@ def prepare(directory, generation, epochs):
     code += sorted(backbone.rglob("*.py"))
     files = code + [checkpoint, manifest, generation / "all_city_campaign_config.json", generation / "results.jsonl",
         generation / "summary.json", *[real_data / "Dataframes" / f"{city}.csv" for city in cities]]
-    if resumed:
+    if current_quality:
+        files += [Path(v2_campaign.__file__), Path(history_v2.__file__), Path(requalify_v2.__file__),
+                  generation / "migration_config.json", generation / "resume_config.json"]
+        files += sorted((generation / "imported").glob("*.json"))
+        files += sorted((generation / "imported").glob("*.jsonl"))
+    elif resumed:
         files += [Path(resume_campaign.__file__), Path(resume_recovery.__file__), generation / "resume_config.json"]
+    if resumed:
         files += sorted((generation / "resume_state").rglob("*config.json"))
         files += sorted((generation / "resume_state").rglob("intent.json"))
         files += sorted((generation / "resume_state").rglob("input.jsonl"))
@@ -96,7 +106,8 @@ def prepare(directory, generation, epochs):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("command", choices=("prepare", "run", "check-data", "status"))
-    parser.add_argument("--generation-dir", type=Path, default=all_city_campaign.DEFAULT_OUTPUT)
+    from experiments.qwen_curriculum.resume_control import configured_output_dir
+    parser.add_argument("--generation-dir", type=Path, default=configured_output_dir())
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--epochs", type=int, default=10)
     args = parser.parse_args(argv)

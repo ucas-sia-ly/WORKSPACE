@@ -47,8 +47,18 @@ def stopped(state):
     return state["active_state"] in {"inactive", "failed"} and state["main_pid"] == 0
 
 
-def status(directory=DEFAULT_OUTPUT):
-    directory = Path(directory).resolve()
+def configured_output_dir():
+    override = Path.home() / ".config/systemd/user" / f"{COORDINATOR_UNIT}.d" / "resume.conf"
+    if override.exists():
+        marker = "# qwen-resume-output-dir: "
+        for line in override.read_text(encoding="utf-8").splitlines():
+            if line.startswith(marker):
+                return Path(json.loads(line[len(marker):])).resolve()
+    return DEFAULT_OUTPUT.resolve()
+
+
+def status(directory=None):
+    directory = Path(directory).resolve() if directory is not None else configured_output_dir()
     report = {"output_dir": str(directory), "units": {
         unit: unit_state(unit) for unit in (COORDINATOR_UNIT, QWEN_UNIT)}}
     report["resources_released"] = all(stopped(state) for state in report["units"].values())
@@ -57,7 +67,7 @@ def status(directory=DEFAULT_OUTPUT):
     return report
 
 
-def pause(directory=DEFAULT_OUTPUT):
+def pause(directory=None):
     # The generator child belongs to the coordinator's systemd control group.
     # Qwen is a separate unit and must also be stopped to release resident weights
     # and cancel an HTTP request that is still executing after its client exits.
@@ -86,12 +96,16 @@ def _systemd_argument(value):
     return '"' + value.replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def install_systemd_override(directory=DEFAULT_OUTPUT, *, user_unit_dir=None, python=None):
+def install_systemd_override(directory=DEFAULT_OUTPUT, *, user_unit_dir=None, python=None, controller=None):
     """Write an override; do not reload, enable or start any service here."""
     directory = Path(directory).resolve()
     user_unit_dir = Path(user_unit_dir) if user_unit_dir else Path.home() / ".config/systemd/user"
     interpreter = Path(python) if python else Path.home() / "miniconda3/envs/AdaptVPR/bin/python"
-    controller = Path(__file__).with_name("resume_campaign.py").resolve()
+    if controller is None:
+        entry = "v2_campaign.py" if (directory / "migration_config.json").exists() else "resume_campaign.py"
+        controller = Path(__file__).with_name(entry).resolve()
+    else:
+        controller = Path(controller).resolve()
     command = " ".join(_systemd_argument(arg) for arg in
         (interpreter, "-u", controller, "run", "--output-dir", directory))
     # StandardOutput is a single setting, not an ExecStart argument list; quotes
@@ -113,16 +127,9 @@ def install_systemd_override(directory=DEFAULT_OUTPUT, *, user_unit_dir=None, py
     return path
 
 
-def resume(directory=DEFAULT_OUTPUT):
-    directory = Path(directory).resolve()
-    override = Path.home() / ".config/systemd/user" / f"{COORDINATOR_UNIT}.d" / "resume.conf"
-    configured_output = DEFAULT_OUTPUT.resolve()
-    if override.exists():
-        marker = "# qwen-resume-output-dir: "
-        for line in override.read_text(encoding="utf-8").splitlines():
-            if line.startswith(marker):
-                configured_output = Path(json.loads(line[len(marker):])).resolve()
-                break
+def resume(directory=None):
+    configured_output = configured_output_dir()
+    directory = Path(directory).resolve() if directory is not None else configured_output
     if directory != configured_output:
         raise RuntimeError(f"The background service is configured for {configured_output}, not {directory}; "
                            "stop it and install the matching systemd override first")
@@ -145,7 +152,8 @@ def resume(directory=DEFAULT_OUTPUT):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("pause", "resume", "status"))
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Defaults to the output directory currently bound to the background service")
     args = parser.parse_args()
     try:
         action = {"pause": pause, "resume": resume, "status": status}[args.command]
