@@ -6,7 +6,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
+import numpy as np
+
 from . import runner
+from .inspect_generated import summarize as summarize_matching
+from .verifier_controls import matcher_diagnostics
 
 
 class RunnerProtocolTests(unittest.TestCase):
@@ -101,6 +105,31 @@ class RunnerProtocolTests(unittest.TestCase):
         self.assertEqual((aggregate["geo_ok"], aggregate["div_ok"], aggregate["passed"]), (2, 2, 1))
         self.assertEqual(aggregate["failure_reasons"], {"geometry": 1, "diversity": 1})
         self.assertEqual(aggregate["errors"], 0)
+
+
+class MatchingDiagnosticsTests(unittest.TestCase):
+    def test_diagnostics_and_summary_use_counts_and_displacement_only(self):
+        points = np.repeat([[10.0, 10.0]], 16, axis=0)
+        diagnostics = matcher_diagnostics({
+            "matched_kpts0": points, "matched_kpts1": points,
+            "inlier_kpts0": points, "inlier_kpts1": points,
+            "all_kpts0": points, "all_kpts1": points,
+            "num_inliers": 16, "H": np.eye(3),
+        }, 512)
+        self.assertEqual(diagnostics["num_matched"], 16)
+        self.assertEqual(diagnostics["num_inliers"], 16)
+        self.assertEqual(diagnostics["estimated_H_grid_displacement_median_px"], 0)
+        self.assertNotIn("coverage", json.dumps(diagnostics))
+        row = {"run_dir": "fixture", "src": 0, "strat": "released",
+               "prompt_variant": "released", "model": "qwen", "method": "qwen_released",
+               "cond": "rain", "status": "ok", "reference_geo_ok": True,
+               "reference_passed": True, **diagnostics}
+        summary = summarize_matching([row])
+        self.assertNotIn("coverage", json.dumps(summary))
+        self.assertEqual(summary["successful_diagnostics"], 1)
+        for group in summary["groups"]:
+            self.assertEqual(group["median_num_matched"], 16)
+            self.assertEqual(group["median_estimated_H_grid_displacement_median_px"], 0)
 
 
 if __name__ == "__main__":

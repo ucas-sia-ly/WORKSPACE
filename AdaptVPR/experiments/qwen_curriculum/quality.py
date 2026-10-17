@@ -1,8 +1,8 @@
 """Experimental Qwen quality checks separating structure from weather semantics.
 
-Geometry combines the production inlier ratio with minimum evidence, spatial
-coverage and proximity of the fitted homography to identity. CLIP cosine
-distance is recorded but never required. Fixed-scale weather contrasts are
+Geometry combines the production inlier ratio with minimum match evidence and
+proximity of the fitted homography to identity. CLIP cosine distance is recorded
+but never required. Fixed-scale weather contrasts are
 exploratory semantic checks, not calibrated probabilities or independent truth.
 The constructor allocates no CLIP model; CPU CLIP is loaded on first evaluation.
 """
@@ -25,8 +25,7 @@ from experiments.qwen_curriculum.weather_signal import (
 
 QUALITY_DEFAULTS = {
     "min_s_geo": 0.78,
-    "min_matches": 64,
-    "min_source_inlier_grid_coverage": 0.35,
+    "min_matches": 16,
     "max_H_grid_median_px_at_512": 16.0,
     "weather_thresholds": {
         condition: {"min_shift": 0.0, "min_generated_logit": 0.0}
@@ -50,9 +49,9 @@ def _thresholds(overrides: dict | None) -> dict:
                 if not isinstance(limits, dict) or set(limits) - {"min_shift", "min_generated_logit"}:
                     raise ValueError("Unknown/non-object per-condition weather thresholds")
                 result[key][condition].update(limits)
-    for key in ("min_s_geo", "min_source_inlier_grid_coverage"):
-        if type(result[key]) not in (int, float) or not math.isfinite(result[key]) or not 0 <= result[key] <= 1:
-            raise ValueError(f"{key} must be finite in [0, 1]")
+    ratio = result["min_s_geo"]
+    if type(ratio) not in (int, float) or not math.isfinite(ratio) or not 0 <= ratio <= 1:
+        raise ValueError("min_s_geo must be finite in [0, 1]")
     if type(result["min_matches"]) is not int or result["min_matches"] < 4:
         raise ValueError("min_matches must be an integer at least 4")
     displacement = result["max_H_grid_median_px_at_512"]
@@ -74,13 +73,13 @@ def quality_definition(thresholds: dict | None = None, *, matcher_name: str = "s
     if not isinstance(matcher_name, str) or not matcher_name.strip():
         raise ValueError("matcher_name must be nonempty")
     return {
-        "version": 1,
+        "version": 2,
         "thresholds": _thresholds(thresholds),
         "threshold_status": "experimental configurable first-run checks; not calibrated quality guarantees",
         "matcher_name": matcher_name, "matcher_image_size": img_size, "max_num_keypoints": n_kpts,
         "matcher_failure_policy": "raise; no silent matcher substitution",
         "matcher_input": "production JPEG95 temporary images; square resize",
-        "structure_gate": "s_geo >= min_s_geo AND matches >= min_matches AND source 4x4 inlier coverage >= minimum AND fitted-H 5x5 median displacement <= maximum scaled from 512 pixels",
+        "structure_gate": "s_geo >= min_s_geo AND matches >= min_matches AND fitted-H 5x5 median displacement <= maximum scaled from 512 pixels",
         "weather_gate": "generated condition-vs-clear contrast > per-condition minimum AND generated-minus-source contrast > per-condition minimum",
         "s_div_policy": "descriptive only; no minimum cosine distance",
         "competing_weather_policy": "target minus strongest competing-weather logit is descriptive only",
@@ -215,7 +214,7 @@ class QwenQualityVerifier:
         diagnostic_result["H"] = (np.asarray(result["H"], dtype=np.float64) / np.linalg.norm(result["H"])) if valid_h else None
         if not valid_counts:
             # Preserve usable match count while excluding malformed inliers
-            # from coverage/hull math, which otherwise can emit NaN JSON values.
+            # from displacement math, which otherwise can emit NaN JSON values.
             diagnostic_result.update(matched_kpts0=matched0 if np.isfinite(matched0).all() else [],
                                      inlier_kpts0=[], inlier_kpts1=[], num_inliers=0,
                                      all_kpts0=[], all_kpts1=[])
@@ -230,9 +229,6 @@ class QwenQualityVerifier:
             reasons.append("geometry_inlier_ratio_below_minimum_or_invalid")
         if matches < self.thresholds["min_matches"]:
             reasons.append("geometry_too_few_matches")
-        grid_coverage = diagnostics["source_inlier_coverage"]["grid_coverage"]
-        if not math.isfinite(grid_coverage) or grid_coverage < self.thresholds["min_source_inlier_grid_coverage"]:
-            reasons.append("geometry_source_inlier_coverage_below_minimum")
         displacement = diagnostics["estimated_H_grid_displacement_median_px"]
         max_displacement = self.thresholds["max_H_grid_median_px_at_512"] * self.img_size / 512
         if not valid_h or displacement is None or not math.isfinite(displacement):

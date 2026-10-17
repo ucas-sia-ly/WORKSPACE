@@ -2,7 +2,7 @@
 
 Only the production _compute_s_geo method is called. CLIP scores and the
 original gate decisions are retained from the generator checkpoint, not
-recomputed. Coverage and homography displacement are descriptive; this script
+recomputed. Homography displacement is descriptive; this script
 introduces no acceptance rules.
 
 Example:
@@ -135,10 +135,6 @@ def summarize(rows: list[dict]) -> dict:
                       "inlier_identity_displacement_median_px", "estimated_H_grid_displacement_median_px",
                       "estimated_H_grid_displacement_max_px"):
             summary[f"median_{field}"] = median_available(ok, field)
-        summary["median_source_inlier_grid_coverage"] = statistics.median(
-            [row["source_inlier_coverage"]["grid_coverage"] for row in ok]) if ok else None
-        summary["median_source_inlier_convex_hull_area_fraction"] = statistics.median(
-            [row["source_inlier_coverage"]["convex_hull_area_fraction"] for row in ok]) if ok else None
         summaries.append(summary)
     return {"groups": summaries, "rows": len(latest),
             "successful_diagnostics": sum(row["status"] == "ok" for row in latest.values()),

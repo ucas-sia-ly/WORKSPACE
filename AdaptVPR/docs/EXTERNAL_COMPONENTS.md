@@ -177,7 +177,7 @@ matcher = get_matcher(name, device=device, max_num_keypoints=n_kpts)
 The returned matcher must provide `load_image(...)` and return `matched_kpts0`
 and `num_inliers` for the route agent's geometric score. The curriculum's
 structure checks also require `matched_kpts1`, paired `inlier_kpts0` /
-`inlier_kpts1` and a fitted `H`, so match count, spatial coverage and displacement
-can be checked. Its requested matcher fails explicitly without silent
-substitution. Curriculum CLIP defaults to CPU and supplies fixed-scale weather
+`inlier_kpts1` and a fitted `H` to check match count and displacement. The current
+v2 policy requires at least 16 matches. Its requested matcher fails explicitly
+without silent substitution. Curriculum CLIP defaults to CPU and supplies fixed-scale weather
 contrasts; route-agent CLIP supplies the independent appearance-diversity score.

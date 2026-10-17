@@ -1,8 +1,10 @@
 # 全部23城市：不限总张数的困难源图生成和原始SALAD训练
 
+本文对应已有冻结任务，尚未迁移到当前最少16个匹配点的审核规则 v2。恢复限制与迁移要求见 [RESUME.md](RESUME.md)；下列恢复命令以原实现及配置通过冻结校验为前提。
+
 本地已逐城市核对CSV对应图片文件、地点标签及至少4张真实视角的要求：23城市共有524701张有效真实图片、62514个地点。城市名自动从`dataset/gsv-cities/Dataframes/*.csv`发现，保留OSL、PRG、PRS、TRT等原始CSV名称。
 
-本轮全量源图筛选已完成：共79426张符合源图规则的候选，复用原7277张，新增72149张。新增生成预计需要约216.4GB存放原始PNG及训练PNG，另预留5GB；当前可用约85GB，需增加空间或选择其他磁盘。按约27秒/张估算，新增生成约22.5天；这是候选数量，审核通过数量要在生成后确定。
+本轮全量源图筛选已完成：共79426张符合源图规则的候选，复用原7277张，新增72149张。新增生成预计需要约216.4GB存放原始PNG及训练PNG，另预留5GB；当前剩余空间和已生成张数以`summary.json`为准。按约27秒/张估算，新增生成约22.5天；这是候选数量，审核通过数量要在生成后确定。
 
 保留原来四城的7277张生成图片和原签名结果。新增19城不设固定总张数，也不按每城250/500张截断：使用原始SALAD教师，可靠正样本相似度≥0.15，困难度位于各城70%–97.5%分位，每地点最多2张源图，保留全部符合条件的候选。源图筛选与生成后审核是两步，候选数量不等于最终审核通过数量。
 
@@ -42,7 +44,7 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 HF_HUB_OFFLINE=1 \
 cat outputs/qwen_curriculum/generation_23city/summary.json
 ```
 
-累计天气比例保持night50%、snow20%、fog20%、rain10%，按累计目标精确整数分配。Qwen仍为同一2511模型、Lightning 4steps BF16、guidance1、source_aspect_v1高分辨率画布和32个常驻DiT blocks；原结构与天气验收门限保持不变。训练PNG仍LANCZOS缩回源尺寸，原始PNG保留。
+累计天气比例保持night50%、snow20%、fog20%、rain10%，按累计目标精确整数分配。Qwen仍为同一2511模型、Lightning 4steps BF16、guidance1、source_aspect_v1高分辨率画布和32个常驻DiT blocks；本冻结任务记录原结构与天气验收门限。训练PNG仍LANCZOS缩回源尺寸，原始PNG保留。
 
 不限张数可能需要比当前磁盘剩余空间更多的容量。`summary.json`中`required_free_bytes_estimate`为剩余图片预留估算（约3MB/图加5GB余量），`available_free_bytes`为实际可用空间；不足时生成入口在任何POST之前停止。若需要较大磁盘，在第一次生成前用该磁盘上的新`--output-dir`重新prepare/run；原四城图片继续引用原路径。单张稳定约27秒，可用最终新增数量估算总耗时。描述子缓存另约20GB，数字不包含已占用的旧数据。
 
@@ -52,20 +54,22 @@ cat outputs/qwen_curriculum/generation_23city/summary.json
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 HF_HUB_OFFLINE=1 \
 ADAPTVPR_CLIP_LOCAL_FILES_ONLY=1 \
 /home/admin123/miniconda3/envs/AdaptVPR/bin/python -u \
-  AdaptVPR/experiments/qwen_curriculum/all_city_campaign.py run \
+  AdaptVPR/experiments/qwen_curriculum/resume_campaign.py run \
   --output-dir outputs/qwen_curriculum/generation_23city
 ```
 
-所有新增任务被自动拆成不超过1000次调用的阶段。全局域和源图计划不因分批而重排。逐任务预留调用预算、最多一个POST，中断未知结果不自动重试；已经完成的图不重复生成，已保存但未审核的图可恢复审核。原始图片和账本不删除或重新签名。全部任务验证后发布`state=complete`并停止Qwen服务，`training_manifest.jsonl`只含通过审核的图。
+所有新增任务被自动拆成不超过1000次调用的阶段。全局域和源图计划不因分批而重排。已完成图片不重复生成；已保存但未审核的图先补审核；中断且没有完整输出的任务在下次显式恢复时独立重试，原失败记录保留。每次恢复时同一任务最多新调用一次，再失败就停，避免无限重试。全部任务验证后发布`state=complete`并停止Qwen服务，`training_manifest.jsonl`只含通过审核的图。
 
-已安装但未启动后台生成服务。使用默认输出目录时可执行以下命令，关闭终端后继续运行；不要同时执行前台run：
+使用默认输出目录时可执行以下后台命令，关闭终端后继续运行；不要同时执行前台run。当前任务继续运行，新恢复入口在下一次暂停、恢复时接管：
 
 ```bash
-systemctl --user start qwen-curriculum-23city.service
-systemctl --user status qwen-curriculum-23city.service
+/home/admin123/miniconda3/envs/AdaptVPR/bin/python \
+  AdaptVPR/experiments/qwen_curriculum/resume_control.py resume
+/home/admin123/miniconda3/envs/AdaptVPR/bin/python \
+  AdaptVPR/experiments/qwen_curriculum/resume_control.py status
 ```
 
-如果改为其他磁盘上的输出目录，使用对应run命令在tmux终端中运行，或修改该服务的输出路径。恢复执行同一run命令或重新start该服务。
+需要电脑空闲时，使用`resume_control.py pause`同时停止协调器和独立Qwen服务，释放显存、内存；稍后使用`resume`。断电后也执行同一恢复命令。完整说明见[RESUME.md](RESUME.md)。如果使用其他磁盘上的输出目录，使用对应前台命令，或先停止服务再安装该目录的覆盖配置；不要同时运行旧入口。
 
 ## 3. 全23城训练命令
 

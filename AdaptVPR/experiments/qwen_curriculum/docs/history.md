@@ -63,7 +63,7 @@ tail -f outputs/qwen_curriculum/generation_2000/worker.log
 
 沿用 `outputs/gen_diagnosis/qwen_source_aspect_100src/images` 的 Qwen-Image-Edit-2511 + Lightning 4steps、guidance=1、`source_aspect_v1` 大画布。保持 released prompt 和空 negative prompt，保留原始大图，训练图仅 LANCZOS 缩回源图尺寸。每个不同源图生成一个随机域，域标签使用精确配额独立洗牌，避免源图排序与天气相关。
 
-结构验收检查内点率、匹配数、空间覆盖和 homography 位移；天气验收检查 CLIP 的目标域相对晴天对比及相对源图的正向变化。`s_div` 只记录，不再以差异超过 0.15 作为通过条件。CLIP 是弱语义信号；首轮门限属于实验设置，需要人工复核。通过标记不等于天气或地点身份的绝对保证，生成质量也不直接证明 Recall 提升。
+本页记录历史实验，原始配置和审核结果保持不变。当前审核规则 v2 的结构验收检查内点率、匹配数（至少16）和 homography 位移；天气验收检查 CLIP 的目标域相对晴天对比及相对源图的正向变化。`s_div` 只记录，不再以差异超过 0.15 作为通过条件。CLIP 是弱语义信号；首轮门限属于实验设置，需要人工复核。通过标记不等于天气或地点身份的绝对保证，生成质量也不直接证明 Recall 提升。
 
 每次 POST 前原子保存预算预留；失败和中断未知结果也计入预算，不自动重试。图像保存后验收失败可以继续验收，不消耗新调用。并发锁防止同目录双 worker。计划、运行配置、结果、图像都有内容校验；配置变更使用新目录。验收合格图持续写入 `training_manifest.jsonl`。
 

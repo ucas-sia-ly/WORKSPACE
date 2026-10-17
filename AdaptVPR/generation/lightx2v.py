@@ -198,7 +198,6 @@ class Lightx2vGenerator:
         self,
         ref_image: Image.Image,
         prompt: str,
-        mask: Image.Image = None,
         seed: int = 42,
         negative_prompt: str = "",
         **kwargs,
@@ -208,7 +207,7 @@ class Lightx2vGenerator:
             return result
         if _mock_disabled():
             raise RuntimeError("[Lightx2v] The API returned no result and strict mode forbids Local mock fallback")
-        return self._mock_local(ref_image, prompt, mask)
+        return self._mock_local(ref_image, prompt)
 
     def generate_dual(
         self,
@@ -229,7 +228,6 @@ class Lightx2vGenerator:
         self,
         ref_image: Image.Image,
         prompt: str,
-        mask: Image.Image = None,
     ) -> Image.Image:
         print(f"[Lightx2v][Mock Local] prompt='{prompt[:50]}...'")
         result = ref_image.copy()

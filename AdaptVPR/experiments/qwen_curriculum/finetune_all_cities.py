@@ -35,7 +35,12 @@ def prepare(directory, generation, epochs):
             raise ValueError("Use a new experiment directory for different generation/epochs")
         base.check_inputs(cfg)
         return cfg
-    rows, campaign = all_city_campaign.load_collection(generation)
+    resumed = (generation / "resume_config.json").exists()
+    if resumed:
+        from experiments.qwen_curriculum import resume_campaign, resume_recovery
+        rows, campaign = resume_campaign.load_collection(generation)
+    else:
+        rows, campaign = all_city_campaign.load_collection(generation)
     _, _, request = mine_all_cities.load_selection(Path(campaign["mining_dir"]))
     real_data = Path(request["real_data"])
     cities = mine_all_cities.discover_cities(real_data)
@@ -70,6 +75,11 @@ def prepare(directory, generation, epochs):
     code += sorted(backbone.rglob("*.py"))
     files = code + [checkpoint, manifest, generation / "all_city_campaign_config.json", generation / "results.jsonl",
         generation / "summary.json", *[real_data / "Dataframes" / f"{city}.csv" for city in cities]]
+    if resumed:
+        files += [Path(resume_campaign.__file__), Path(resume_recovery.__file__), generation / "resume_config.json"]
+        files += sorted((generation / "resume_state").rglob("*config.json"))
+        files += sorted((generation / "resume_state").rglob("intent.json"))
+        files += sorted((generation / "resume_state").rglob("input.jsonl"))
     cfg = fast_campaign.frozen(path, {"schema_version": 1, "experiment": "original_salad_23city_accepted_qwen",
         "generation_dir": str(generation), "generation_fingerprint": campaign["fingerprint"],
         "initial_checkpoint": str(checkpoint), "accepted_manifest": str(manifest), "accepted_images": count,

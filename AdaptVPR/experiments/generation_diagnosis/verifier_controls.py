@@ -76,16 +76,6 @@ def build_controls(source: Image.Image, donor: Image.Image):
     ]
 
 
-def coverage(points: np.ndarray, side: int, grid: int = 4) -> dict:
-    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
-    if len(points) == 0:
-        return {"occupied_grid_cells": 0, "grid_cells": grid * grid, "grid_coverage": 0.0, "convex_hull_area_fraction": 0.0}
-    cells = np.floor(points / side * grid).astype(int).clip(0, grid - 1)
-    occupied = len(set(map(tuple, cells)))
-    hull_area = float(cv2.contourArea(cv2.convexHull(points.astype(np.float32)))) if len(points) >= 3 else 0.0
-    return {"occupied_grid_cells": occupied, "grid_cells": grid * grid, "grid_coverage": occupied / (grid * grid), "convex_hull_area_fraction": hull_area / (side * side)}
-
-
 def matcher_diagnostics(result: dict, side: int) -> dict:
     matched0 = np.asarray(result.get("matched_kpts0", []), dtype=np.float64).reshape(-1, 2)
     inlier0 = np.asarray(result.get("inlier_kpts0", []), dtype=np.float64).reshape(-1, 2)
@@ -101,8 +91,6 @@ def matcher_diagnostics(result: dict, side: int) -> dict:
         "num_detected_control": n_detected1,
         "source_matched_fraction": n_matched / n_detected0 if n_detected0 else 0.0,
         "source_inlier_fraction": n_inliers / n_detected0 if n_detected0 else 0.0,
-        "source_inlier_coverage": coverage(inlier0, side),
-        "control_inlier_coverage": coverage(inlier1, side),
         "inlier_identity_displacement_median_px": None,
         "estimated_H": None,
         "estimated_H_grid_displacement_median_px": None,

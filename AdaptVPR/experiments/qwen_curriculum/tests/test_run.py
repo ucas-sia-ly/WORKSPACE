@@ -108,6 +108,17 @@ class RunTests(unittest.TestCase):
         self.verifier = Verifier()
         self.args = run.parse_args(["generate", "--run-dir", str(self.directory), "--device", "cpu"])
 
+    def test_new_quality_policy_cannot_overwrite_a_frozen_legacy_run(self):
+        legacy = run.execution_definition(self.args)
+        legacy["quality"]["version"] = 1
+        legacy["quality"]["thresholds"]["min_matches"] = 64
+        run.freeze(self.directory, legacy)
+        config_path = self.directory / "execution_config.json"
+        original = config_path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "Immutable execution settings changed"):
+            run.freeze(self.directory, run.execution_definition(self.args))
+        self.assertEqual(config_path.read_bytes(), original)
+
     def generate(self, verifier_factory=None):
         with ExitStack() as stack:
             stack.enter_context(patch.object(run.requests, "Session", return_value=self.session))

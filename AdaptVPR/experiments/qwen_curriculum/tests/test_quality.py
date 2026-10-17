@@ -94,16 +94,32 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(result["rejection_reasons"], [])
 
     def test_high_inlier_ratio_with_few_matches_is_rejected(self):
-        result = self.verify(raw_result(matches=32, inliers=32))
+        result = self.verify(raw_result(matches=15, inliers=15))
         self.assertEqual(result["s_geo"], 1)
         self.assertFalse(result["geometry_ok"])
         self.assertTrue(result["weather_ok"])
         self.assertIn("geometry_too_few_matches", result["rejection_reasons"])
 
-    def test_concentrated_inlier_evidence_is_rejected(self):
-        result = self.verify(raw_result(concentrated=True))
-        self.assertEqual(result["source_inlier_coverage"]["grid_coverage"], 1 / 16)
-        self.assertIn("geometry_source_inlier_coverage_below_minimum", result["rejection_reasons"])
+    def test_default_match_threshold_is_16_and_includes_boundary(self):
+        self.assertEqual(QUALITY_DEFAULTS["min_matches"], 16)
+        for matches in (16, 32, 63, 64):
+            with self.subTest(matches=matches):
+                result = self.verify(raw_result(matches=matches, inliers=matches))
+                self.assertTrue(result["geometry_ok"])
+                self.assertTrue(result["passed"])
+                self.assertNotIn("geometry_too_few_matches", result["rejection_reasons"])
+
+    def test_match_threshold_can_still_be_overridden_explicitly(self):
+        result = self.verify(raw_result(matches=32, inliers=32), thresholds={"min_matches": 64})
+        self.assertIn("geometry_too_few_matches", result["rejection_reasons"])
+        self.assertEqual(QUALITY_DEFAULTS["min_matches"], 16)
+
+    def test_concentrated_matches_can_pass_without_spatial_statistics(self):
+        result = self.verify(raw_result(matches=16, inliers=16, concentrated=True))
+        self.assertTrue(result["geometry_ok"])
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["rejection_reasons"], [])
+        self.assertNotIn("coverage", json.dumps(result))
 
     def test_near_identity_h_boundary_is_closed_and_scales_with_resolution(self):
         self.assertTrue(self.verify(raw_result(displacement=16))["geometry_ok"])
@@ -171,9 +187,14 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(QUALITY_DEFAULTS["min_s_geo"], 0.78)
         self.assertEqual(verifier.definition["s_div_policy"], "descriptive only; no minimum cosine distance")
 
+    def test_new_policy_has_no_spatial_statistics_configuration(self):
+        definition = quality_definition()
+        self.assertEqual(definition["version"], 2)
+        self.assertNotIn("coverage", json.dumps(definition))
+
     def test_invalid_settings_rejected_before_loading_models(self):
         for thresholds in ({"unknown": 1}, {"min_s_geo": float("nan")}, {"min_matches": True},
-                           {"min_matches": 3}, {"min_source_inlier_grid_coverage": 1.1},
+                           {"min_matches": 3},
                            {"max_H_grid_median_px_at_512": -1},
                            {"weather_thresholds": {"clear": {"min_shift": 0}}},
                            {"weather_thresholds": {"rain": {"confidence": 1}}}):
