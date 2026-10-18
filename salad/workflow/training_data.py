@@ -21,6 +21,7 @@ least one real image and never samples the same path twice within that sample.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import random
@@ -38,6 +39,290 @@ class PlaceImages:
     synthetic_paths: list[Path] = field(default_factory=list)
     synthetic_by_source: dict[Path, dict[str, list[Path]]] = field(default_factory=dict)
     source_by_synthetic_path: dict[Path, Path] = field(default_factory=dict)
+    condition_by_synthetic_path: dict[Path, str] = field(default_factory=dict)
+
+
+def _sampling_seed(*parts: Any) -> int:
+    """Process-independent seed; never use Python's salted hash()."""
+    payload = json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest(), "big")
+
+
+def coverage_pk_indices(n: int, k: int, *, seed: int, city: str,
+                        place_id: int, epoch: int) -> list[int]:
+    """Return epoch's K unique indices into a stable, complete real pool.
+
+    Concatenate N-element permutations and read slots [epoch*K, (epoch+1)*K).
+    At a boundary inside a group, move the previous tail's identities behind
+    the next permutation's other identities. This prevents within-group
+    duplicates WITHOUT discarding any entries of either permutation.
+
+    Repairs depend only on the previous permutation. Every lcm(N,K) slots the
+    permutation and group boundaries align, so reconstruction starts there:
+    at most K/gcd(N,K) preceding cycles, independent of epoch/resume history.
+    No queue, worker state, global RNG, or history of actual visits is used.
+    """
+    if not 1 <= k <= n or epoch < 0:
+        raise ValueError("coverage_pk requires 1 <= K <= pool size and epoch >= 0")
+    start, stop = epoch * k, (epoch + 1) * k
+    first_cycle, last_cycle = start // n, (stop - 1) // n
+    cycles_per_alignment = k // math.gcd(n, k)
+    aligned_cycle = first_cycle // cycles_per_alignment * cycles_per_alignment
+    previous: list[int] = []
+    selected = []
+    for cycle in range(aligned_cycle, last_cycle + 1):
+        permutation = list(range(n))
+        random.Random(_sampling_seed("coverage_pk_v1", seed, city, place_id, cycle)).shuffle(permutation)
+        tail_size = cycle * n % k
+        if tail_size:
+            blocked = set(previous[-tail_size:])
+            permutation = ([i for i in permutation if i not in blocked]
+                           + [i for i in permutation if i in blocked])
+        if cycle >= first_cycle:
+            left, right = max(0, start - cycle * n), min(n, stop - cycle * n)
+            selected.extend(permutation[left:right])
+        previous = permutation
+    return selected
+
+
+class CoveragePlaceBatchSampler:
+    """One visit/place/epoch, with epoch carried in every worker's item key.
+
+    A final singleton borrows a place from the preceding batch. With P=2 it
+    merges instead (one batch of three), retaining metric-learning negatives.
+    Explicit keys also work with persistent workers; set_epoch on a parent
+    dataset alone would not update their copies.
+    """
+
+    def __init__(self, num_places: int, batch_size: int, seed: int) -> None:
+        if num_places < 2 or batch_size < 2:
+            raise ValueError("Coverage batches require at least two places")
+        self.num_places, self.batch_size, self.seed = num_places, batch_size, seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("epoch must be nonnegative (zero-based)")
+        self.epoch = epoch
+
+    def __iter__(self):
+        epoch = self.epoch
+        indices = list(range(self.num_places))
+        random.Random(_sampling_seed("coverage_places_v1", self.seed, epoch)).shuffle(indices)
+        batches = [indices[i:i + self.batch_size] for i in range(0, len(indices), self.batch_size)]
+        if len(batches[-1]) == 1:
+            if len(batches[-2]) > 2:
+                batches[-1].insert(0, batches[-2].pop())
+            else:
+                tail = batches.pop()
+                batches[-1].extend(tail)
+        for batch in batches:
+            yield [(epoch, index) for index in batch]
+
+    def __len__(self) -> int:
+        count = (self.num_places + self.batch_size - 1) // self.batch_size
+        return count - int(self.batch_size == 2 and self.num_places > 2 and self.num_places % 2 == 1)
+
+
+class SamplingCoverage:
+    """Main-process accounting of consumed metric images, never prefetched data.
+
+    Synthetic slots and auxiliary real companions are excluded. Accounting
+    state is checkpointed, but never feeds back into sampling decisions.
+    """
+
+    def __init__(self, dataset, *, since_epoch: int = 0, state: dict | None = None):
+        self.places = dataset.places
+        self.pool_sizes = [len(place.real_paths) for place in self.places]
+        self.total_real_images = sum(self.pool_sizes)
+        digest = hashlib.sha256()
+        for place in self.places:
+            digest.update(json.dumps([place.city, place.place_id, [p.name for p in place.real_paths]],
+                                     ensure_ascii=False).encode("utf-8") + b"\n")
+        self.pool_digest = digest.hexdigest()
+        self.seen = [bytearray(size) for size in self.pool_sizes]
+        self.visits = [0] * len(self.places)
+        self.exposures = self.unique = 0
+        self.since_epoch = since_epoch
+        if state is not None:
+            if state.get("version") != 1 or state.get("pool_digest") != self.pool_digest:
+                raise ValueError("Sampling coverage checkpoint does not match the real image pools")
+            self.seen = [bytearray(bits) for bits in state["seen"]]
+            self.visits = list(state["visits"])
+            self.exposures, self.unique = state["exposures"], state["unique"]
+            self.since_epoch = state["since_epoch"]
+            if [len(bits) for bits in self.seen] != self.pool_sizes or len(self.visits) != len(self.places):
+                raise ValueError("Invalid sampling coverage checkpoint dimensions")
+        self.begin_epoch()
+
+    def begin_epoch(self) -> None:
+        self.epoch_seen: set[tuple[int, int]] = set()
+        self.epoch_visits = [0] * len(self.places)
+        self.epoch_exposures = self.epoch_new = 0
+
+    def update(self, metadata) -> None:
+        for place_index, indices in zip(metadata["place_index"].tolist(), metadata["real_indices"].tolist()):
+            self.visits[place_index] += 1
+            self.epoch_visits[place_index] += 1
+            for index in indices:
+                if index < 0:  # Synthetic image, not a real exposure.
+                    continue
+                self.exposures += 1
+                self.epoch_exposures += 1
+                self.epoch_seen.add((place_index, index))
+                if not self.seen[place_index][index]:
+                    self.seen[place_index][index] = 1
+                    self.unique += 1
+                    self.epoch_new += 1
+
+    def summary(self) -> dict:
+        return {
+            "statistics_since_epoch": self.since_epoch + 1,
+            "eligible_real_images": self.total_real_images,
+            "epoch_real_exposures": self.epoch_exposures,
+            "epoch_unique_real_images": len(self.epoch_seen),
+            "epoch_new_real_images": self.epoch_new,
+            "epoch_repeated_real_exposures": self.epoch_exposures - len(self.epoch_seen),
+            "epoch_previously_seen_real_exposures": self.epoch_exposures - self.epoch_new,
+            "cumulative_real_exposures": self.exposures,
+            "cumulative_unique_real_images": self.unique,
+            "cumulative_real_coverage": self.unique / self.total_real_images,
+            "cumulative_repeated_real_exposures": self.exposures - self.unique,
+            "epoch_place_visits": sum(self.epoch_visits),
+            "epoch_unique_places": sum(count > 0 for count in self.epoch_visits),
+        }
+
+    def place_statistics(self) -> list[dict]:
+        epoch_total, total = sum(self.epoch_visits), sum(self.visits)
+        return [
+            {"city": place.city, "place_id": place.place_id,
+             "epoch_visits": self.epoch_visits[i], "cumulative_visits": self.visits[i],
+             "epoch_sampling_frequency": self.epoch_visits[i] / epoch_total if epoch_total else 0.0,
+             "cumulative_sampling_frequency": self.visits[i] / total if total else 0.0}
+            for i, place in enumerate(self.places)
+        ]
+
+    def state_dict(self) -> dict:
+        return {"version": 1, "pool_digest": self.pool_digest,
+                "seen": [bytes(bits) for bits in self.seen], "visits": list(self.visits),
+                "exposures": self.exposures, "unique": self.unique, "since_epoch": self.since_epoch}
+
+
+class SyntheticAuxSampler:
+    """At most one exact-source synthetic query per current main-batch place.
+
+    Selection and image augmentation use a private, checkpointed RNG. There is
+    no fallback to a source outside the K real images and no extra source decode.
+    ``source_indices`` index the flattened P*K main image tensor.
+    """
+
+    def __init__(self, dataset, exposure_prob: float, seed: int):
+        if not math.isfinite(exposure_prob) or not 0 <= exposure_prob <= 1:
+            raise ValueError("synthetic exposure probability must be in [0, 1]")
+        self.dataset = dataset
+        self.exposure_prob = exposure_prob
+        self.rng = random.Random(_sampling_seed("synthetic_aux_v1", seed))
+        self.begin_epoch()
+
+    def begin_epoch(self):
+        self.counts = dict(main_places=0, places_with_synthetic=0, eligible_places=0,
+                           main_real_images=0, available_sources=0, triggered_places=0)
+        self.conditions: dict[str, int] = {}
+
+    def state_dict(self):
+        return {"version": 1, "rng": self.rng.getstate()}
+
+    def load_state_dict(self, state):
+        if state.get("version") != 1:
+            raise ValueError("Unsupported synthetic auxiliary sampler checkpoint")
+        self.rng.setstate(state["rng"])
+
+    def _read_image(self, path):
+        import numpy as np
+        import torch
+        from PIL import Image, ImageEnhance, ImageOps
+
+        height, width = self.dataset.image_size
+        try:
+            with Image.open(path) as original:
+                image = original.convert("RGB").resize((width, height), Image.Resampling.BILINEAR)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Cannot decode auxiliary synthetic image {path}: {exc}") from exc
+        if self.dataset.augment:
+            if self.rng.random() < 0.5:
+                image = ImageOps.mirror(image)
+            if self.rng.random() < 0.5:
+                for enhancement in (ImageEnhance.Brightness, ImageEnhance.Contrast, ImageEnhance.Color):
+                    image = enhancement(image).enhance(self.rng.uniform(0.8, 1.2))
+        pixels = np.asarray(image, dtype=np.float32).copy() / 255.0
+        tensor = torch.from_numpy(pixels).permute(2, 0, 1)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        return (tensor - mean) / std
+
+    def sample(self, metadata):
+        import torch
+
+        groups: dict[int, list[tuple[int, Path]]] = {}
+        flat_index = 0
+        for place_index, indices in zip(metadata["place_index"].tolist(), metadata["real_indices"].tolist()):
+            place = self.dataset.places[place_index]
+            candidates = groups.setdefault(place_index, [])
+            for index in indices:
+                if index < 0:
+                    raise ValueError("Synthetic auxiliary training requires an entirely real main batch")
+                source = place.real_paths[index]
+                self.counts["main_real_images"] += 1
+                if source in place.synthetic_by_source:
+                    candidates.append((flat_index, source))
+                    self.counts["available_sources"] += 1
+                flat_index += 1
+        images, labels, source_indices = [], [], []
+        synthetic_paths, source_paths, conditions = [], [], []
+        for place_index, candidates in groups.items():
+            place = self.dataset.places[place_index]
+            self.counts["main_places"] += 1
+            self.counts["places_with_synthetic"] += bool(place.synthetic_paths)
+            self.counts["eligible_places"] += bool(candidates)
+            if not candidates or self.exposure_prob == 0:
+                continue
+            if self.rng.random() >= self.exposure_prob:
+                continue
+            source_index, source = self.rng.choice(candidates)
+            domains = place.synthetic_by_source[source]
+            domain = self.rng.choice(sorted(domains))
+            output = self.rng.choice(domains[domain])
+            # Manifest loader has validated this exact source relation.
+            if place.source_by_synthetic_path[output] != source:
+                raise ValueError("Auxiliary synthetic image has a conflicting exact source")
+            condition = place.condition_by_synthetic_path.get(output, "unknown")
+            images.append(self._read_image(output))
+            labels.append(place.label)
+            source_indices.append(source_index)
+            synthetic_paths.append(str(output))
+            source_paths.append(str(source))
+            conditions.append(condition)
+            self.conditions[condition] = self.conditions.get(condition, 0) + 1
+            self.counts["triggered_places"] += 1
+        return {
+            "synthetic_images": torch.stack(images) if images else torch.empty((0, 3, *self.dataset.image_size)),
+            "synthetic_labels": torch.tensor(labels, dtype=torch.long),
+            "source_indices": torch.tensor(source_indices, dtype=torch.long),
+            "synthetic_paths": synthetic_paths, "source_paths": source_paths,
+            "condition": conditions, "pair_valid": torch.ones(len(images), dtype=torch.bool),
+        }
+
+    def summary(self):
+        c = self.counts
+        def ratio(n, d):
+            return n / d if d else 0.0
+        return {**c, "exposure_probability": self.exposure_prob,
+                "actual_trigger_rate": ratio(c["triggered_places"], c["eligible_places"]),
+                "trigger_rate_all_places": ratio(c["triggered_places"], c["main_places"]),
+                "available_source_fraction": ratio(c["available_sources"], c["main_real_images"]),
+                "eligible_place_fraction": ratio(c["eligible_places"], c["main_places"]),
+                "synthetic_fraction_observed": ratio(c["triggered_places"], c["main_real_images"] + c["triggered_places"]),
+                "condition_exposure": dict(self.conditions)}
 
 
 def _required_path(value: Any, *, location: str, field_name: str) -> Path:
@@ -129,6 +414,13 @@ class MixedGSVCitiesDataset:
     PyTorch DataLoader seeds Python's random module in each worker. Seeding
     ``random`` in the main process also makes direct sampling reproducible.
     Heavy image/tensor imports happen only when an item is read.
+
+    ``coverage_pk`` selects K real source identities from the COMPLETE pool,
+    using zero-based epoch, seed, city and place_id. Existing synthetic mix or
+    replacement rules then apply; actual real exposure can therefore be < K.
+    ``(epoch, index)`` keys carry epoch to workers; direct callers can instead
+    use ``set_epoch``. Optional sampling metadata is appended AFTER all normal
+    outputs and identifies only real images actually used in the metric batch.
     """
 
     def __init__(
@@ -144,6 +436,9 @@ class MixedGSVCitiesDataset:
         synthetic_mode: str = "mix",
         reliability_pairs: bool = False,
         reliability_target_cache: Path | None = None,
+        real_sampling: str = "random_pk",
+        seed: int = 42,
+        return_sampling_metadata: bool = False,
     ) -> None:
         if images_per_place < 2:
             raise ValueError("images_per_place must be >= 2 to supply positive pairs")
@@ -153,6 +448,8 @@ class MixedGSVCitiesDataset:
             raise ValueError("synthetic_fraction must be between 0 and 1")
         if synthetic_mode not in {"mix", "replace"}:
             raise ValueError("synthetic_mode must be 'mix' or 'replace'")
+        if real_sampling not in {"random_pk", "coverage_pk"}:
+            raise ValueError("real_sampling must be 'random_pk' or 'coverage_pk'")
         if not isinstance(reliability_pairs, bool):
             raise ValueError("reliability_pairs must be a bool")
         if reliability_target_cache is not None and (not reliability_pairs or augment):
@@ -164,6 +461,10 @@ class MixedGSVCitiesDataset:
         self.min_images_per_place = min_images_per_place
         self.synthetic_fraction = synthetic_fraction
         self.synthetic_mode = synthetic_mode
+        self.real_sampling = real_sampling
+        self.seed = seed
+        self.epoch = 0
+        self.return_sampling_metadata = return_sampling_metadata
         self.image_size = tuple(image_size)
         self.augment = augment
         self.reliability_pairs = reliability_pairs
@@ -217,6 +518,9 @@ class MixedGSVCitiesDataset:
         for key in sorted(groups):
             place = groups[key]
             if len(place.real_paths) >= min_images_per_place:
+                if real_sampling == "coverage_pk":
+                    # Stable across CSV row order and relocation; retain all N views.
+                    place.real_paths.sort(key=lambda path: path.name)
                 place.label = len(self.places)
                 self.places.append(place)
         if not self.places:
@@ -239,6 +543,9 @@ class MixedGSVCitiesDataset:
             "synthetic_fraction": synthetic_fraction,
             "image_size": list(self.image_size),
         }
+        if real_sampling == "coverage_pk":
+            self.summary.update(real_sampling=real_sampling, sampling_seed=seed,
+                                coverage_algorithm="permutation_boundary_repair_v1")
         if synthetic_mode == "replace":
             self.summary.update({
                 "synthetic_mode": "replace",
@@ -346,37 +653,64 @@ class MixedGSVCitiesDataset:
                 groups[key].synthetic_paths.append(output)
                 groups[key].synthetic_by_source.setdefault(source, {}).setdefault(domain, []).append(output)
                 groups[key].source_by_synthetic_path[output] = source
+                groups[key].condition_by_synthetic_path[output] = (
+                    condition.strip() if isinstance(condition, str) and condition.strip() else "unknown")
 
     def __len__(self) -> int:
         return len(self.places)
 
-    def __getitem__(self, index: int):
-        import numpy as np
-        import torch
-        from PIL import Image, ImageEnhance, ImageOps
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("epoch must be nonnegative (zero-based)")
+        self.epoch = epoch
 
+    def sample_paths(self, index: int, *, epoch: int | None = None) -> list[tuple[Path, bool]]:
+        """Select paths without decoding images; random_pk keeps its original RNG calls."""
+        epoch = self.epoch if epoch is None else epoch
         place = self.places[index]
         k = self.images_per_place
+        rng = random
+        sources = None
+        if self.real_sampling == "coverage_pk":
+            sources = [place.real_paths[i] for i in coverage_pk_indices(
+                len(place.real_paths), k, seed=self.seed, city=place.city,
+                place_id=place.place_id, epoch=epoch)]
+            rng = random.Random(_sampling_seed("coverage_variants_v1", self.seed, place.city,
+                                               place.place_id, epoch, k))
         if self.synthetic_mode == "replace":
-            sources = random.sample(place.real_paths, k)
+            sources = sources if sources is not None else rng.sample(place.real_paths, k)
             selected = []
             for source in sources:
                 domains = place.synthetic_by_source.get(source)
-                if domains and random.random() < self.synthetic_fraction:
-                    domain = random.choice(sorted(domains))
-                    selected.append((random.choice(domains[domain]), True))
+                if domains and rng.random() < self.synthetic_fraction:
+                    domain = rng.choice(sorted(domains))
+                    selected.append((rng.choice(domains[domain]), True))
                 else:
                     selected.append((source, False))
             if all(is_synthetic for _, is_synthetic in selected):
-                retained = random.randrange(k)
+                retained = rng.randrange(k)
                 selected[retained] = (sources[retained], False)
         else:
             num_synthetic = min(
                 math.floor(k * self.synthetic_fraction), len(place.synthetic_paths), k - 1,
             )
-            selected = [(path, False) for path in random.sample(place.real_paths, k - num_synthetic)]
-            selected.extend((path, True) for path in random.sample(place.synthetic_paths, num_synthetic))
-        random.shuffle(selected)
+            real = sources[:k - num_synthetic] if sources is not None else rng.sample(place.real_paths, k - num_synthetic)
+            selected = [(path, False) for path in real]
+            selected.extend((path, True) for path in rng.sample(place.synthetic_paths, num_synthetic))
+        rng.shuffle(selected)
+        return selected
+
+    def __getitem__(self, index: int | tuple[int, int]):
+        import numpy as np
+        import torch
+        from PIL import Image, ImageEnhance, ImageOps
+
+        epoch = self.epoch
+        if isinstance(index, tuple):
+            epoch, index = index
+        place = self.places[index]
+        k = self.images_per_place
+        selected = self.sample_paths(index, epoch=epoch)
         tensors = []
         kinds = []
         companions = []
@@ -439,6 +773,12 @@ class MixedGSVCitiesDataset:
         )
         if self.reliability_pairs:
             if self.reliability_target_cache is not None:
-                return (*result, torch.stack(cached_targets), torch.stack(cached_confidence))
-            return (*result, torch.stack(companions), torch.tensor(pair_valid, dtype=torch.bool))
+                result = (*result, torch.stack(cached_targets), torch.stack(cached_confidence))
+            else:
+                result = (*result, torch.stack(companions), torch.tensor(pair_valid, dtype=torch.bool))
+        if self.return_sampling_metadata:
+            real_indices = {path: i for i, path in enumerate(place.real_paths)}
+            result = (*result, {"place_index": index, "real_indices": torch.tensor(
+                [-1 if is_synthetic else real_indices[path] for path, is_synthetic in selected],
+                dtype=torch.long)})
         return result

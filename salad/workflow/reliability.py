@@ -89,8 +89,11 @@ def build_local_targets(source_features: torch.Tensor, generated_features: torch
         raise ValueError("paired feature grids must be on the same device")
     if isinstance(search_radius, bool) or not isinstance(search_radius, int) or search_radius < 1:
         raise ValueError("search_radius must be an integer >= 1")
-    if not isinstance(alignment_tolerance, int) or not 0 <= alignment_tolerance < search_radius:
-        raise ValueError("alignment_tolerance must be an integer in [0, search_radius)")
+    if (type(alignment_tolerance) is not int
+            or not 0 <= alignment_tolerance <= search_radius):
+        raise ValueError("alignment_tolerance must be an integer in [0, search_radius]")
+    # Inclusive: radius=1 is a 3x3 search tolerating one patch in either axis.
+    # At equality there is no farther candidate, hence no displacement negative.
     if any(size < 1 for size in source_features.shape):
         raise ValueError("feature dimensions must be non-empty")
     with torch.autocast(device_type=source_features.device.type, enabled=False):

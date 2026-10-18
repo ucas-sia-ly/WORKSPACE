@@ -73,8 +73,8 @@ def get_matching_probs(S, dustbin_score = 1.0, num_iters=3, reg=1.0):
         num_iters=num_iters,
         reg=reg
     )
-    # log_P : [B_size, m+1, n+1]
-    # log_P 是 Sinkhorn 算法的输出，形状为[B, num_clusters + 1, num_clusters + 1]
+    # log_P: [B, m+1, n]. After undoing norm, each patch has unit mass;
+    # target row masses are 1 per cluster and n-m for the dustbin.
     return log_P - norm
 
 
@@ -234,6 +234,9 @@ class SALAD(nn.Module):
 
         Returns:
             f (torch.Tensor): The global descriptor [B, m*l + g]
+            With return_aux=True, also return backbone features [B,C,H,W],
+            projected content [B,l,H*W], pre-OT scores [B,m,H*W], and full
+            log assignments [B,m+1,H*W]. These retain student gradients.
         """
         x, t = x # Extract features and token
         # 右边的x是一个tuple，包含两个元素：f和t。f是局部特征张量，t是全局场景token张量。
@@ -242,6 +245,10 @@ class SALAD(nn.Module):
         # flatten(2)将张量展平为二维张量，保留前两个维度不变，第三个维度被展平为一个维度。
         # 维度变化为[B, cluster_dim, H*W]，其中H和W是输入特征图的高度和宽度。
         p = self.score(x).flatten(2)
+        # Keep references only when requested; never recompute either branch,
+        # change its dropout draws, or detach student features.
+        if return_aux:
+            content_features, score_logits = f, p
         t = self.token_features(t)# 维度变化为[B, token_dim]=[B,256]
 
         # Sinkhorn algorithm. The original branch deliberately retains its
@@ -259,10 +266,12 @@ class SALAD(nn.Module):
                 p = get_matching_probs(p.float(), dustbin_score, 3)
         else:
             p = get_matching_probs(p, self.dust_bin, 3)
-        # p是匹配概率矩阵，形状为[B, num_clusters, num_clusters]。
+        if return_aux:
+            log_assignment = p
+        # Full assignment includes the dustbin: [B, num_clusters + 1, H*W].
         p = torch.exp(p)
         dustbin_probability = p[:, -1, :]
-        # p 是 Sinkhorn 算法的输出，形状为[B, num_clusters, num_clusters]。
+        # Removing the final row leaves [B, num_clusters, H*W].
         p = p[:, :-1, :]
         keep_probability = p.sum(dim=1)
         # 去掉 dustbin 的概率，只保留 cluster 的概率。
@@ -281,6 +290,10 @@ class SALAD(nn.Module):
                 descriptor = nn.functional.normalize(descriptor, p=2, dim=-1)
             if return_aux:
                 return descriptor, {
+                    "backbone_local_features": x,
+                    "content_features": content_features,
+                    "score_logits": score_logits,
+                    "log_assignment": log_assignment,
                     "reliability_logits": reliability_logits,
                     "reliability": reliability,
                     "local_features": x,
@@ -308,6 +321,10 @@ class SALAD(nn.Module):
         descriptor = nn.functional.normalize(f, p=2, dim=-1)
         if return_aux:
             return descriptor, {
+                "backbone_local_features": x,
+                "content_features": content_features,
+                "score_logits": score_logits,
+                "log_assignment": log_assignment,
                 "local_features": x,
                 "assignment_dustbin": dustbin_probability,
                 "assignment_keep": keep_probability,

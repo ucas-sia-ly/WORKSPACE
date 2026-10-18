@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -240,6 +242,184 @@ def load_checkpoint_model(checkpoint: Path, device: str, backbone_repo: Path | N
                        backbone_weights=backbone_weights)
     model.load_state_dict(state, strict=True)
     return model.to(device).eval()
+
+
+def input_preprocessing(image_size):
+    """The training loader's RGB/PIL resize/ImageNet normalization contract."""
+    return {"version": "rgb_bilinear_imagenet_v1", "image_size": list(image_size),
+            "color_space": "RGB", "input_range": [0.0, 1.0],
+            "resize": "PIL_bilinear", "mean": [0.485, 0.456, 0.406],
+            "std": [0.229, 0.224, 0.225]}
+
+
+def validate_teacher_compatibility(student_config, teacher_config, teacher_preprocessing):
+    """Fail before any forward when feature/assignment semantics do not align."""
+    validate_model_config(student_config)
+    validate_model_config(teacher_config)
+    if student_config["backbone_arch"] != teacher_config["backbone_arch"]:
+        raise ValueError("Teacher/student backbone architectures differ")
+    for key in ("num_channels", "num_clusters", "cluster_dim", "token_dim"):
+        if student_config["agg_config"][key] != teacher_config["agg_config"][key]:
+            raise ValueError(f"Teacher/student {key} differs")
+    for key, default in (("norm_layer", True), ("return_token", True)):
+        if student_config["backbone_config"].get(key, default) != teacher_config["backbone_config"].get(key, default):
+            raise ValueError(f"Teacher/student backbone {key} differs")
+    if teacher_preprocessing != input_preprocessing(student_config["image_size"]):
+        raise ValueError("Teacher/student input preprocessing or image_size differs")
+    if list(teacher_config["image_size"]) != teacher_preprocessing["image_size"]:
+        raise ValueError("Teacher checkpoint preprocessing and model image_size disagree")
+
+
+class FrozenSALADTeacher(nn.Module):
+    """Strictly loaded, trained SALAD targets; never a random-aggregator fallback.
+
+    Training provenance must include a positive global_step in a full workflow
+    or Lightning checkpoint. Raw tensor dictionaries cannot establish whether
+    an aggregator was trained, so they remain supported by the student loader
+    but are deliberately rejected here. Metadata is provenance, not a claim
+    that arbitrary tensor values can prove successful training.
+    """
+
+    def __init__(self, checkpoint: Path, student_config, *, device="cpu", backbone_repo=None):
+        super().__init__()
+        path = Path(checkpoint).expanduser().resolve()
+        # Hash and load the same open file, even if another training process
+        # atomically replaces checkpoint.pt while we initialize this teacher.
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+            handle.seek(0)
+            payload = torch.load(handle, map_location="cpu", weights_only=True)
+        if (not isinstance(payload, dict) or "state_dict" not in payload or type(payload.get("global_step")) is not int
+                or payload["global_step"] <= 0):
+            raise ValueError("Teacher requires a full trained SALAD checkpoint with state_dict and positive global_step; "
+                             "random initialization or metadata-free raw weights are not a teacher")
+        try:
+            state, config = checkpoint_state_and_config(payload)
+        except (KeyError, AttributeError, TypeError) as exc:
+            raise ValueError("Teacher checkpoint must contain a complete SALAD backbone and aggregator") from exc
+        hparams = payload.get("hyper_parameters", {})
+        training_config = payload.get("training_config", {})
+        if not isinstance(hparams, dict) or not isinstance(training_config, dict):
+            raise ValueError("Teacher training metadata must contain dictionaries")
+        config.setdefault("image_size", [224, 224])
+        if payload.get("model_config") is None and "image_size" in hparams:
+            size = hparams["image_size"]
+            config["image_size"] = [size, size] if isinstance(size, int) else list(size)
+        preprocessing_records = [container["image_preprocessing"] for container in (
+            payload, training_config, hparams) if "image_preprocessing" in container]
+        if any(record != preprocessing_records[0] for record in preprocessing_records):
+            raise ValueError("Teacher checkpoint contains conflicting preprocessing records")
+        preprocessing = preprocessing_records[0] if preprocessing_records else None
+        preprocessing_source = "checkpoint"
+        if preprocessing is None:
+            # Existing workflow/Lightning SALAD checkpoints use this convention.
+            # Preserve compatibility, while explicitly recording this inference.
+            preprocessing = input_preprocessing(config["image_size"])
+            preprocessing_source = "legacy_salad_rgb_bilinear_imagenet_convention"
+        validate_teacher_compatibility(student_config, config, preprocessing)
+        if torch.device(device).type == "cpu":
+            os.environ["XFORMERS_DISABLED"] = "1"
+        # Construction initializes modules before strict loading. Isolate those
+        # temporary random draws so adding a teacher cannot change the student.
+        with torch.random.fork_rng(devices=[]):
+            self.model = SALADModel(config, pretrained_backbone=False, backbone_repo=backbone_repo)
+            self.model.load_state_dict(state, strict=True)
+        self.model.to(device)
+        self.requires_grad_(False)
+        self.eval()
+        self.provenance = {
+            "checkpoint": str(path), "checkpoint_sha256": digest.hexdigest(),
+            "checkpoint_global_step": payload["global_step"],
+            "model_config": copy.deepcopy(config), "image_preprocessing": preprocessing,
+            "preprocessing_source": preprocessing_source, "precision": "32",
+            "targets": "online_real_main_images", "distillation_loss": None,
+        }
+        self.oom_retries = 0
+
+    def train(self, mode=True):
+        # Remain in eval even when a parent module is switched to train mode.
+        return super().train(False)
+
+    def requires_grad_(self, requires_grad=True):
+        return super().requires_grad_(False)
+
+    @torch.no_grad()
+    def forward(self, images, return_aux=True):
+        self.eval()
+        if images.ndim != 4 or images.shape[1] != 3:
+            raise ValueError("Teacher input must be normalized RGB [B,3,H,W]")
+        if list(images.shape[-2:]) != self.provenance["image_preprocessing"]["image_size"]:
+            raise ValueError("Teacher input shape differs from its checked preprocessing contract")
+        # Target features/log assignments are FP32 even inside student AMP.
+        with torch.autocast(device_type=images.device.type, enabled=False):
+            return self.model(images.float(), return_aux=return_aux)
+
+    def iter_targets(self, images, batch_size=0):
+        """Stream (start_index, descriptor, aux) without concatenating GPU targets.
+
+        Zero tries the entire batch first. On a CUDA forward OOM, halve the
+        chunk and retry; a failed single-image forward is reported explicitly.
+        Callers must consume/release each result to bound target memory.
+        """
+        if type(batch_size) is not int or batch_size < 0:
+            raise ValueError("teacher batch_size must be a nonnegative integer")
+        size = min(batch_size or len(images), len(images))
+        start = 0
+        while start < len(images):
+            try:
+                descriptor, aux = self(images[start:start + size], return_aux=True)
+            except torch.cuda.OutOfMemoryError as exc:
+                if size <= 1:
+                    raise RuntimeError("Teacher CUDA OOM with one image; reduce image size/student batch or free GPU memory") from exc
+                size = max(1, size // 2)
+                self.oom_retries += 1
+                if images.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                continue
+            yield start, descriptor, aux
+            start += len(descriptor)
+            del descriptor, aux
+
+
+def profile_teacher_targets(teacher, images, batch_size=0):
+    """Stage 2A interface probe: generate then release targets, add no loss.
+
+    CUDA peaks are PROCESS allocator peaks over this teacher interval (including
+    resident student/teacher/input tensors), not device-wide memory or an
+    estimated constant. Timing includes target validation and synchronization.
+    """
+    device = images.device
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        baseline = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    else:
+        baseline = None
+    started = time.perf_counter()
+    before_retries = teacher.oom_retries
+    chunks = largest = count = 0
+    feature_shapes = {}
+    for _, descriptor, aux in teacher.iter_targets(images, batch_size):
+        if not torch.isfinite(descriptor).all() or any(not torch.isfinite(value).all() for value in aux.values()):
+            raise RuntimeError("Nonfinite online teacher targets")
+        count += len(descriptor)
+        largest = max(largest, len(descriptor))
+        chunks += 1
+        feature_shapes = {name: list(value.shape[1:]) for name, value in aux.items()}
+        del descriptor, aux
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return {
+        "images": count, "chunks": chunks, "largest_chunk": largest,
+        "seconds": time.perf_counter() - started,
+        "cuda_baseline_allocated_bytes": baseline,
+        "cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+        "cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved(device) if device.type == "cuda" else None,
+        "oom_retries": teacher.oom_retries - before_retries,
+        "feature_shapes_per_image": feature_shapes,
+    }
 
 
 def atomic_save_checkpoint(payload, path: Path):

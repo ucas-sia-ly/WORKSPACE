@@ -22,11 +22,19 @@ def parse_args(argv=None):
     parser.add_argument("--epochs", type=int, default=50, help="Total epochs, including epochs in --resume")
     parser.add_argument("--batch-size", type=int, default=32, help="Places per batch; image batch is places x images-per-place")
     parser.add_argument("--images-per-place", type=int, default=4)
+    parser.add_argument("--real-sampling", choices=["random_pk", "coverage_pk"], default="random_pk",
+                        help="random_pk: original sampling; coverage_pk: stateless epoch-based coverage of full real pools")
     parser.add_argument("--min-images-per-place", type=int, default=4)
     parser.add_argument("--synthetic-fraction", type=float, default=0.5,
                         help="mix: target synthetic slots; replace: probability of replacing each selected source view")
     parser.add_argument("--synthetic-mode", choices=["mix", "replace"], default="mix",
                         help="replace preserves the original sampler's source identities and substitutes exact-source variants")
+    parser.add_argument("--synthetic-aux", action="store_true",
+                        help="CCR-VPR Stage 1: all-real main batch plus at most one exact-source synthetic query per place")
+    parser.add_argument("--synthetic-exposure-prob", type=float, default=0.5,
+                        help="Per-eligible-place auxiliary trigger probability, not a synthetic image fraction")
+    parser.add_argument("--synthetic-global-weight", type=float, default=0.1)
+    parser.add_argument("--synthetic-global-temperature", type=float, default=0.1)
     parser.add_argument("--synthetic-places-only", action="store_true",
                         help="Train only eligible places with at least one accepted synthetic view")
     parser.add_argument("--cities", nargs="+", help="CSV city names; default all Dataframes/*.csv")
@@ -37,6 +45,10 @@ def parse_args(argv=None):
     parser.add_argument("--aggregator", choices=["salad"], default="salad")
     parser.add_argument("--init-policy", choices=["random_aggregator_pretrained_backbone"],
                         default="random_aggregator_pretrained_backbone")
+    parser.add_argument("--teacher-checkpoint", type=Path,
+                        help="Full trained SALAD checkpoint (positive global_step) for frozen online targets; no distillation loss in Stage 2A")
+    parser.add_argument("--teacher-batch-size", type=int, default=0,
+                        help="Online teacher chunk size; 0 tries the full real batch, CUDA OOM halves the chunk automatically")
     parser.add_argument("--num-trainable-blocks", type=int, default=4)
     parser.add_argument("--num-clusters", type=int, default=64)
     parser.add_argument("--cluster-dim", type=int, default=128)
@@ -90,12 +102,24 @@ def parse_args(argv=None):
         parser.error("--batch-size must be >= 2 places for metric-learning negatives")
     if args.num_workers < 0 or args.max_batches_per_epoch < 0:
         parser.error("Worker and batch limits cannot be negative")
+    if args.teacher_batch_size < 0:
+        parser.error("--teacher-batch-size cannot be negative")
+    if args.teacher_batch_size and args.teacher_checkpoint is None:
+        parser.error("--teacher-batch-size requires --teacher-checkpoint")
     if args.learning_rate <= 0 or args.weight_decay < 0 or args.miner_margin < 0:
         parser.error("Learning rate must be positive; weight decay/miner margin cannot be negative")
     if args.synthetic_places_only and args.synthetic_manifest is None:
         parser.error("--synthetic-places-only requires --synthetic-manifest")
     if args.synthetic_mode == "replace" and args.synthetic_manifest is None:
         parser.error("--synthetic-mode replace requires --synthetic-manifest")
+    if not math.isfinite(args.synthetic_exposure_prob) or not 0 <= args.synthetic_exposure_prob <= 1:
+        parser.error("--synthetic-exposure-prob must be finite and in [0,1]")
+    if not math.isfinite(args.synthetic_global_weight) or args.synthetic_global_weight < 0:
+        parser.error("--synthetic-global-weight must be finite and nonnegative")
+    if not math.isfinite(args.synthetic_global_temperature) or args.synthetic_global_temperature < 1.1754943508222875e-38:
+        parser.error("--synthetic-global-temperature must be finite and positive in FP32")
+    if args.synthetic_aux and (args.reliability_ot or args.synthetic_mode != "mix"):
+        parser.error("CCR-VPR Stage 1 requires --synthetic-mode mix and no --reliability-ot; its main batch is all-real")
     if args.init_checkpoint and args.backbone_weights:
         parser.error("--init-checkpoint contains backbone weights; omit --backbone-weights")
     for name in ("reliability_loss_weight", "reliability_real_prior_weight", "reliability_coverage_weight"):
@@ -214,7 +238,7 @@ def filter_synthetic_places(dataset):
     })
 
 
-def resolved_training_config(args, model_config, initialization=None):
+def resolved_training_config(args, model_config, initialization=None, teacher=None):
     dataframes = args.real_data.expanduser().resolve() / "Dataframes"
     metadata = [dataframes / f"{city}.csv" for city in sorted(args.cities)] if args.cities else sorted(dataframes.glob("*.csv"))
     if args.synthetic_manifest:
@@ -230,8 +254,9 @@ def resolved_training_config(args, model_config, initialization=None):
         "synthetic_manifest": str(args.synthetic_manifest.expanduser().resolve()) if args.synthetic_manifest else None,
         "cities": sorted(args.cities) if args.cities else None,
         "images_per_place": args.images_per_place,
+        "real_sampling": args.real_sampling,
         "min_images_per_place": args.min_images_per_place,
-        "synthetic_fraction": args.synthetic_fraction,
+        "synthetic_fraction": 0.0 if args.synthetic_aux else args.synthetic_fraction,
         "synthetic_mode": args.synthetic_mode,
         "synthetic_places_only": args.synthetic_places_only,
         "batch_size": args.batch_size,
@@ -246,6 +271,18 @@ def resolved_training_config(args, model_config, initialization=None):
         "model_config": model_config,
         **(initialization or {"init_checkpoint": None, "init_checkpoint_sha256": None}),
     }
+    if teacher is not None:
+        config["teacher"] = {**copy.deepcopy(teacher.provenance), "batch_size": args.teacher_batch_size}
+    if args.synthetic_aux:
+        config["synthetic_aux"] = {
+            "version": 1, "exposure_prob": args.synthetic_exposure_prob,
+            "global_weight": args.synthetic_global_weight,
+            "global_temperature": args.synthetic_global_temperature,
+            "loss": "asymmetric_multi_positive_infonce",
+            "reference": "detached_current_real_batch",
+            "source_policy": "exact_current_batch_source_only",
+            "rng": "independent_checkpointed_python_v1",
+        }
     if args.reliability_ot:
         config["reliability"] = {
             "loss_weight": args.reliability_loss_weight,
@@ -277,8 +314,10 @@ def train(args):
     from torch.utils.data import DataLoader
 
     from workflow.metric_loss import multi_similarity_loss
-    from workflow.model import SALADModel, atomic_save_checkpoint, load_model_state, read_checkpoint
-    from workflow.training_data import MixedGSVCitiesDataset
+    from workflow.model import (SALADModel, FrozenSALADTeacher, atomic_save_checkpoint,
+                                input_preprocessing, load_model_state, profile_teacher_targets, read_checkpoint)
+    from workflow.training_data import CoveragePlaceBatchSampler, MixedGSVCitiesDataset, SamplingCoverage, SyntheticAuxSampler
+    from workflow.synthetic_losses import asymmetric_multi_positive_infonce
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -292,8 +331,9 @@ def train(args):
     dataset = MixedGSVCitiesDataset(
         real_data=args.real_data, synthetic_manifest=args.synthetic_manifest, cities=args.cities,
         images_per_place=args.images_per_place, min_images_per_place=args.min_images_per_place,
-        synthetic_fraction=args.synthetic_fraction, image_size=tuple(args.image_size),
+        synthetic_fraction=0.0 if args.synthetic_aux else args.synthetic_fraction, image_size=tuple(args.image_size),
         augment=not args.no_augment, synthetic_mode=args.synthetic_mode,
+        real_sampling=args.real_sampling, seed=args.seed, return_sampling_metadata=True,
         **({"reliability_pairs": True} if args.reliability_ot else {}),
         **({"reliability_target_cache": args.reliability_target_cache} if args.reliability_target_cache else {}),
     )
@@ -301,6 +341,7 @@ def train(args):
         args.reliability_cache_integrity = dataset.reliability_target_cache.integrity_digest
     if args.synthetic_places_only:
         filter_synthetic_places(dataset)
+    aux_sampler = SyntheticAuxSampler(dataset, args.synthetic_exposure_prob, args.seed) if args.synthetic_aux else None
     if len(dataset) < 2:
         raise ValueError("Need at least two eligible places for metric-learning positives and negatives")
     print(json.dumps(dataset.summary, indent=2, ensure_ascii=False), flush=True)
@@ -324,10 +365,16 @@ def train(args):
     if not args.resume and (args.output_dir / "checkpoint.pt").exists():
         raise FileExistsError("Output directory already has checkpoint.pt; use --resume or a new output directory")
 
-    training_config = resolved_training_config(args, model_config, initialization)
+    teacher = (FrozenSALADTeacher(args.teacher_checkpoint, model_config, device=device,
+                                 backbone_repo=args.backbone_repo) if args.teacher_checkpoint else None)
+    training_config = resolved_training_config(args, model_config, initialization, teacher)
     if resume is not None:
         saved_training_config = {"synthetic_places_only": False, "synthetic_mode": "mix", "init_checkpoint": None,
-                                 "init_checkpoint_sha256": None, **resume["training_config"]}
+                                 "init_checkpoint_sha256": None, "real_sampling": "random_pk", **resume["training_config"]}
+        if args.real_sampling == "coverage_pk":
+            # Image identities and place order are worker-independent. Random
+            # augmentations/model numerics need not be identical across workers.
+            saved_training_config["num_workers"] = args.num_workers
         if saved_training_config != training_config:
             raise ValueError("Resume data/model/optimizer options must match the saved training_config")
         if resume["dataset_summary"] != dataset.summary:
@@ -374,12 +421,26 @@ def train(args):
         np.random.set_state((np_state[0], np.asarray(np_state[1], dtype=np.uint32), *np_state[2:]))
         if device.type == "cuda" and resume["rng_state"].get("cuda"):
             torch.cuda.set_rng_state_all(resume["rng_state"]["cuda"])
+        if aux_sampler is not None:
+            if "synthetic_aux" not in resume["rng_state"]:
+                raise ValueError("Auxiliary resume checkpoint is missing its independent sampler RNG")
+            aux_sampler.load_state_dict(resume["rng_state"]["synthetic_aux"])
 
     batch_size = min(args.batch_size, len(dataset))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                        drop_last=len(dataset) % batch_size == 1,
-                        num_workers=args.num_workers, pin_memory=device.type == "cuda",
-                        generator=generator, worker_init_fn=seed_worker)
+    coverage_state = resume.get("sampling_coverage") if resume is not None else None
+    coverage = SamplingCoverage(dataset, since_epoch=start_epoch, state=coverage_state)
+    if resume is not None and coverage_state is None:
+        print(f"Checkpoint has no historical sampling statistics; coverage accounting starts at epoch {start_epoch + 1}.",
+              flush=True)
+    place_batch_sampler = None
+    loader_options = dict(num_workers=args.num_workers, pin_memory=device.type == "cuda",
+                          generator=generator, worker_init_fn=seed_worker)
+    if args.real_sampling == "coverage_pk":
+        place_batch_sampler = CoveragePlaceBatchSampler(len(dataset), batch_size, args.seed)
+        loader = DataLoader(dataset, batch_sampler=place_batch_sampler, **loader_options)
+    else:
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                            drop_last=len(dataset) % batch_size == 1, **loader_options)
     run_config = {**training_config, "epochs": args.epochs, "seed": args.seed,
                   "device": str(device), "precision": precision, "effective_batch_size": batch_size,
                   "init_policy": "pretrained_salad_checkpoint" if initialization["init_checkpoint"] else args.init_policy,
@@ -390,16 +451,28 @@ def train(args):
     (args.output_dir / "data_summary.json").write_text(json.dumps(dataset.summary, indent=2), encoding="utf-8")
     print(f"Device={device}, precision={precision}; batch={batch_size} places x {args.images_per_place} images", flush=True)
     log_path = args.output_dir / "training_log.jsonl"
+    sampling_log_path = args.output_dir / "sampling_coverage.jsonl"
     for epoch in range(start_epoch, args.epochs):
         started = time.monotonic()
+        dataset.set_epoch(epoch)
+        if place_batch_sampler is not None:
+            place_batch_sampler.set_epoch(epoch)
+        coverage.begin_epoch()
+        if aux_sampler is not None:
+            aux_sampler.begin_epoch()
         model.train()
         loss_sum = 0.0
+        real_loss_sum = aux_loss_sum = 0.0
+        aux_steps = 0
         real_exposure = synthetic_exposure = steps = 0
         reliability_sums = {}
+        teacher_statistics = None
         paired_exposure = 0
         for batch_index, batch in enumerate(loader):
             if args.max_batches_per_epoch and batch_index >= args.max_batches_per_epoch:
                 break
+            sampling_metadata = batch[-1]
+            batch = batch[:-1]
             if args.reliability_ot:
                 images, labels, synthetic, paired_data, paired_info = batch
                 cached_targets = cached_confidence = None
@@ -418,6 +491,21 @@ def train(args):
             images = images.flatten(0, 1).to(device, non_blocking=True)
             labels = labels.flatten().to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
+            if teacher is not None:
+                # Stage 2A probes the online real-image target interface only.
+                # Consume chunks immediately; no teacher feature or OT loss yet.
+                teacher_images = images if not bool(synthetic.any()) else images[~synthetic.flatten().to(device)]
+                report = profile_teacher_targets(teacher, teacher_images, args.teacher_batch_size)
+                del teacher_images
+                if teacher_statistics is None:
+                    teacher_statistics = report
+                else:
+                    for key in ("images", "chunks", "seconds", "oom_retries"):
+                        teacher_statistics[key] += report[key]
+                    for key in ("largest_chunk", "cuda_baseline_allocated_bytes",
+                                "cuda_peak_allocated_bytes", "cuda_peak_reserved_bytes"):
+                        if report[key] is not None:
+                            teacher_statistics[key] = max(teacher_statistics[key], report[key])
             dtype = torch.float16 if precision == "16" else torch.bfloat16
             with torch.autocast(device_type=device.type, dtype=dtype, enabled=precision != "32"):
                 if args.reliability_ot:
@@ -468,16 +556,43 @@ def train(args):
                     loss = multi_similarity_loss(descriptors, labels, epsilon=args.miner_margin)
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Nonfinite loss at epoch={epoch + 1}, batch={batch_index}")
+            loss_value = float(loss.detach())
             scaler.scale(loss).backward()
+            if aux_sampler is not None:
+                real_loss_sum += loss_value
+                # No retain_graph: free main activations before the auxiliary forward.
+                references, reference_labels = descriptors.detach(), labels.detach()
+                del loss, descriptors, images
+                aux_batch = aux_sampler.sample(sampling_metadata)
+                if len(aux_batch["synthetic_images"]):
+                    query_images = aux_batch["synthetic_images"].to(device, non_blocking=True)
+                    with torch.autocast(device_type=device.type, dtype=dtype, enabled=precision != "32"):
+                        queries = model(query_images)
+                    aux_loss = asymmetric_multi_positive_infonce(
+                        queries, aux_batch["synthetic_labels"].to(device), references, reference_labels,
+                        temperature=args.synthetic_global_temperature,
+                        pair_valid=aux_batch["pair_valid"].to(device))
+                    weighted_aux_loss = args.synthetic_global_weight * aux_loss
+                    if not torch.isfinite(weighted_aux_loss):
+                        optimizer.zero_grad(set_to_none=True)
+                        raise RuntimeError(f"Nonfinite synthetic loss at epoch={epoch + 1}, batch={batch_index}")
+                    scaler.scale(weighted_aux_loss).backward()
+                    aux_loss_sum += float(aux_loss.detach())
+                    loss_value += float(weighted_aux_loss.detach())
+                    aux_steps += 1
+                    del queries, aux_loss, weighted_aux_loss, query_images
+                del references, reference_labels, aux_batch
+            # One unscale/clip/step/update for the accumulated real + query gradients.
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0,
                                           error_if_nonfinite=not scaler.is_enabled())
             scaler.step(optimizer)
             scaler.update()
+            coverage.update(sampling_metadata)
             synthetic_count = int(synthetic.sum())
             synthetic_exposure += synthetic_count
             real_exposure += synthetic.numel() - synthetic_count
-            loss_sum += float(loss.detach())
+            loss_sum += loss_value
             if args.reliability_ot:
                 values = {"metric_loss": metric_loss.detach(),
                           "spatial_reliability_std": auxiliary["reliability"].flatten(1).std(dim=1, correction=0).mean().detach(),
@@ -495,7 +610,19 @@ def train(args):
                "synthetic_exposure": synthetic_exposure,
                "synthetic_fraction_observed": synthetic_exposure / (real_exposure + synthetic_exposure),
                "learning_rate_next_epoch": optimizer.param_groups[0]["lr"],
-               "seconds": time.monotonic() - started}
+               "seconds": time.monotonic() - started,
+               "sampling": coverage.summary()}
+        if teacher_statistics is not None:
+            row["teacher"] = {**teacher_statistics,
+                              "seconds_per_image": teacher_statistics["seconds"] / teacher_statistics["images"],
+                              "mode": "online_targets_only_no_distillation"}
+        if aux_sampler is not None:
+            row["synthetic_aux"] = {
+                **aux_sampler.summary(), "loss_real": real_loss_sum / steps,
+                "loss_syn_per_step": aux_loss_sum / steps,
+                "loss_syn_nonempty": aux_loss_sum / aux_steps if aux_steps else 0.0,
+                "nonempty_batches": aux_steps, "global_weight": args.synthetic_global_weight,
+            }
         if args.reliability_ot:
             counts = ("positive_patches", "negative_patches", "unknown_patches")
             all_counts = (*counts, "corruption_negative_patches")
@@ -514,16 +641,24 @@ def train(args):
             "scaler_state_dict": scaler.state_dict(), "epoch": epoch + 1, "global_step": global_step,
             "total_epochs": args.epochs, "precision": precision, "training_config": training_config,
             "dataset_summary": dataset.summary, "metrics": row,
+            "image_preprocessing": input_preprocessing(args.image_size),
+            "sampling_coverage": coverage.state_dict(),
             "rng_state": {"python": random.getstate(), "torch": torch.get_rng_state(),
                           "numpy": (np_state[0], np_state[1].tolist(), *np_state[2:]),
                           "loader": generator.get_state(),
                           "cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else []},
         }
+        if aux_sampler is not None:
+            checkpoint["rng_state"]["synthetic_aux"] = aux_sampler.state_dict()
         atomic_save_checkpoint(checkpoint, args.output_dir / "checkpoint.pt")
         if (epoch + 1) % args.save_every == 0 or epoch + 1 == args.epochs:
             atomic_save_checkpoint(checkpoint, args.output_dir / f"checkpoint_epoch_{epoch + 1:03d}.pt")
         with log_path.open("a", encoding="utf-8") as log:
             log.write(json.dumps(row) + "\n")
+        with sampling_log_path.open("a", encoding="utf-8") as log:
+            log.write(json.dumps({"epoch": epoch + 1, "real_sampling": args.real_sampling,
+                                  **coverage.summary(), "places": coverage.place_statistics()},
+                                 ensure_ascii=False) + "\n")
         print(json.dumps(row), flush=True)
     print(f"Checkpoint: {args.output_dir / 'checkpoint.pt'}", flush=True)
 
