@@ -35,6 +35,18 @@ def parse_args(argv=None):
                         help="Per-eligible-place auxiliary trigger probability, not a synthetic image fraction")
     parser.add_argument("--synthetic-global-weight", type=float, default=0.1)
     parser.add_argument("--synthetic-global-temperature", type=float, default=0.1)
+    parser.add_argument("--feature-distill-weight", type=float, default=0.0)
+    parser.add_argument("--score-distill-weight", type=float, default=0.0)
+    parser.add_argument("--ot-distill-weight", type=float, default=0.0)
+    parser.add_argument("--pair-confidence-mode", choices=["uniform", "verified"], default="uniform",
+                        help="Same Stage 2B A correspondences: uniform q=1 or verified soft positive_conf")
+    parser.add_argument("--pair-calibration", type=Path,
+                        help="Stage 2B calibration JSON for this teacher and preprocessing; required by local losses")
+    parser.add_argument("--pair-calibration-index", type=int, default=0)
+    parser.add_argument("--pair-geometry-cache", type=Path,
+                        help="Optional Stage 2B geometry-only cache; missing pairs use teacher structural evidence")
+    parser.add_argument("--ot-min-teacher-keep", type=float, default=1.1920928955078125e-7,
+                        help="Exclude numerically negligible teacher cluster mass from conditional OT; default FP32 epsilon")
     parser.add_argument("--synthetic-places-only", action="store_true",
                         help="Train only eligible places with at least one accepted synthetic view")
     parser.add_argument("--cities", nargs="+", help="CSV city names; default all Dataframes/*.csv")
@@ -46,7 +58,7 @@ def parse_args(argv=None):
     parser.add_argument("--init-policy", choices=["random_aggregator_pretrained_backbone"],
                         default="random_aggregator_pretrained_backbone")
     parser.add_argument("--teacher-checkpoint", type=Path,
-                        help="Full trained SALAD checkpoint (positive global_step) for frozen online targets; no distillation loss in Stage 2A")
+                        help="Full trained SALAD checkpoint (positive global_step) for frozen online targets")
     parser.add_argument("--teacher-batch-size", type=int, default=0,
                         help="Online teacher chunk size; 0 tries the full real batch, CUDA OOM halves the chunk automatically")
     parser.add_argument("--num-trainable-blocks", type=int, default=4)
@@ -73,6 +85,10 @@ def parse_args(argv=None):
                         help="Maximum extra real-image forwards per batch when corruption supervision is enabled")
     parser.add_argument("--reliability-head-lr", type=float,
                         help="Learning rate for the new head; otherwise --learning-rate")
+    parser.add_argument("--reliability-generated-weight", type=float, default=0.0,
+                        help="Stage 3 tri-state BCE on fixed-resize generated pairs; requires calibrated teacher evidence")
+    parser.add_argument("--reliability-generated-occlusion-weight", type=float, default=0.0,
+                        help="Explicit controlled occlusion copies of generated views, separately reported proxy negatives")
     parser.add_argument("--reliability-loss-weight", type=float, default=0.1)
     parser.add_argument("--reliability-real-prior-weight", type=float, default=0.01)
     parser.add_argument("--reliability-coverage-weight", type=float, default=0.1)
@@ -92,6 +108,8 @@ def parse_args(argv=None):
                                 help="Fine-tune complete SALAD weights (raw, Lightning, or this entry point's checkpoint), with a fresh optimizer")
     parser.add_argument("--save-every", type=int, default=1, help="Keep a numbered checkpoint every N epochs")
     parser.add_argument("--max-batches-per-epoch", type=int, default=0, help="0 means all batches; positive for a small smoke run")
+    parser.add_argument("--profile-training", action="store_true",
+                        help="Synchronize CUDA and log per-step compute time/allocator peaks; local distillation enables this automatically")
     parser.add_argument("--no-augment", action="store_true", help="Disable training image augmentation")
     parser.add_argument("--check-data", action="store_true", help="Check metadata/manifest without loading DINOv2 or training")
     args = parser.parse_args(argv)
@@ -118,8 +136,25 @@ def parse_args(argv=None):
         parser.error("--synthetic-global-weight must be finite and nonnegative")
     if not math.isfinite(args.synthetic_global_temperature) or args.synthetic_global_temperature < 1.1754943508222875e-38:
         parser.error("--synthetic-global-temperature must be finite and positive in FP32")
-    if args.synthetic_aux and (args.reliability_ot or args.synthetic_mode != "mix"):
-        parser.error("CCR-VPR Stage 1 requires --synthetic-mode mix and no --reliability-ot; its main batch is all-real")
+    if args.synthetic_aux and args.synthetic_mode != "mix":
+        parser.error("CCR-VPR auxiliary training requires --synthetic-mode mix; its main batch is all-real")
+    for name in ("feature_distill_weight", "score_distill_weight", "ot_distill_weight"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
+            parser.error(f"--{name.replace('_', '-')} must be finite and nonnegative")
+    if args.pair_calibration_index < 0:
+        parser.error("--pair-calibration-index cannot be negative")
+    if not math.isfinite(args.ot_min_teacher_keep) or not 0 <= args.ot_min_teacher_keep < 1:
+        parser.error("--ot-min-teacher-keep must be finite in [0,1)")
+    for name in ("reliability_generated_weight", "reliability_generated_occlusion_weight"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
+            parser.error(f"--{name.replace('_', '-')} must be finite and nonnegative")
+        if getattr(args, name) > 0 and not args.reliability_ot:
+            parser.error("Generated reliability supervision requires --reliability-ot")
+    if pair_supervision_enabled(args):
+        if not args.synthetic_aux or not args.teacher_checkpoint or not args.pair_calibration:
+            parser.error("Local distillation requires --synthetic-aux, --teacher-checkpoint and --pair-calibration")
+        if args.feature_distill_weight > 0 and args.num_trainable_blocks < 1:
+            parser.error("Feature distillation requires at least one trainable backbone block")
     if args.init_checkpoint and args.backbone_weights:
         parser.error("--init-checkpoint contains backbone weights; omit --backbone-weights")
     for name in ("reliability_loss_weight", "reliability_real_prior_weight", "reliability_coverage_weight"):
@@ -150,6 +185,16 @@ def parse_args(argv=None):
         if min(args.image_size) < 56:
             parser.error("Local geometry corruption requires at least a 4x4 DINO patch grid")
     return args
+
+
+def local_distillation_enabled(args):
+    return any(getattr(args, name) > 0 for name in
+               ("feature_distill_weight", "score_distill_weight", "ot_distill_weight"))
+
+
+def pair_supervision_enabled(args):
+    return (local_distillation_enabled(args) or args.reliability_generated_weight > 0
+            or args.reliability_generated_occlusion_weight > 0)
 
 
 def seed_worker(worker_id):
@@ -213,7 +258,8 @@ def resolve_model_initialization(args, resume=None):
                 aggregator[option] = requested
         if aggregator.get("reliability_mode", "learned") == "fixed" and any(weight != 0 for weight in (
                 args.reliability_loss_weight, args.reliability_real_prior_weight,
-                args.reliability_coverage_weight, args.reliability_corruption_weight)):
+                args.reliability_coverage_weight, args.reliability_corruption_weight,
+                args.reliability_generated_weight, args.reliability_generated_occlusion_weight)):
             raise ValueError("Fixed reliability mode requires all auxiliary loss weights to be zero")
     validate_model_config(config)
     return config, state, provenance
@@ -238,7 +284,7 @@ def filter_synthetic_places(dataset):
     })
 
 
-def resolved_training_config(args, model_config, initialization=None, teacher=None):
+def resolved_training_config(args, model_config, initialization=None, teacher=None, local_supervisor=None):
     dataframes = args.real_data.expanduser().resolve() / "Dataframes"
     metadata = [dataframes / f"{city}.csv" for city in sorted(args.cities)] if args.cities else sorted(dataframes.glob("*.csv"))
     if args.synthetic_manifest:
@@ -273,6 +319,10 @@ def resolved_training_config(args, model_config, initialization=None, teacher=No
     }
     if teacher is not None:
         config["teacher"] = {**copy.deepcopy(teacher.provenance), "batch_size": args.teacher_batch_size}
+    if local_supervisor is not None:
+        config["local_distillation"] = copy.deepcopy(local_supervisor.provenance)
+        config["teacher"].update(targets="online_fixed_resize_source_and_generated",
+                                 distillation_loss="independent_feature_score_conditional_ot")
     if args.synthetic_aux:
         config["synthetic_aux"] = {
             "version": 1, "exposure_prob": args.synthetic_exposure_prob,
@@ -305,6 +355,13 @@ def resolved_training_config(args, model_config, initialization=None, teacher=No
                 "method": "real_only_local_copy_paste_v1",
                 "rng": "independent_per_step_generator_v1",
             }
+        if args.reliability_generated_weight > 0 or args.reliability_generated_occlusion_weight > 0:
+            config["reliability"]["generated_supervision"] = dict(
+                version=1, weight=args.reliability_generated_weight,
+                occlusion_weight=args.reliability_generated_occlusion_weight,
+                positives="stage2b_A_positive_conf", negatives="explicit_manifest_masks_only",
+                unknown="zero_direct_supervision", controlled_occlusion="separate_copy_2x2_patch_rectangle",
+                occlusion_rng="independent_per_step_pair_v1")
     return config
 
 
@@ -367,7 +424,11 @@ def train(args):
 
     teacher = (FrozenSALADTeacher(args.teacher_checkpoint, model_config, device=device,
                                  backbone_repo=args.backbone_repo) if args.teacher_checkpoint else None)
-    training_config = resolved_training_config(args, model_config, initialization, teacher)
+    local_supervisor = None
+    if pair_supervision_enabled(args):
+        from workflow.local_distillation import LocalDistillationSupervisor
+        local_supervisor = LocalDistillationSupervisor(teacher, dataset, args)
+    training_config = resolved_training_config(args, model_config, initialization, teacher, local_supervisor)
     if resume is not None:
         saved_training_config = {"synthetic_places_only": False, "synthetic_mode": "mix", "init_checkpoint": None,
                                  "init_checkpoint_sha256": None, "real_sampling": "random_pk", **resume["training_config"]}
@@ -467,6 +528,11 @@ def train(args):
         real_exposure = synthetic_exposure = steps = 0
         reliability_sums = {}
         teacher_statistics = None
+        local_sums = {}
+        runtime_sums = {}
+        profiling = local_supervisor is not None or args.profile_training
+        local_weights = dict(feature=args.feature_distill_weight, score=args.score_distill_weight,
+                             ot=args.ot_distill_weight)
         paired_exposure = 0
         for batch_index, batch in enumerate(loader):
             if args.max_batches_per_epoch and batch_index >= args.max_batches_per_epoch:
@@ -490,8 +556,13 @@ def train(args):
                 images, labels, synthetic = batch
             images = images.flatten(0, 1).to(device, non_blocking=True)
             labels = labels.flatten().to(device, non_blocking=True)
+            if profiling:
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                    torch.cuda.reset_peak_memory_stats(device)
+                step_started = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
-            if teacher is not None:
+            if teacher is not None and local_supervisor is None:
                 # Stage 2A probes the online real-image target interface only.
                 # Consume chunks immediately; no teacher feature or OT loss yet.
                 teacher_images = images if not bool(synthetic.any()) else images[~synthetic.flatten().to(device)]
@@ -559,7 +630,7 @@ def train(args):
             loss_value = float(loss.detach())
             scaler.scale(loss).backward()
             if aux_sampler is not None:
-                real_loss_sum += loss_value
+                real_loss_sum += float(metric_loss.detach()) if args.reliability_ot else loss_value
                 # No retain_graph: free main activations before the auxiliary forward.
                 references, reference_labels = descriptors.detach(), labels.detach()
                 del loss, descriptors, images
@@ -581,13 +652,33 @@ def train(args):
                     loss_value += float(weighted_aux_loss.detach())
                     aux_steps += 1
                     del queries, aux_loss, weighted_aux_loss, query_images
+                if local_supervisor is not None:
+                    try:
+                        prepared, totals, local_stats = local_supervisor.prepare(aux_batch)
+                        local_metrics = local_supervisor.backward(model, prepared, totals, scaler,
+                                                                  precision, local_weights, global_step=global_step)
+                    except (RuntimeError, ValueError):
+                        optimizer.zero_grad(set_to_none=True)
+                        raise
+                    loss_value += local_metrics["weighted_total"]
+                    for key, value in {**local_stats, **local_metrics}.items():
+                        local_sums[key] = local_sums.get(key, 0.) + value
+                    del prepared, totals, local_stats, local_metrics
                 del references, reference_labels, aux_batch
-            # One unscale/clip/step/update for the accumulated real + query gradients.
+            # One unscale/clip/step/update for real, query, local and head gradients.
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0,
                                           error_if_nonfinite=not scaler.is_enabled())
             scaler.step(optimizer)
             scaler.update()
+            if profiling:
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                    runtime_sums["gpu_peak_allocated_bytes"] = max(runtime_sums.get("gpu_peak_allocated_bytes", 0),
+                                                                 torch.cuda.max_memory_allocated(device))
+                    runtime_sums["gpu_peak_reserved_bytes"] = max(runtime_sums.get("gpu_peak_reserved_bytes", 0),
+                                                                torch.cuda.max_memory_reserved(device))
+                runtime_sums["step_seconds"] = runtime_sums.get("step_seconds", 0.) + time.perf_counter() - step_started
             coverage.update(sampling_metadata)
             synthetic_count = int(synthetic.sum())
             synthetic_exposure += synthetic_count
@@ -623,6 +714,26 @@ def train(args):
                 "loss_syn_nonempty": aux_loss_sum / aux_steps if aux_steps else 0.0,
                 "nonempty_batches": aux_steps, "global_weight": args.synthetic_global_weight,
             }
+        if local_supervisor is not None:
+            counts = ("pairs", "patches", "positive_a_patches", "excluded_b_patches", "geometry_cache_hits",
+                      "feature_patches", "score_patches", "ot_patches", "low_teacher_keep_patches",
+                      "gpu_peak_allocated_bytes", "gpu_peak_reserved_bytes")
+            row["local_distillation"] = {k: v if k in counts else v / steps for k, v in local_sums.items()
+                                          if not k.startswith(("generated_region_", "occluded_region_"))}
+            if args.reliability_ot:
+                from workflow.reliability import summarize_reliability_regions
+                for prefix, name in (("generated_region_", "generated_reliability"),
+                                     ("occluded_region_", "controlled_generated_occlusion")):
+                    statistics = {k[len(prefix):]: v for k, v in local_sums.items() if k.startswith(prefix)}
+                    if statistics:
+                        row[name] = summarize_reliability_regions(statistics)
+            for key in ("positive_a", "feature", "score", "ot"):
+                row["local_distillation"][key + "_fraction"] = local_sums.get(key + "_patches", 0) / max(1, local_sums.get("patches", 0))
+            row["local_distillation"].update(confidence_mode=args.pair_confidence_mode,
+                                             positive_policy="stage2b_A_only", weights=local_weights)
+        if profiling:
+            row["runtime"] = {**runtime_sums, "step_seconds": runtime_sums["step_seconds"] / steps,
+                              "timing_scope": "after_main_input_transfer_through_scaler_update"}
         if args.reliability_ot:
             counts = ("positive_patches", "negative_patches", "unknown_patches")
             all_counts = (*counts, "corruption_negative_patches")

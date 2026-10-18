@@ -1,10 +1,11 @@
-"""Conservative structural weak supervision for SALAD's reliability head.
+"""Explicit Stage 3 evidence and legacy V1/V2 reliability supervision.
 
 Only training needs a same-view real companion. Relative local self-similarity
 provides evidence about spatial consistency, rather than treating a weather
 appearance change or low cross-image feature cosine as a generation error.
-Ambiguous regions have zero supervision weight. The detached teacher shares
-the existing DINO backbone; it is neither an extra model nor an inference input.
+Ambiguous regions have zero supervision weight. The legacy detached teacher shares
+the existing DINO backbone; Stage 3 instead consumes frozen, calibrated pair
+evidence through tristate_reliability_loss. Neither needs pairs at inference.
 """
 
 from __future__ import annotations
@@ -13,6 +14,73 @@ import math
 
 import torch
 import torch.nn.functional as F
+
+
+def tristate_reliability_loss(logits, positive_conf, negative_conf):
+    """Independent evidence-weighted positive/negative BCE; unknown has no loss.
+
+    Negative confidence MUST come from explicit damage evidence, never 1-q.
+    Conflicting evidence is rejected rather than silently converted to a label.
+    Returns class numerators/masses so microbatches can be reduced exactly.
+    """
+    with torch.autocast(device_type=logits.device.type, enabled=False):
+        logits = logits.float()
+        positive, negative = positive_conf.detach().float(), negative_conf.detach().float()
+        if (logits.ndim != 4 or logits.shape[1] != 1 or positive.shape != logits.shape
+                or negative.shape != logits.shape or positive.device != logits.device
+                or negative.device != logits.device):
+            raise ValueError("Tri-state grids must share [B,1,H,W] shape and device")
+        if not torch.isfinite(logits).all():
+            raise ValueError("Nonfinite reliability logits")
+        for q in (positive, negative):
+            if not torch.isfinite(q).all() or (q < 0).any() or (q > 1).any():
+                raise ValueError("Reliability evidence must be finite in [0,1]")
+        if ((positive > 0) & (negative > 0)).any():
+            raise ValueError("Positive and negative evidence overlap")
+        # Reuse V2's soft endpoints, not an inverse-confidence pseudo-label.
+        pos = (F.binary_cross_entropy_with_logits(logits, torch.full_like(logits, .95),
+                                                reduction="none") * positive).sum()
+        neg = (F.binary_cross_entropy_with_logits(logits, torch.full_like(logits, .05),
+                                                reduction="none") * negative).sum()
+        pm, nm = positive.sum(), negative.sum()
+        loss = (pos / (pm + 1e-8) + neg / (nm + 1e-8)) / ((pm > 0).float() + (nm > 0).float()).clamp_min(1)
+        if not torch.isfinite(loss):
+            raise RuntimeError("Nonfinite tri-state reliability loss")
+        return dict(loss=loss, positive_numerator=pos, negative_numerator=neg,
+                    positive_mass=pm, negative_mass=nm)
+
+
+@torch.no_grad()
+def reliability_region_statistics(logits, positive_conf, negative_conf, assignment_dustbin):
+    """Additive counts/sums, so absent negative evidence is not reported as r=0."""
+    reliability = logits.detach().float().sigmoid()
+    dustbin = assignment_dustbin.detach().float().reshape_as(reliability)
+    if not torch.isfinite(reliability).all() or not torch.isfinite(dustbin).all():
+        raise ValueError("Nonfinite reliability diagnostics")
+    p, n = positive_conf.detach() > 0, negative_conf.detach() > 0
+    result = dict(images=float(len(logits)), patches=float(logits.numel()),
+                  unknown_count=float((~(p | n)).sum()),
+                  spatial_std_sum=float(reliability.flatten(1).std(1, correction=0).sum()),
+                  dustbin_mass_sum=float(dustbin.sum()))
+    for name, mask in (("positive", p), ("negative", n)):
+        result[name + "_count"] = float(mask.sum())
+        result[name + "_reliability_sum"] = float(reliability[mask].sum())
+        result[name + "_dustbin_sum"] = float(dustbin[mask].sum())
+    return result
+
+
+def summarize_reliability_regions(statistics):
+    result = dict(statistics)
+    for name in ("positive", "negative"):
+        count = statistics.get(name + "_count", 0)
+        for value in ("reliability", "dustbin"):
+            result[name + "_mean_" + value] = statistics.get(name + "_" + value + "_sum", 0) / count if count else None
+    patches, images = statistics.get("patches", 0), statistics.get("images", 0)
+    result["unknown_fraction"] = statistics.get("unknown_count", 0) / patches if patches else None
+    result["spatial_reliability_std"] = statistics.get("spatial_std_sum", 0) / images if images else None
+    p, n = result["positive_mean_dustbin"], result["negative_mean_dustbin"]
+    result["negative_minus_positive_dustbin"] = n - p if n is not None and p is not None else None
+    return result
 
 
 _NEIGHBORS = tuple((dy * radius, dx * radius) for radius in (1, 2)

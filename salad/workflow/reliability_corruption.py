@@ -1,13 +1,42 @@
 """Known geometric damage for reliability training, independent of weather.
 
-These copies are an auxiliary task on real views. They never replace metric
-images, create generated-image labels, or use an additional feature model.
+The original V2 copy-paste task uses real views. Stage 3 separately offers
+explicit generated-view occlusion copies. Neither replaces metric images or
+infers labels on original generated pixels from weather/appearance similarity.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+
+
+def make_generated_occlusions(images, *, patch_size=14, generator=None):
+    """Explicit Stage 3 proxy task: cover one patch-aligned 2x2 rectangle.
+
+    Zero is ImageNet-normalized mean color, not a darkness classifier. Only
+    changed pixels in this deliberately written rectangle establish negatives.
+    Original generated images and their labels remain untouched. No inference
+    about natural Qwen errors is made. The caller supplies an independent RNG.
+    """
+    if (images.ndim != 4 or not images.is_floating_point() or patch_size < 1
+            or any(n % patch_size for n in images.shape[-2:])):
+        raise ValueError("Occlusions require floating patch-aligned images")
+    if not torch.isfinite(images).all():
+        raise ValueError("Occlusion inputs must be finite")
+    h, w = (n // patch_size for n in images.shape[-2:])
+    if min(h, w) < 2:
+        raise ValueError("Occlusions need at least a 2x2 grid")
+    altered = images.detach().clone()
+    mask = torch.zeros((len(images), 1, h, w), dtype=torch.bool, device=images.device)
+    for b in range(len(images)):
+        y = int(torch.randint(h - 1, (), device=images.device, generator=generator))
+        x = int(torch.randint(w - 1, (), device=images.device, generator=generator))
+        region = altered[b, :, y*patch_size:(y+2)*patch_size, x*patch_size:(x+2)*patch_size]
+        changed = region.ne(0).reshape(images.shape[1], 2, patch_size, 2, patch_size).any((0, 2, 4))
+        region.zero_()
+        mask[b, 0, y:y+2, x:x+2] = changed
+    return altered, mask
 
 
 def make_local_corruptions(images: torch.Tensor, is_synthetic: torch.Tensor, *,
