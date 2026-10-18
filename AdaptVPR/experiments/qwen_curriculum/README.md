@@ -1,37 +1,57 @@
 # Qwen 困难样本增广
 
-**当前入口：全部23城市，不限制困难源图总数。** [mine_all_cities.py](mine_all_cities.py)复用已有四城7277张，逐城筛选其余19城的全部合格困难源图；[v2_campaign.py](v2_campaign.py)保留原计划和图片，按最新代码审核并接续生成；[finetune_all_cities.py](finetune_all_cities.py)使用全部23城真实数据与各城审核通过图，微调原始预训练SALAD并自动测试六域SVOX。完整命令、磁盘预估及恢复方式见 [ALL_23_CITIES.md](ALL_23_CITIES.md)。
+当前任务覆盖全部 23 个 GSV-Cities 城市，使用 Qwen 生成困难域图片，再以当前审核通过的图片微调原始 SALAD，最后测试六域 SVOX。完整操作见 [ALL_23_CITIES.md](ALL_23_CITIES.md)，暂停和恢复见 [RESUME.md](RESUME.md)。
 
-**当前审核规则 v2：** 最少匹配点数为16，移除空间覆盖率门限，保留内点率、homography 位移及天气审核。[v2_campaign.py](v2_campaign.py)将已有图片和诊断数据迁入独立的 `generation_23city_v2`，旧配置、图片和账本保留，新结果明确记录来源，详见 [RESUME.md](RESUME.md)。
+`outputs/qwen_curriculum/` 顶层只保留两个目录：
 
-**长期生成的暂停与恢复：** 使用 [resume_control.py](resume_control.py) 的 `pause` / `resume` / `status`，自动跟随后台服务当前绑定的 v2 目录。当前协调器 [v2_campaign.py](v2_campaign.py)接续原计划，恢复已落盘图片，独立重试中断任务；暂停同时退出常驻 Qwen 以释放显存。具体命令见 [RESUME.md](RESUME.md)。
+- `images/`：统一图片库，`train/` 为训练尺寸 PNG，`raw/` 为高分辨率 PNG，`accepted/` 为审核通过入口。
+- `state/`：当前计划、账本、审核结果、进度及日志；`training/` 保存后续训练与评估，`history/legacy.tar.gz` 保留原始历史证据。
 
-本地23城训练池已核对：524701张真实图、62514个地点。生成量和审核通过量由数据决定。新入口不固定城市列表、不固定5004/7277训练图数；旧实验目录保留为历史结果。
+生成和完整性检查统一由 [campaign.py](campaign.py) 执行，后台绑定 `--output-dir outputs/qwen_curriculum/state`。
 
-## 流程与入口
+`state/runtime_config.json` 校验当前代码与固定计划。历史配置和源码归档用于溯源，当前任务不再执行旧实验或迁移入口。
 
-按阶段执行，生成和训练分别加载模型。完整命令以 [全部城市操作说明](ALL_23_CITIES.md) 为准。
+整理快照已保存 21010 张，已审核 21009 张，通过 13710 张，1 张等待补审核，还需新生成 58416 张。全计划仍为 79426 张，实时数量见 `state/summary.json`。
 
-1. [mine_all_cities.py](mine_all_cities.py)：逐城挖掘困难真实源图，复用已冻结的四城市记录。
-2. [all_city_campaign.py](all_city_campaign.py) 保留原计划，[v2_campaign.py](v2_campaign.py)迁移并按当前代码接续生成 night / snow / fog / rain 图像，审核并保存清单。
-3. [finetune_all_cities.py](finetune_all_cities.py)：使用真实图与审核通过的对应生成图微调 SALAD，评估 SVOX 六域。
+## 常用命令
 
-## 目录与职责
+```bash
+cd /home/admin123/github/WORKSPACE
+conda activate AdaptVPR
 
-| 文件或目录 | 职责 |
+python AdaptVPR/experiments/qwen_curriculum/resume_control.py resume
+python AdaptVPR/experiments/qwen_curriculum/resume_control.py status
+python AdaptVPR/experiments/qwen_curriculum/resume_control.py pause
+```
+
+暂停后校验，不启动模型或新增生成调用：
+
+```bash
+python AdaptVPR/experiments/qwen_curriculum/campaign.py check
+```
+
+已完成图不重复生成；已保存但未审核的图先补审核；中断且没有完整输出的任务，在下一次显式恢复时使用原参数重试。暂停同时退出常驻 Qwen，释放生成占用的显存和内存。
+
+## 生成、审核与训练
+
+源图筛选已完成，保留全部符合规则的困难候选，不限制每城固定张数。完整 23 城训练池为 524701 张真实图、62514 个地点。night/snow/fog/rain 比例为 50%/20%/20%/10%，不生成 overcast。
+
+Qwen-Image-Edit-2511、Lightning 4steps BF16、guidance 1、源宽高比画布及 32 个常驻 DiT blocks 保持不变。审核 v2 使用最少 16 个匹配点、内点率、homography 位移和天气门限，不设空间覆盖率门限。
+
+全部生成完成后，[finetune_all_cities.py](finetune_all_cities.py) 从 `state/data_config.json` 读取原始 `salad/checkpoint/dino_salad.ckpt` 和完整真实数据输入，只以当前通过图片替换对应源图。训练默认输出为 `state/training/`，随后自动评估 SVOX day/night/rain/snow/sun/overcast 六域。
+
+## 代码与文档
+
+| 入口 | 职责 |
 |---|---|
-| `mine_sources.py`、`extend_plan.py` | 困难度计算与已有计划扩展 |
-| `plan.py`、`run.py` | 冻结生成计划、生成、导入和运行状态 |
-| `quality.py`、`weather_signal.py` | 结构一致性与天气审核 |
-| `common.py` | 路径、原子记录与哈希校验 |
-| `tests/` | 采样、生成账本、恢复、训练和评估测试 |
-| [docs/](docs/README.md) | 历史生成批次、训练对照和验证记录 |
+| `resume_control.py` | 后台暂停、恢复和状态 |
+| `campaign.py` | 计划校验、任务调度、恢复及完整性检查 |
+| `run.py`、`resume_recovery.py` | 生成执行、调用账本和中断恢复 |
+| `image_store.py` | 统一图库及审核通过入口 |
+| `quality.py`、`weather_signal.py` | 当前结构与天气审核 |
+| `finetune_all_cities.py`、`finetune_pretrained.py` | 原始 SALAD 微调与训练恢复 |
+| `evaluate_pretrained_finetune.py` | 原模型与微调模型的六域 SVOX 评估 |
+| `common.py` | 路径、原子写入和校验 |
+| `tests/` | 生成、账本、恢复、训练及存储验证 |
 
-四城市协调器、固定图片池对照及可靠性模块实验入口保留原路径；
-全部城市流程仍复用其公共实现。已冻结实验通过源码路径和 SHA-256 校验，
-恢复时以相应配置和历史说明为准。
-
-## 历史实验文档
-
-[文档索引](docs/README.md) 汇总生成批次、预训练微调、比例对照和 Reliability OT 实验。
-[历史流程记录](docs/history.md) 保存旧 README 的完整四城市说明。
+完整生成与训练命令见 [ALL_23_CITIES.md](ALL_23_CITIES.md)。

@@ -1,7 +1,6 @@
 """Pause/resume the owned generation services, without suspending GPU processes.
 
-Only the new resumable coordinator is selected by the systemd override. The
-historical generation source, plans and journals are left intact.
+The service uses the single campaign controller and the current state directory.
 """
 from __future__ import annotations
 
@@ -15,7 +14,7 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from experiments.qwen_curriculum import common
 
-DEFAULT_OUTPUT = common.WORKSPACE_ROOT / "outputs/qwen_curriculum/generation_23city"
+DEFAULT_OUTPUT = common.WORKSPACE_ROOT / "outputs/qwen_curriculum/state"
 COORDINATOR_UNIT = "qwen-curriculum-23city.service"
 QWEN_UNIT = "adaptvpr-lightx2v.service"
 SYSTEMCTL = "/usr/bin/systemctl"
@@ -102,8 +101,7 @@ def install_systemd_override(directory=DEFAULT_OUTPUT, *, user_unit_dir=None, py
     user_unit_dir = Path(user_unit_dir) if user_unit_dir else Path.home() / ".config/systemd/user"
     interpreter = Path(python) if python else Path.home() / "miniconda3/envs/AdaptVPR/bin/python"
     if controller is None:
-        entry = "v2_campaign.py" if (directory / "migration_config.json").exists() else "resume_campaign.py"
-        controller = Path(__file__).with_name(entry).resolve()
+        controller = Path(__file__).with_name("campaign.py").resolve()
     else:
         controller = Path(controller).resolve()
     command = " ".join(_systemd_argument(arg) for arg in

@@ -6,20 +6,13 @@ SVOX results are reporting data, never a checkpoint-selection signal.
 """
 from __future__ import annotations
 
-import argparse
-from collections import Counter
 import gc
-import json
 from pathlib import Path
 import subprocess
 import sys
 import time
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from experiments.qwen_curriculum import common, run, scale_campaign, fast_campaign
-
-DEFAULT_OUTPUT = common.WORKSPACE_ROOT / "outputs/qwen_curriculum/finetune_salad_pretrained_accepted_5004"
+from experiments.qwen_curriculum import common
 
 
 def training_command(config, *, check_data=False, resume=False):
@@ -43,12 +36,20 @@ def training_command(config, *, check_data=False, resume=False):
 
 
 def check_inputs(config):
-    for path, digest in config["files_sha256"].items():
-        if common.file_sha256(Path(path)) != digest:
-            raise ValueError(f"Frozen fine-tuning input changed: {path}")
+    for name, digest in config["files_sha256"].items():
+        path = Path(name)
+        if not path.is_file() or common.file_sha256(path) != digest:
+            raise ValueError(f"Frozen fine-tuning input missing or changed: {path}")
     for row in common.read_jsonl(Path(config["accepted_manifest"])):
-        run.validate_image(row, "source_path", "source_sha256")
-        run.validate_image(row)
+        for field, hash_field in (("source_path", "source_sha256"), ("output_path", "output_sha256")):
+            path = Path(row[field])
+            if not path.is_file() or common.file_sha256(path) != row[hash_field]:
+                raise ValueError(f"Recorded training image missing or changed: {path}")
+
+
+def _training_logs(config):
+    path = Path(config["training_dir"]) / "training_log.jsonl"
+    return common.read_jsonl(path) if path.exists() else []
 
 
 def checkpoint_audit(config, *, initial=False):
@@ -108,84 +109,11 @@ def checkpoint_audit(config, *, initial=False):
     return report
 
 
-def prepare(directory, generation, checkpoint, epochs):
-    path = directory / "experiment_config.json"
-    if path.exists():
-        cfg = fast_campaign.config_file(path)
-        if (cfg["generation_dir"] != str(generation) or cfg["initial_checkpoint"] != str(checkpoint)
-                or cfg["epochs"] != epochs):
-            raise ValueError("Use a new experiment directory for changed fine-tuning settings")
-        check_inputs(cfg)
-        return cfg
-    rows, campaign = scale_campaign.load_collection(generation)
-    accepted = [r for r in rows if r.get("passed") is True and r.get("eligible_for_training") is True]
-    if not accepted or any(r.get("weather_ok") is not True for r in accepted):
-        raise ValueError("Accepted subset must pass the structure and weather checks")
-    if accepted != common.read_jsonl(generation / "training_manifest.jsonl"):
-        raise ValueError("Published accepted manifest differs from the sealed quality records")
-    directory.mkdir(parents=True, exist_ok=True)
-    manifest = directory / "accepted_manifest.jsonl"
-    common.write_jsonl(manifest, accepted)
-    mining_path = Path(campaign["mining_provenance"]["mining_config"])
-    request = json.loads(mining_path.read_text())["descriptor_request"]
-    real_data = Path(request["real_data"])
-    metadata = [real_data / "Dataframes" / f"{city}.csv" for city in request["cities"]]
-    for file, city in zip(metadata, request["cities"]):
-        if common.file_sha256(file) != request["metadata_sha256"][city]:
-            raise ValueError("GSV labels changed since source mining")
-    common.use_salad()
-    from workflow.training_data import MixedGSVCitiesDataset
-    dataset = MixedGSVCitiesDataset(real_data, manifest, cities=request["cities"],
-        synthetic_mode="replace", synthetic_fraction=1.0, augment=False)
-    if dataset.summary["num_synthetic_images"] != len(accepted):
-        raise ValueError("Accepted variants were dropped or duplicated by the training loader")
-    for row in accepted:
-        if dataset.source_index.get(Path(row["source_path"])) != (row["city"], row["place_id"]):
-            raise ValueError("Accepted image label differs from its exact real metadata source")
-    dataset.summary["replacement_explanation"] = "selected accepted hard source replaces its real view; other views stay real"
-    common.write_json(directory / "accepted_summary.json", {
-        "generated_images": len(rows), "accepted_images": len(accepted), "excluded_images": len(rows) - len(accepted),
-        "conditions": dict(Counter(r["condition"] for r in accepted)),
-        "cities": dict(Counter(r["city"] for r in accepted)),
-        "selected_places": len({(r["city"], r["place_id"]) for r in accepted}),
-        "training_pool": dataset.summary, "quality_flags_modified": False})
-    accepted_count = len(accepted)
-    del dataset, accepted, rows
-    gc.collect()
-    backbone_repo = Path.home() / ".cache/torch/hub/facebookresearch_dinov2_main"
-    code = [Path(__file__), common.SALAD_ROOT / "train_salad.py",
-        common.CURRICULUM_ROOT / "evaluate_pretrained_finetune.py"]
-    code += sorted((common.SALAD_ROOT / "workflow").glob("*.py"))
-    code += sorted((common.SALAD_ROOT / "models/aggregators").glob("*.py"))
-    code += sorted(backbone_repo.rglob("*.py"))
-    inputs = code + metadata + [manifest, checkpoint, generation / "results.jsonl",
-        generation / "summary.json", generation / "scale_campaign_config.json", mining_path]
-    cfg = fast_campaign.frozen(path, {
-        "schema_version": 1, "experiment": "original_pretrained_salad_accepted_qwen_finetune",
-        "generation_dir": str(generation), "generation_fingerprint": campaign["fingerprint"],
-        "initial_checkpoint": str(checkpoint), "accepted_manifest": str(manifest), "accepted_images": accepted_count,
-        "real_data": str(real_data), "cities": request["cities"], "epochs": epochs,
-        "training_dir": str(directory / "finetuned"), "backbone_repo": str(backbone_repo),
-        "svox_root": str(common.WORKSPACE_ROOT / "dataset/svox"),
-        "fine_tuning": {"lr": 1e-5, "weight_decay": 1e-4, "scheduler": "cosine", "last_blocks": 4,
-            "batch_places": 32, "images_per_place": 4, "image_size": [224, 224], "precision": "32",
-            "workers": 0, "seed": 42, "augment": False, "full_pretrained_aggregator": True,
-            "reliability_ot": False, "accepted_only": True, "synthetic_mode": "replace", "replacement_probability": 1.0},
-        "evaluation": {"domains": ["day", "night", "rain", "snow", "sun", "overcast"],
-            "image_size": [322, 322], "precision": "32", "positive_radius_m": 25,
-            "checkpoint_selection": "predeclared final epoch; no SVOX model selection"},
-        "files_sha256": {str(p.resolve()): common.file_sha256(p) for p in inputs},
-    })
-    common.write_json(directory / "initialization_audit.json", checkpoint_audit(cfg, initial=True))
-    publish(directory, cfg, "prepared")
-    return cfg
-
-
 def publish(directory, config, state, **extra):
     progress = {"state": state, "experiment_fingerprint": config["fingerprint"],
         "accepted_images": config["accepted_images"], "target_epochs": config["epochs"],
         "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **extra}
-    logs = run.read_rows(Path(config["training_dir"]), "training_log.jsonl")
+    logs = _training_logs(config)
     if logs:
         progress.update(completed_epochs=logs[-1]["epoch"], last_loss=logs[-1]["loss"],
                         synthetic_fraction_observed=logs[-1]["synthetic_fraction_observed"])
@@ -204,7 +132,7 @@ def run_training(directory, config):
         if saved["epoch"] > config["epochs"]:
             raise ValueError("Checkpoint exceeds the requested epochs")
         # A durable epoch checkpoint may precede its log after an interruption.
-        logs = run.read_rows(path.parent, "training_log.jsonl")
+        logs = _training_logs(config)
         logs = [r for r in logs if r["epoch"] < saved["epoch"]]
         logs.append(saved["metrics"])
         common.write_jsonl(path.parent / "training_log.jsonl", logs)
@@ -263,33 +191,3 @@ def execute(directory, config):
         "final_checkpoint_sha256": common.file_sha256(Path(config["training_dir"]) / "checkpoint.pt"),
         "image_size": [322, 322], "precision": "32", "domains": comparison})
     publish(directory, config, "complete")
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("command", choices=("prepare", "run", "status", "check-data"))
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--generation-dir", type=Path, default=scale_campaign.DEFAULT_OUTPUT)
-    parser.add_argument("--checkpoint", type=Path, default=common.SALAD_ROOT / "checkpoint/dino_salad.ckpt")
-    parser.add_argument("--epochs", type=int, default=10)
-    args = parser.parse_args(argv)
-    if args.epochs <= 0:
-        parser.error("Epoch count must be positive")
-    directory = args.output_dir.resolve()
-    if args.command == "status":
-        print((directory / "progress.json").read_text())
-        return
-    with run.run_lock(directory):
-        config = prepare(directory, args.generation_dir.resolve(), args.checkpoint.resolve(), args.epochs)
-        if args.command == "check-data":
-            subprocess.run(training_command(config, check_data=True), check=True, cwd=common.WORKSPACE_ROOT)
-        elif args.command == "run":
-            try:
-                execute(directory, config)
-            except BaseException as exc:
-                publish(directory, config, "stopped", error=f"{type(exc).__name__}: {exc}")
-                raise
-
-
-if __name__ == "__main__":
-    main()

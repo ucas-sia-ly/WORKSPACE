@@ -11,6 +11,8 @@
 | [CCR-VPR Stage 2B](ccr_vpr_stage2b.md) | 真实/生成 Patch 对应、A/B 候选、明确负证据、几何缓存与四天气诊断 |
 | [CCR-VPR Stage 2C](ccr_vpr_stage2c.md) | 独立 Feature / Score / Conditional OT 蒸馏、B0–B5 短程命令与 GPU 实测 |
 | [CCR-VPR Stage 3](ccr_vpr_stage3.md) | 三态 Reliability、保留 V2 负监督、C0–C3 消融与未通过的短程效果验收 |
+| [CCR 可行性实验](ccr_feasibility.md) | A/M/B0/B4/B5 统一运行、固定更新预算、独立校准与验证、中断恢复、检索收益汇总 |
+| [4090 48GB / 32GB 运行配置](ccr_resources_4090.md) | 有界预取、BF16、精确检索缓存、显存预算与主机内存监控、本机短程测量 |
 | [Reliability OT](reliability_ot.md) | 可选 patch 可靠性分支、dustbin 偏置、弱监督、单图推理与 v1 兼容性 |
 | [Reliability OT v2](reliability_v2.md) | 固定教师缓存、局部几何负监督、轻量上下文与消融设置 |
 | [原版 SALAD](../README.md) | 原版环境、数据集、Lightning 训练与论文引用 |
@@ -21,6 +23,7 @@
 - [evaluate_salad.py](../evaluate_salad.py)：项目 checkpoint 评估入口。
 - [cache_reliability_targets.py](../cache_reliability_targets.py)：离线构建可靠性目标缓存。
 - [run_finetune_comparison.py](../run_finetune_comparison.py)：串行完成微调前后的评估对照。
+- [run_ccr_feasibility.py](../run_ccr_feasibility.py)：有界可行性消融实验，默认仅预检查，显式 `--execute` 才训练。
 - [tests/](../tests/)：训练、评估、采样、checkpoint 和可靠性单元测试。
 
 原版 [main.py](../main.py)、[eval.py](../eval.py) 和

@@ -4,7 +4,7 @@
 
 ## 从这里开始
 
-- [Qwen 工作流](experiments/qwen_curriculum/README.md)：当前全部 23 城市挖掘、分批生成、训练入口及命令。
+- [Qwen 工作流](experiments/qwen_curriculum/README.md)：全部 23 城市的分批生成、审核、恢复及训练命令。
 - [SALAD 工作流](../salad/docs/workflow.md)：真实图与合成图的训练、评估和对照。
 - [可靠性 OT](../salad/docs/reliability_v2.md)：可选的 patch 可靠性模块。
 - [依赖与资源配置](docs/EXTERNAL_COMPONENTS.md)：Qwen、VisMatch、CLIP 的安装和显存设置。
@@ -14,7 +14,7 @@
 
 | 路径 | 用途 |
 |---|---|
-| `experiments/qwen_curriculum/` | 当前数据构建、生成恢复、训练对照及测试 |
+| `experiments/qwen_curriculum/` | 23 城市生成、恢复、原始 SALAD 微调及六域 SVOX 测试 |
 | `adapters/lightx2v_qwen_image_edit.py` | Qwen HTTP 服务 |
 | `generation/qwen_disk_weights.py`、`qwen_resident.py` | 低内存 BF16 权重准备和 GPU 常驻缓存 |
 | `verification/` | 结构匹配与 CLIP 图像特征 |
@@ -22,9 +22,9 @@
 | `preprocessing/`、`scripts/build_manifest.py` | 原路线生成结果的训练清单导出 |
 | `configs/`、`scripts/` | 公共配置、依赖准备、服务启动 |
 | `tests/` | 单元测试与可重跑的十图 demo 输入 |
-| `experiments/generation_diagnosis/` | 既有生成结果诊断和冻结实验兼容代码 |
+| `experiments/generation_diagnosis/` | 生成结果诊断及当前审核使用的匹配统计 |
 
-现行服务启动器、环境预检及公共配置只使用 Qwen。`adapters/iclight_sd15_fc.py`、`adapters/iclight_lora.py` 和历史诊断 `runner.py` 保留本次清理前的源码，因为用户认可的 `outputs/gen_diagnosis/qwen_source_aspect_100src/` 配置绑定了它们的源码哈希；改名或删除会破坏历史诊断依赖。旧阶段冻结的版本以其配置哈希为准，已有实现升级后的目录不能直接恢复旧阶段。它们不进入当前困难源图生成主流程。
+现行服务启动器、环境预检及公共配置只使用 Qwen。生成图片统一存放在 `outputs/qwen_curriculum/images/`，计划、账本、恢复状态和训练输出位于 `outputs/qwen_curriculum/state/`。
 
 ## 安装与服务
 

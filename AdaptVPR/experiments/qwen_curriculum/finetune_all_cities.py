@@ -4,17 +4,16 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import gc
-import json
 from pathlib import Path
 import sys
 import subprocess
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from experiments.qwen_curriculum import common, run, all_city_campaign, mine_all_cities, fast_campaign, finetune_pretrained as base
-from experiments.qwen_curriculum.campaign import config_file
+from experiments.qwen_curriculum import campaign, common, finetune_pretrained as base
+from experiments.qwen_curriculum.campaign import config_file, frozen, run_lock
 
-DEFAULT_OUTPUT = common.WORKSPACE_ROOT / "outputs/qwen_curriculum/finetune_salad_pretrained_23city"
+DEFAULT_OUTPUT = common.WORKSPACE_ROOT / "outputs/qwen_curriculum/state/training"
 
 
 def accepted_cities(rows, cities):
@@ -27,6 +26,52 @@ def accepted_cities(rows, cities):
     return accepted
 
 
+def load_training_inputs(campaign):
+    """Verify the independent, immutable data/model snapshot for this campaign."""
+    if not campaign.get("training_inputs"):
+        raise ValueError("Current campaign requires a frozen training_inputs snapshot")
+    path = Path(campaign["training_inputs"])
+    request = config_file(path)
+    if type(request.get("schema_version")) is not int or request["schema_version"] != 1:
+        raise ValueError("Unsupported training input snapshot schema")
+    if any(key not in request for key in ("real_data", "checkpoint", "backbone_repo", "cities", "files_sha256")):
+        raise ValueError("Training input snapshot lacks data, model or city provenance")
+    if any(not isinstance(request[key], str) or not Path(request[key]).is_absolute()
+           for key in ("real_data", "checkpoint", "backbone_repo")):
+        raise ValueError("Training input data/model paths must be absolute strings")
+    cities = request["cities"]
+    if (not isinstance(cities, list) or not cities or any(not isinstance(city, str) or not city for city in cities)
+            or len(set(cities)) != len(cities)
+            or cities != campaign["cities"]):
+        raise ValueError("Training input cities differ from the complete generation campaign")
+    files = request["files_sha256"]
+    if not isinstance(files, dict) or not files:
+        raise ValueError("Training input snapshot has no frozen files")
+    if any(not isinstance(name, str) or not Path(name).is_absolute()
+           or not isinstance(digest, str) or len(digest) != 64 for name, digest in files.items()):
+        raise ValueError("Training input frozen files need absolute paths and SHA256 strings")
+    required = [Path(request["checkpoint"])]
+    required += [Path(request["real_data"]) / "Dataframes" / f"{city}.csv" for city in cities]
+    if any(str(file) not in files for file in required):
+        raise ValueError("Training input snapshot must freeze the original checkpoint and every city CSV")
+    for name, digest in files.items():
+        file = Path(name)
+        if not file.is_file() or common.file_sha256(file) != digest:
+            raise ValueError(f"Frozen training input missing or changed: {file}")
+    if not Path(request["real_data"]).is_dir() or not Path(request["backbone_repo"]).is_dir():
+        raise ValueError("Training real-data or backbone repository directory is missing")
+    return request
+
+
+def discover_cities(real_data):
+    cities = sorted(path.stem for path in (real_data / "Dataframes").glob("*.csv"))
+    if len(cities) != 23:
+        raise ValueError(f"Expected 23 GSV cities, found {len(cities)}")
+    if any(not (real_data / "Images" / city).is_dir() for city in cities):
+        raise ValueError("A metadata city lacks its Images directory")
+    return cities
+
+
 def prepare(directory, generation, epochs):
     path = directory / "experiment_config.json"
     if path.exists():
@@ -35,20 +80,11 @@ def prepare(directory, generation, epochs):
             raise ValueError("Use a new experiment directory for different generation/epochs")
         base.check_inputs(cfg)
         return cfg
-    current_quality = (generation / "migration_config.json").exists()
-    resumed = (generation / "resume_config.json").exists()
-    if current_quality:
-        from experiments.qwen_curriculum import v2_campaign, history_v2, requalify_v2
-        rows, campaign = v2_campaign.load_collection(generation)
-    elif resumed:
-        from experiments.qwen_curriculum import resume_campaign, resume_recovery
-        rows, campaign = resume_campaign.load_collection(generation)
-    else:
-        rows, campaign = all_city_campaign.load_collection(generation)
-    _, _, request = mine_all_cities.load_selection(Path(campaign["mining_dir"]))
+    rows, generation_config = campaign.load_collection(generation)
+    request = load_training_inputs(generation_config)
     real_data = Path(request["real_data"])
-    cities = mine_all_cities.discover_cities(real_data)
-    if cities != campaign["cities"]:
+    cities = discover_cities(real_data)
+    if cities != generation_config["cities"]:
         raise ValueError("All-city generation no longer matches the installed GSV cities")
     accepted = accepted_cities(rows, cities)
     directory.mkdir(parents=True, exist_ok=True)
@@ -72,26 +108,24 @@ def prepare(directory, generation, epochs):
     gc.collect()
     checkpoint = Path(request["checkpoint"])
     backbone = Path(request["backbone_repo"])
-    code = [Path(__file__), Path(base.__file__), Path(all_city_campaign.__file__), Path(mine_all_cities.__file__),
-        common.SALAD_ROOT / "train_salad.py", common.CURRICULUM_ROOT / "evaluate_pretrained_finetune.py"]
+    code = [Path(__file__), Path(base.__file__), Path(common.__file__), Path(campaign.__file__),
+        common.SALAD_ROOT / "train_salad.py"]
+    code += [common.CURRICULUM_ROOT / name for name in
+        ("run.py", "resume_recovery.py", "image_store.py", "quality.py", "weather_signal.py",
+         "evaluate_pretrained_finetune.py")]
     code += sorted((common.SALAD_ROOT / "workflow").glob("*.py"))
     code += sorted((common.SALAD_ROOT / "models/aggregators").glob("*.py"))
     code += sorted(backbone.rglob("*.py"))
-    files = code + [checkpoint, manifest, generation / "all_city_campaign_config.json", generation / "results.jsonl",
-        generation / "summary.json", *[real_data / "Dataframes" / f"{city}.csv" for city in cities]]
-    if current_quality:
-        files += [Path(v2_campaign.__file__), Path(history_v2.__file__), Path(requalify_v2.__file__),
-                  generation / "migration_config.json", generation / "resume_config.json"]
-        files += sorted((generation / "imported").glob("*.json"))
-        files += sorted((generation / "imported").glob("*.jsonl"))
-    elif resumed:
-        files += [Path(resume_campaign.__file__), Path(resume_recovery.__file__), generation / "resume_config.json"]
-    if resumed:
-        files += sorted((generation / "resume_state").rglob("*config.json"))
-        files += sorted((generation / "resume_state").rglob("intent.json"))
-        files += sorted((generation / "resume_state").rglob("input.jsonl"))
-    cfg = fast_campaign.frozen(path, {"schema_version": 1, "experiment": "original_salad_23city_accepted_qwen",
-        "generation_dir": str(generation), "generation_fingerprint": campaign["fingerprint"],
+    files = code + [checkpoint, manifest, Path(generation_config["training_inputs"]),
+        generation / "all_city_campaign_config.json", generation / "runtime_config.json",
+        generation / "results.jsonl", generation / "training_manifest.jsonl", generation / "summary.json",
+        *[real_data / "Dataframes" / f"{city}.csv" for city in cities]]
+    files += sorted((generation / "imported").glob("*.json"))
+    files += sorted((generation / "imported").glob("*.jsonl"))
+    for name in ("*config.json", "intent.json", "input.jsonl"):
+        files += sorted((generation / "resume_state").rglob(name))
+    cfg = frozen(path, {"schema_version": 1, "experiment": "original_salad_23city_accepted_qwen",
+        "generation_dir": str(generation), "generation_fingerprint": generation_config["fingerprint"],
         "initial_checkpoint": str(checkpoint), "accepted_manifest": str(manifest), "accepted_images": count,
         "real_data": str(real_data), "cities": cities, "epochs": epochs,
         "training_dir": str(directory / "finetuned"), "backbone_repo": str(backbone),
@@ -117,7 +151,7 @@ def main(argv=None):
     if args.command == "status":
         print((directory / "progress.json").read_text())
         return
-    with run.run_lock(directory):
+    with run_lock(directory):
         cfg = prepare(directory, args.generation_dir.resolve(), args.epochs)
         if args.command == "check-data":
             subprocess.run(base.training_command(cfg, check_data=True), check=True, cwd=common.WORKSPACE_ROOT)

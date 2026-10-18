@@ -1,8 +1,8 @@
-"""CPU-only queued generation gates, complete training proof and stage aggregation."""
-from contextlib import ExitStack, redirect_stdout
-import io
+"""CPU integration coverage for the only supported 23-city runtime."""
+from collections import Counter
 import json
 from pathlib import Path
+import signal
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -10,23 +10,16 @@ import unittest
 from unittest.mock import Mock, patch
 
 from PIL import Image
+import requests
 
-ADAPTVPR_ROOT = Path(__file__).resolve().parents[3]
-if str(ADAPTVPR_ROOT) not in sys.path:
-    sys.path.insert(0, str(ADAPTVPR_ROOT))
-from experiments.qwen_curriculum import campaign, common, recover_interrupted
-
-
-ARMS = {'generated_8to1', 'true_8to1', 'generated_4to1', 'true_4to1'}
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from experiments.qwen_curriculum import common, run, campaign, resume_recovery, image_store
 
 
-def seal(row, field='fingerprint'):
-    body = {key: value for key, value in row.items() if key != field}
-    return {**body, field: common.fingerprint(body)}
-
-
-class Waiting(Exception):
-    """End a mocked sleep without making an active wait look complete."""
+class Verifier:
+    def evaluate(self, source, generated, condition):
+        return {"status": "passed", "passed": True, "eligible_for_training": True,
+                "weather_ok": True, "s_geo": 0.91, "weather_shift": 1.5}
 
 
 class CampaignTests(unittest.TestCase):
@@ -34,318 +27,376 @@ class CampaignTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.training = self.root / 'training'
-        self.training.mkdir()
-        self.output = self.root / 'campaign'
-        self.output.mkdir()
-        self.training_config = seal({'protocol': 'four fixed arms then all evaluations'})
-        common.write_json(self.training / 'experiment_config.json', self.training_config)
-        self.args = SimpleNamespace(output_dir=self.output, training_dir=self.training,
-                                    training_unit='training.service')
-        self.coordinator = {'training_fingerprint': self.training_config['fingerprint'],
-                            'implementation_sha256': {}}
-        self.stages = []
+        self.directory = self.root / "state"
+        self.parent = self.directory / "imported"
+        self.parent.mkdir(parents=True)
+        self.service = self.root / "service"
+        self.service.mkdir()
         self.jobs = []
-        self.saved = []
-        for stage_index in range(2):
-            directory = self.root / f'original_stage_{stage_index}'
-            directory.mkdir()
-            jobs, generated, results, attempts = [], [], [], []
-            for index in range(2):
-                serial = stage_index * 2 + index
-                source = self.root / f'source_{serial}.png'
-                output = directory / f'original_output_{serial}.png'
-                raw = directory / f'original_raw_{serial}.png'
-                Image.new('RGB', (20, 16), (10 + serial, 40, 60)).save(source)
-                Image.new('RGB', (20, 16), (50 + serial, 80, 100)).save(output)
-                Image.new('RGB', (30, 24), (50 + serial, 80, 100)).save(raw)
-                job = seal({'sample_id': f'qwen_{serial:024x}', 'source_path': str(source),
-                    'source_sha256': common.file_sha256(source), 'source_dimensions': [20, 16],
-                    'city': 'City', 'place_id': serial, 'seed': serial + 1,
-                    'condition': 'night' if index == 0 else 'snow',
-                    'prompt': 'conservative weather edit', 'negative_prompt': ''}, 'record_sha256')
-                jobs.append(job)
-            common.write_jsonl(directory / 'plan.jsonl', jobs)
-            plan = seal({'num_images': 2, 'plan_sha256': common.file_sha256(directory / 'plan.jsonl'),
-                         'implementation_sha256': {}})
-            common.write_json(directory / 'plan_config.json', plan)
-            execution = seal({'stage': 'generate', 'plan_fingerprint': plan['fingerprint'], 'max_calls': 2,
-                'implementation_sha256': {}, 'qwen_url': 'http://127.0.0.1:8001/generate',
-                'request_timeout': 600, 'matcher_device': 'cpu', 'cpu_threads': 1})
-            common.write_json(directory / 'execution_config.json', execution)
-            for index, job in enumerate(jobs):
-                serial = stage_index * 2 + index
-                output = directory / f'original_output_{serial}.png'
-                raw = directory / f'original_raw_{serial}.png'
-                row = seal({**job, 'execution_fingerprint': execution['fingerprint'],
-                    'output_path': str(output), 'output_sha256': common.file_sha256(output),
-                    'raw_output_path': str(raw), 'raw_output_sha256': common.file_sha256(raw)}, 'result_sha256')
-                generated.append(row)
-                results.append(seal({**row, 'status': 'passed' if index == 0 else 'rejected',
-                    'passed': index == 0, 'eligible_for_training': index == 0}, 'result_sha256'))
-                attempts.append(seal({'sample_id': job['sample_id'], 'call_number': index + 1,
-                    'record_sha256': job['record_sha256'], 'execution_fingerprint': execution['fingerprint']},
-                    'attempt_sha256'))
-            common.write_jsonl(directory / 'generated.jsonl', generated)
-            common.write_jsonl(directory / 'results.jsonl', results)
-            common.write_jsonl(directory / 'attempts.jsonl', attempts)
-            common.write_json(directory / 'summary.json', {'state': 'complete', 'generation_errors': 0})
-            self.stages.append({'run_dir': str(directory), 'num_images': 2, 'max_calls': 2,
-                                'plan_fingerprint': plan['fingerprint'], 'plan_sha256': plan['plan_sha256']})
-            self.jobs.extend(jobs)
-            self.saved.extend(results)
-        self.config = seal({'total_images': 4, 'parent_run_dir': self.stages[0]['run_dir'],
-                            'stages': self.stages})
-        self.full_report()
+        for number in range(4):
+            image = self.root / f"source_{number}.png"
+            Image.new("RGB", (20, 16), (number * 25, 80, 45)).save(image)
+            body = {"sample_id": "qwen_" + common.fingerprint(number)[:24],
+                "source_path": str(image), "source_sha256": common.file_sha256(image),
+                "source_dimensions": [20, 16], "condition": "night", "city": "City",
+                "place_id": number, "seed": 123 + number,
+                "prompt": f"source anchored night prompt {number}", "negative_prompt": ""}
+            self.jobs.append({**body, "record_sha256": common.fingerprint(body)})
+        self.health = {"status": "ok", "model_loaded": True, "generator_ready": True,
+            "error": None, "model_id": "Qwen/Qwen-Image-Edit-2511", "source_modified": False,
+            "canvas_policy": "source_aspect_v1", "sampling": {"infer_steps": 4, "guidance_scale": 1.0},
+            "canvas": {"target_shape_order": "height,width", "target_pixels": 720,
+                "multiple": 1, "min_side": 1, "max_side": 128, "rounding": "nearest_multiple",
+                "unsupported_aspect_ratio": "reject"}}
+        master = self.directory / "additional_plan"
+        master.mkdir()
+        self.plan = campaign.frozen(master / "plan_config.json", {
+            "output_dir": str(master), "num_images": 4, "seed": 42,
+            "domain_quotas": {"night": 4}, "plan_sha256": "historical-unused"})
+        common.write_jsonl(self.directory / "combined_plan.jsonl", self.jobs)
+        reference = {**run.execution_definition(SimpleNamespace(run_dir=self.directory, device="cuda", cpu_threads=4)),
+            "stage": "generate", "plan_fingerprint": self.plan["fingerprint"], "max_calls": 4,
+            "qwen_url": "http://127.0.0.1:8001/generate", "request_timeout": 600.0,
+            "service": run.service_identity(self.health),
+            "call_policy": "one POST per job; durable reservation; no automatic retries",
+            "source_encoding": "lossless RGB PNG decoded from original"}
+        self.execution = campaign.frozen(self.parent / "execution_config.json", {
+            **run.execution_definition(SimpleNamespace(run_dir=self.parent, device="cuda", cpu_threads=4)),
+            "stage": "quality_v2_import", "max_calls": 0})
+        self.generated = [self.image_row(job) for job in self.jobs[:2]]
+        self.results = [run.sealed({**self.generated[0], "status": "passed", "passed": True,
+                                   "eligible_for_training": True})]
+        common.write_jsonl(self.parent / "generated.jsonl", self.generated)
+        common.write_jsonl(self.parent / "results.jsonl", self.results)
+        common.write_jsonl(self.parent / "historical_attempts.jsonl", [])
+        self.config = campaign.frozen(self.directory / "all_city_campaign_config.json", {
+            "stage": "current_quality_23city_migration", "parent_run_dir": str(self.parent),
+            "combined_plan": str(self.directory / "combined_plan.jsonl"), "total_images": 4,
+            "additional_images": 2, "reference_execution": reference, "stages": [],
+            "runtime_profile": "resident_bf16_48g", "domain_quotas": {"night": 4}, "city_quotas": {"City": 4}})
+        campaign.frozen(self.directory / "resume_config.json", {"campaign_fingerprint": self.config["fingerprint"],
+            "files_sha256": {"removed_old_coordinator.py": "historical-evidence-only"}})
+        files = [self.directory / "all_city_campaign_config.json", self.directory / "combined_plan.jsonl",
+                 master / "plan_config.json"]
+        files += list(self.parent.glob("*.json*"))
+        files += [Path(module.__file__).resolve() for module in (campaign, common, run, resume_recovery, image_store)]
+        campaign.frozen(self.directory / "runtime_config.json", {"schema_version": 1,
+            "campaign_fingerprint": self.config["fingerprint"],
+            "files_sha256": {str(p): common.file_sha256(p) for p in files}})
+        self.imported_snapshot = {p: p.read_bytes() for p in self.parent.glob("*.json*")}
+        self.service_patch = patch.object(run, "service_output_directory", return_value=self.service)
+        self.service_patch.start()
+        self.addCleanup(self.service_patch.stop)
+        self.catalog().publish("paused")
 
-    def full_report(self):
-        checkpoints = {}
-        for arm in ARMS:
-            directory = self.training / arm
-            directory.mkdir(exist_ok=True)
-            checkpoint = directory / 'checkpoint.pt'
-            checkpoint.write_bytes(f'final checkpoint {arm}'.encode())
-            checkpoints[arm] = common.file_sha256(checkpoint)
-        self.report = seal({'state': 'complete', 'experiment_fingerprint': self.training_config['fingerprint'],
-                            'checkpoint_sha256': checkpoints})
-        common.write_json(self.training / 'comparison.json', self.report)
-        common.write_json(self.training / 'progress.json', {'stage': 'complete'})
+    def image_row(self, job):
+        directory = self.parent / "saved" / job["sample_id"]
+        directory.mkdir(parents=True)
+        raw, output = directory / "raw.png", directory / "image.png"
+        Image.new("RGB", (30, 24), (job["place_id"] * 25, 90, 100)).save(raw)
+        with Image.open(raw) as image:
+            image.resize((20, 16), Image.Resampling.LANCZOS).save(output)
+        return run.sealed({**job, "execution_fingerprint": self.execution["fingerprint"],
+            "output_path": str(output), "output_sha256": common.file_sha256(output),
+            "raw_output_path": str(raw), "raw_output_sha256": common.file_sha256(raw)})
 
-    def finish_proof(self):
-        return campaign.training_finished(self.training, self.training_config['fingerprint'])
+    def catalog(self):
+        return campaign.Catalog(self.directory, self.config)
 
-    def wait(self, state='inactive', code=0):
-        with patch.object(campaign, 'unit_state', return_value=state), \
-             patch.object(campaign, 'unit_exit_code', return_value=code), redirect_stdout(io.StringIO()):
-            return campaign.wait_for_training(self.args, self.config, self.coordinator)
+    def verify_saved(self, command, catalog, state):
+        self.assertEqual(command[3], "verify-one")
+        directory = Path(command[command.index("--verification-dir") + 1])
+        with patch.object(run, "QwenQualityVerifier", return_value=Verifier()):
+            campaign.verify_one(directory)
+        catalog.refresh().publish(state)
 
-    def test_complete_training_requires_all_four_unchanged_checkpoints_and_progress(self):
-        self.assertTrue(self.finish_proof())
-        self.wait()
-        common.write_json(self.training / 'progress.json', {'stage': 'evaluation', 'arm': 'true_4to1'})
-        self.assertFalse(self.finish_proof())
-        with self.assertRaisesRegex(RuntimeError, 'before full completion'):
-            self.wait()
+    def generate_stage(self, stage, *, fail=False):
+        session, health = Mock(), Mock()
+        health.json.return_value = self.health
+        session.get.return_value = health
+        if fail:
+            session.post.side_effect = requests.Timeout("simulated interrupted HTTP request")
+        else:
+            def post(url, json, timeout):
+                jobs = run.load_plan(Path(stage["run_dir"]))[1]
+                job = next(j for j in jobs if j["seed"] == json["seed"])
+                self.assertEqual(json["prompt"], job["prompt"])
+                self.assertEqual((json["infer_steps"], json["guidance_scale"]), (4, 1.0))
+                raw = self.service / f"{job['sample_id']}.png"
+                Image.new("RGB", (30, 24), (90, 110, 120)).save(raw)
+                response = Mock()
+                response.json.return_value = {"result_path": str(raw), "canvas_policy": "source_aspect_v1",
+                    "source_dimensions": [20, 16], "raw_dimensions": [30, 24], "target_shape": [24, 30]}
+                return response
+            session.post.side_effect = post
+        args = run.parse_args(["generate", "--run-dir", stage["run_dir"], "--max-calls", str(stage["max_calls"]),
+            "--request-timeout", "600", "--device", "cuda", "--cpu-threads", "4"])
+        with patch.object(run.requests, "Session", return_value=session), \
+                patch.object(run, "QwenQualityVerifier", return_value=Verifier()):
+            if fail:
+                with self.assertRaisesRegex(requests.Timeout, "interrupted HTTP"):
+                    run.generate(args)
+            else:
+                run.generate(args)
+        return session
 
-    def test_missing_completion_report_keeps_generation_stopped(self):
-        (self.training / 'comparison.json').unlink()
-        self.assertFalse(self.finish_proof())
-        with self.assertRaisesRegex(RuntimeError, 'before full completion'):
-            self.wait()
+    def succeed(self, command, catalog, state):
+        if command[3] == "verify-one":
+            return self.verify_saved(command, catalog, state)
+        stage = campaign.config_file(Path(command[command.index("--run-dir") + 1]) / "stage_config.json")
+        session = self.generate_stage(stage)
+        catalog.refresh().publish(state)
+        return session
 
-    def test_partial_arm_report_and_changed_checkpoint_are_rejected(self):
-        report = dict(self.report)
-        report['checkpoint_sha256'] = dict(report['checkpoint_sha256'])
-        report['checkpoint_sha256'].pop('true_4to1')
-        common.write_json(self.training / 'comparison.json', seal(report))
-        with self.assertRaisesRegex(ValueError, 'all four training arms'):
-            self.finish_proof()
-        common.write_json(self.training / 'comparison.json', self.report)
-        (self.training / 'true_4to1/checkpoint.pt').write_bytes(b'changed checkpoint')
-        with self.assertRaisesRegex(ValueError, 'checkpoint changed'):
-            self.finish_proof()
+    def finish(self):
+        with patch.object(campaign, "stop_qwen"), patch.object(campaign, "start_qwen"), \
+                patch.object(campaign, "run_child", side_effect=self.succeed):
+            campaign.execute(self.directory, self.config)
 
-    def test_completion_report_seal_and_experiment_identity_are_checked(self):
-        report = dict(self.report)
-        report['state'] = 'incomplete'
-        common.write_json(self.training / 'comparison.json', report)
-        with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
-            self.finish_proof()
-        report = seal({**self.report, 'experiment_fingerprint': 'another experiment'})
-        common.write_json(self.training / 'comparison.json', report)
-        with self.assertRaisesRegex(ValueError, 'another experiment'):
-            self.finish_proof()
+    def test_saved_images_verify_without_http_and_keep_imported_journals(self):
+        catalog = self.catalog()
+        with patch.object(campaign, "run_child", side_effect=self.verify_saved), \
+                patch.object(run.requests, "Session") as http:
+            campaign.recover_saved(catalog)
+        http.assert_not_called()
+        self.assertEqual(len(catalog.results), 2)
+        self.assertEqual(catalog.pending(), self.jobs[2:])
+        self.assertEqual(self.imported_snapshot, {p: p.read_bytes() for p in self.imported_snapshot})
 
-    def test_unsuccessful_training_exit_stops_even_with_complete_report(self):
-        with self.assertRaisesRegex(RuntimeError, 'exited unsuccessfully'):
-            self.wait(state='failed', code=1)
-        with self.assertRaisesRegex(RuntimeError, 'exited unsuccessfully'):
-            self.wait(state='inactive', code=2)
+    def test_pending_verification_resumes_after_repeated_process_interruptions_without_post(self):
+        catalog = self.catalog()
+        sid = self.jobs[1]["sample_id"]
+        original, origin = catalog.generated[sid], catalog.origins[sid]
+        directory = self.directory / "resume_state/verifications" / sid / origin["execution"]["fingerprint"][:24]
+        # The independent execution and generated row are durable, but quality
+        # verification has not committed a result when this process stops.
+        campaign.make_verification(directory, original, origin["execution"])
+        before = {p: p.read_bytes() for p in directory.glob("*.json*")}
+        for _ in range(2):
+            with patch.object(campaign, "stop_qwen"), patch.object(campaign, "start_qwen") as start, \
+                    patch.object(campaign, "run_child", side_effect=KeyboardInterrupt), \
+                    patch.object(run.requests, "Session") as http:
+                with self.assertRaises(KeyboardInterrupt):
+                    campaign.execute(self.directory, self.config)
+            start.assert_not_called()
+            http.assert_not_called()
+            self.assertEqual(before, {p: p.read_bytes() for p in before})
+            self.assertFalse((directory / "results.jsonl").exists())
+        catalog = self.catalog()
+        self.assertEqual(catalog.origins[sid]["execution"]["fingerprint"], origin["execution"]["fingerprint"])
+        with patch.object(campaign, "run_child", side_effect=self.verify_saved), \
+                patch.object(run.requests, "Session") as http:
+            campaign.recover_saved(catalog)
+        http.assert_not_called()
+        self.assertEqual(catalog.results[sid]["output_sha256"], original["output_sha256"])
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        self.assertEqual(len(list((self.directory / "resume_state/verifications" / sid).glob("*/execution_config.json"))), 1)
 
-    def test_changed_training_config_is_rejected_during_wait(self):
-        common.write_json(self.training / 'experiment_config.json', seal({'protocol': 'changed'}))
-        with self.assertRaisesRegex(ValueError, 'experiment changed'):
-            self.wait(state='active')
+    def test_execution_finishes_exact_plan_and_collects_images(self):
+        self.finish()
+        rows, cfg = campaign.load_collection(self.directory)
+        self.assertEqual(cfg, self.config)
+        self.assertEqual(Counter(r["condition"] for r in rows), {"night": 4})
+        for row in rows:
+            for field in ("output_path", "raw_output_path"):
+                path = Path(row[field])
+                self.assertTrue(path.is_symlink())
+                self.assertTrue(path.resolve().is_relative_to(self.root / "images"))
+                self.assertEqual(common.file_sha256(path), row[field.replace("_path", "_sha256")])
+        self.assertEqual(len(list((self.root / "images/accepted").glob("*.png"))), 4)
 
-    def test_active_training_never_recovers_starts_qwen_or_launches_child(self):
-        # Even an existing complete report does not release an active training unit.
-        with ExitStack() as stack:
-            stack.enter_context(patch.object(campaign, 'freeze_coordinator', return_value=self.coordinator))
-            stack.enter_context(patch.object(campaign, 'check_frozen_artifacts'))
-            stack.enter_context(patch.object(campaign, 'unit_state', return_value='active'))
-            exit_code = stack.enter_context(patch.object(campaign, 'unit_exit_code'))
-            stack.enter_context(patch.object(campaign.time, 'sleep', side_effect=Waiting))
-            recover = stack.enter_context(patch.object(recover_interrupted, 'recover_interrupted'))
-            qwen = stack.enter_context(patch.object(campaign, 'start_qwen'))
-            child = stack.enter_context(patch.object(campaign.subprocess, 'Popen'))
-            stack.enter_context(redirect_stdout(io.StringIO()))
-            with self.assertRaises(Waiting):
-                campaign.execute(self.args, self.config)
-        recover.assert_not_called()
-        qwen.assert_not_called()
+    def test_runtime_seal_rejects_changed_input_and_ignores_legacy_code_evidence(self):
+        self.assertEqual(campaign.check_inputs(self.directory), self.config)
+        path = self.directory / "combined_plan.jsonl"
+        path.write_text("[]\n")
+        with self.assertRaisesRegex(ValueError, "Runtime input/code changed"):
+            campaign.check_inputs(self.directory)
+
+    def test_runtime_must_bind_the_exact_campaign(self):
+        path = self.directory / "runtime_config.json"
+        value = campaign.config_file(path)
+        value.update(campaign_fingerprint="another-campaign")
+        value.pop("fingerprint")
+        path.unlink()
+        campaign.frozen(path, value)
+        with self.assertRaisesRegex(ValueError, "different campaign"):
+            campaign.check_inputs(self.directory)
+
+    def test_runtime_schema_cannot_be_bool_text_or_a_different_version(self):
+        path = self.directory / "runtime_config.json"
+        original = campaign.config_file(path)
+        for schema in (True, "1", 2):
+            body = {k: value for k, value in original.items() if k != "fingerprint"}
+            body["schema_version"] = schema
+            path.unlink()
+            campaign.frozen(path, body)
+            with self.subTest(schema=schema), self.assertRaisesRegex(ValueError, "Unsupported runtime schema"):
+                campaign.check_inputs(self.directory)
+
+    def test_runtime_requires_static_inputs_and_current_code_even_with_a_valid_seal(self):
+        path = self.directory / "runtime_config.json"
+        original = campaign.config_file(path)
+        for omitted in (self.directory / "combined_plan.jsonl", Path(run.__file__).resolve()):
+            body = {k: value for k, value in original.items() if k != "fingerprint"}
+            body["files_sha256"] = {k: value for k, value in body["files_sha256"].items() if k != str(omitted)}
+            path.unlink()
+            campaign.frozen(path, body)
+            with self.subTest(omitted=omitted), self.assertRaisesRegex(ValueError, "every required static input"):
+                campaign.check_inputs(self.directory)
+
+    def test_failed_runtime_validation_does_not_rewrite_progress_or_start_models(self):
+        before = {name: (self.directory / name).read_bytes() for name in
+                  ("summary.json", "results.jsonl", "generated.jsonl", "training_manifest.jsonl")}
+        (self.directory / "combined_plan.jsonl").write_text("changed plan\n")
+        with patch.object(campaign, "stop_qwen"), patch.object(campaign, "start_qwen") as start, \
+                patch.object(campaign, "run_child") as child:
+            with self.assertRaisesRegex(ValueError, "Runtime input/code changed"):
+                campaign.execute(self.directory, self.config)
+        start.assert_not_called()
         child.assert_not_called()
-        exit_code.assert_not_called()
-        summary = json.loads((self.output / 'summary.json').read_text())
-        self.assertEqual(summary['state'], 'waiting_for_training')
-        self.assertEqual(summary['generated_images'], 4)
+        self.assertEqual(before, {name: (self.directory / name).read_bytes() for name in before})
 
-    def test_wait_unlocks_only_after_unit_stops_with_valid_full_report(self):
-        with patch.object(campaign, 'unit_state', side_effect=['active', 'inactive']), \
-             patch.object(campaign, 'unit_exit_code', return_value=0), \
-             patch.object(campaign.time, 'sleep') as sleep, redirect_stdout(io.StringIO()):
-            campaign.wait_for_training(self.args, self.config, self.coordinator)
-        sleep.assert_called_once_with(60)
+    def test_incomplete_campaign_never_becomes_trainable(self):
+        for require_complete in (True, False):
+            with self.assertRaisesRegex(ValueError, "Finish all 23-city"):
+                campaign.load_collection(self.directory, require_complete=require_complete)
+        catalog = self.catalog()
+        self.generate_stage(campaign.continuation(catalog, catalog.pending()))
+        catalog.refresh().publish("complete")
+        with self.assertRaisesRegex(ValueError, "Finish all 23-city"):
+            campaign.load_collection(self.directory)
 
-    def test_aggregate_retains_original_paths_exact_records_and_counts(self):
-        stage_bytes = {Path(stage['run_dir']) / name: (Path(stage['run_dir']) / name).read_bytes()
-                       for stage in self.stages for name in ('results.jsonl', 'generated.jsonl', 'attempts.jsonl')}
-        original_images = {Path(row['output_path']): Path(row['output_path']).read_bytes() for row in self.saved}
-        frozen_provenance = b'{"immutable_stage_plan": true}\n'
-        (self.output / 'stage_provenance.json').write_bytes(frozen_provenance)
-        summary = campaign.refresh(self.output, self.config, 'waiting_for_training')
-        self.assertEqual((self.output / 'stage_provenance.json').read_bytes(), frozen_provenance)
-        self.assertEqual(summary['target_images'], 4)
-        self.assertEqual(summary['generated_images'], 4)
-        self.assertEqual(summary['quality_evaluated'], 4)
-        self.assertEqual(summary['calls_reserved'], 4)
-        self.assertEqual(summary['accepted'], 2)
-        self.assertEqual(summary['rejected'], 2)
-        self.assertEqual(summary['generation_errors'], 0)
-        self.assertEqual(summary['new_images_remaining'], 0)
-        self.assertEqual(summary['conditions_generated'], {'night': 2, 'snow': 2})
-        combined = common.read_jsonl(self.output / 'results.jsonl')
-        self.assertEqual(combined, self.saved)
-        self.assertEqual([row['output_path'] for row in combined], [row['output_path'] for row in self.saved])
-        accepted = common.read_jsonl(self.output / 'training_manifest.jsonl')
-        self.assertEqual(accepted, [row for row in self.saved if row['passed'] and row['eligible_for_training']])
-        provenance = json.loads((self.output / 'runtime_stage_provenance.json').read_text())
-        self.assertEqual([row['results_offset'] for row in provenance], [0, 2])
-        self.assertEqual([row['results_count'] for row in provenance], [2, 2])
-        self.assertFalse(list(self.output.rglob('*.png')))
-        for path, expected in {**stage_bytes, **original_images}.items():
-            self.assertEqual(path.read_bytes(), expected)
+    def test_failure_reserves_one_call_then_explicit_resume_creates_new_stage(self):
+        catalog = self.catalog()
+        first = campaign.continuation(catalog, catalog.pending())
+        self.assertEqual(self.generate_stage(first, fail=True).post.call_count, 1)
+        first_dir = Path(first["run_dir"])
+        before = {name: (first_dir / name).read_bytes() for name in
+                  ("execution_config.json", "attempts.jsonl", "results.jsonl")}
+        catalog.refresh()
+        second = campaign.continuation(catalog, catalog.pending())
+        self.assertEqual(second["retry_of"][self.jobs[2]["sample_id"]]["run_dir"], str(first_dir))
+        self.assertNotEqual(first["run_dir"], second["run_dir"])
+        self.assertEqual(self.generate_stage(second).post.call_count, 2)
+        self.assertEqual(before, {name: (first_dir / name).read_bytes() for name in before})
+        catalog.refresh()
+        self.assertEqual(catalog.pending(), [])
+        self.assertEqual(len(catalog.attempts[self.jobs[2]["sample_id"]]), 2)
 
-    def test_partial_aggregate_counts_reserved_pending_work(self):
-        directory = Path(self.stages[1]['run_dir'])
-        for name in ('generated.jsonl', 'results.jsonl'):
-            common.write_jsonl(directory / name, common.read_jsonl(directory / name)[:1])
-        summary = campaign.refresh(self.output, self.config, 'waiting_for_training')
-        self.assertEqual(summary['generated_images'], 3)
-        self.assertEqual(summary['quality_evaluated'], 3)
-        self.assertEqual(summary['calls_reserved'], 4)
-        self.assertEqual(summary['new_images_remaining'], 1)
+    def test_forged_retry_link_is_rejected_even_if_stage_is_resealed(self):
+        catalog = self.catalog()
+        first = campaign.continuation(catalog, catalog.pending())
+        self.generate_stage(first, fail=True)
+        catalog.refresh()
+        second = campaign.continuation(catalog, catalog.pending())
+        path = Path(second["run_dir"]) / "stage_config.json"
+        value = campaign.config_file(path)
+        value["retry_of"][self.jobs[2]["sample_id"]]["attempt_sha256"] = "0" * 64
+        value.pop("fingerprint")
+        path.unlink()
+        campaign.frozen(path, value)
+        with self.assertRaisesRegex(ValueError, "no matching prior request"):
+            catalog.refresh()
 
-    def test_duplicate_result_generated_id_or_source_content_is_refused(self):
-        directory = Path(self.stages[1]['run_dir'])
-        original_results = (directory / 'results.jsonl').read_bytes()
-        original_generated = (directory / 'generated.jsonl').read_bytes()
-        first_directory = Path(self.stages[0]['run_dir'])
-        first_result = common.read_jsonl(first_directory / 'results.jsonl')[0]
-        first_generated = common.read_jsonl(first_directory / 'generated.jsonl')[0]
-        rows = common.read_jsonl(directory / 'results.jsonl')
-        rows[0] = first_result
-        common.write_jsonl(directory / 'results.jsonl', rows)
-        with self.assertRaisesRegex(ValueError, 'Duplicate result'):
-            campaign.refresh(self.output, self.config, 'running')
-        (directory / 'results.jsonl').write_bytes(original_results)
-        for field in ('sample_id', 'source_sha256'):
-            rows = common.read_jsonl(directory / 'generated.jsonl')
-            rows[0][field] = first_generated[field]
-            common.write_jsonl(directory / 'generated.jsonl', rows)
-            with self.assertRaisesRegex(ValueError, 'Duplicate generated source'):
-                campaign.refresh(self.output, self.config, 'running')
-            (directory / 'generated.jsonl').write_bytes(original_generated)
-        self.assertFalse((self.output / 'summary.json').exists())
+    def test_interrupted_saved_raw_recovers_without_an_extra_request(self):
+        catalog = self.catalog()
+        first = campaign.continuation(catalog, catalog.pending())
+        self.generate_stage(first, fail=True)
+        stage_dir = Path(first["run_dir"])
+        raw = self.service / "interrupted.png"
+        Image.new("RGB", (30, 24), (90, 110, 120)).save(raw)
+        common.write_json(raw.with_suffix(".json"), {"source_path": str(stage_dir / "source_inputs" / f"{self.jobs[2]['sample_id']}.png"),
+            "seed": self.jobs[2]["seed"], "result_path": str(raw), "metadata_path": str(raw.with_suffix(".json")),
+            "canvas_policy": "source_aspect_v1", "source_dimensions": [20, 16], "raw_dimensions": [30, 24], "target_shape": [24, 30]})
+        calls = []
+        def child(command, managed, state):
+            result = self.succeed(command, managed, state)
+            if result is not None:
+                calls.append(result.post.call_count)
+        with patch.object(campaign, "stop_qwen"), patch.object(campaign, "start_qwen"), \
+                patch.object(campaign, "run_child", side_effect=child):
+            campaign.execute(self.directory, self.config)
+        self.assertEqual(calls, [1])
+        rows = campaign.load_collection(self.directory)[0]
+        recovered = next(r for r in rows if r["sample_id"] == self.jobs[2]["sample_id"])
+        self.assertEqual(recovered["recovery"]["http_calls"], 0)
+        self.assertEqual(recovered["raw_output_sha256"], common.file_sha256(raw))
 
-    def test_final_completion_validates_real_job_seals_images_and_ledger(self):
-        campaign.validate_completed_campaign(self.config)
-        directory = Path(self.stages[1]['run_dir'])
-        original = (directory / 'generated.jsonl').read_bytes()
-        common.write_jsonl(directory / 'generated.jsonl', common.read_jsonl(directory / 'generated.jsonl')[:1])
-        with self.assertRaisesRegex(ValueError, 'Not every planned source'):
-            campaign.validate_completed_campaign(self.config)
-        (directory / 'generated.jsonl').write_bytes(original)
-        ledger = (directory / 'attempts.jsonl').read_bytes()
-        common.write_jsonl(directory / 'attempts.jsonl', common.read_jsonl(directory / 'attempts.jsonl')[:1])
-        with self.assertRaisesRegex(ValueError, 'call ledger differs'):
-            campaign.validate_completed_campaign(self.config)
-        (directory / 'attempts.jsonl').write_bytes(ledger)
-        Path(self.saved[-1]['output_path']).write_bytes(b'changed original stage image')
-        with self.assertRaisesRegex(ValueError, 'missing or changed'):
-            campaign.validate_completed_campaign(self.config)
+    def test_saved_continuation_needs_no_post_after_verification_interruption(self):
+        catalog = self.catalog()
+        stage = campaign.continuation(catalog, catalog.pending())
+        args = run.parse_args(["generate", "--run-dir", stage["run_dir"], "--max-calls", "2", "--request-timeout", "600"])
+        session, health, response = Mock(), Mock(), Mock()
+        health.json.return_value = self.health
+        session.get.return_value = health
+        raw = self.service / "quality_interrupted.png"
+        Image.new("RGB", (30, 24), (90, 110, 120)).save(raw)
+        response.json.return_value = {"result_path": str(raw), "canvas_policy": "source_aspect_v1",
+            "source_dimensions": [20, 16], "raw_dimensions": [30, 24], "target_shape": [24, 30]}
+        session.post.return_value = response
+        broken = Mock()
+        broken.evaluate.side_effect = RuntimeError("verification interrupted")
+        with patch.object(run.requests, "Session", return_value=session), \
+                patch.object(run, "QwenQualityVerifier", return_value=broken):
+            with self.assertRaisesRegex(RuntimeError, "verification interrupted"):
+                run.generate(args)
+        self.assertEqual(session.post.call_count, 1)
+        catalog.refresh()
+        with patch.object(campaign, "run_child", side_effect=self.verify_saved), \
+                patch.object(run.requests, "Session") as http:
+            campaign.recover_saved(catalog)
+        http.assert_not_called()
+        self.assertEqual(len(catalog.results), 3)
+        self.assertEqual(catalog.pending(), self.jobs[3:])
 
-    def test_execute_rechecks_artifacts_after_wait_before_recovery(self):
-        with ExitStack() as stack:
-            stack.enter_context(patch.object(campaign, 'freeze_coordinator', return_value=self.coordinator))
-            check = stack.enter_context(patch.object(campaign, 'check_frozen_artifacts',
-                                                    side_effect=[None, ValueError('changed while queued')]))
-            stack.enter_context(patch.object(campaign, 'wait_for_training'))
-            recover = stack.enter_context(patch.object(recover_interrupted, 'recover_interrupted'))
-            qwen = stack.enter_context(patch.object(campaign, 'start_qwen'))
-            with self.assertRaisesRegex(ValueError, 'changed while queued'):
-                campaign.execute(self.args, self.config)
-        self.assertEqual(check.call_count, 2)
-        recover.assert_not_called()
-        qwen.assert_not_called()
+    def test_completed_resume_preserves_frozen_training_snapshots(self):
+        self.finish()
+        names = ("summary.json", "results.jsonl", "generated.jsonl", "training_manifest.jsonl")
+        before = {name: (self.directory / name).read_bytes() for name in names}
+        with patch.object(campaign, "stop_qwen") as stop, patch.object(campaign, "start_qwen") as start, \
+                patch.object(campaign, "run_child") as child:
+            campaign.execute(self.directory, self.config)
+        self.assertEqual(stop.call_count, 2)
+        start.assert_not_called()
+        child.assert_not_called()
+        self.assertEqual(before, {name: (self.directory / name).read_bytes() for name in names})
 
-    def test_stage_subprocess_failure_never_publishes_campaign_complete(self):
-        child = Mock(returncode=1)
-        child.poll.return_value = 1
-        with ExitStack() as stack:
-            stack.enter_context(patch.object(campaign, 'freeze_coordinator', return_value=self.coordinator))
-            stack.enter_context(patch.object(campaign, 'check_frozen_artifacts'))
-            stack.enter_context(patch.object(campaign, 'wait_for_training'))
-            stack.enter_context(patch.object(recover_interrupted, 'recover_interrupted', return_value={}))
-            stack.enter_context(patch.object(campaign, 'start_qwen'))
-            stack.enter_context(patch.object(campaign.subprocess, 'Popen', return_value=child))
-            stack.enter_context(redirect_stdout(io.StringIO()))
-            with self.assertRaisesRegex(RuntimeError, 'Generation stage 1 stopped'):
-                campaign.execute(self.args, self.config)
-        self.assertNotEqual(json.loads((self.output / 'summary.json').read_text())['state'], 'complete')
+    def test_storage_failure_interrupts_owned_worker_and_releases_qwen(self):
+        synchronize = campaign.Catalog.synchronize
+        def fail_during_generation(catalog):
+            if json.loads((self.directory / "summary.json").read_text())["state"] == "generating":
+                raise OSError("simulated image library disk failure")
+            return synchronize(catalog)
+        worker = Mock()
+        worker.poll.return_value = None
+        worker.wait.return_value = 0
+        with patch.object(campaign.Catalog, "synchronize", autospec=True, side_effect=fail_during_generation), \
+                patch.object(campaign, "stop_qwen") as stop, patch.object(campaign, "start_qwen"), \
+                patch.object(campaign, "recover_saved"), patch.object(campaign.subprocess, "Popen", return_value=worker):
+            with self.assertRaisesRegex(OSError, "image library disk failure"):
+                campaign.execute(self.directory, self.config)
+        worker.send_signal.assert_called_once_with(signal.SIGINT)
+        worker.wait.assert_called_once_with(timeout=10)
+        self.assertEqual(stop.call_count, 2)
+        self.assertEqual(json.loads((self.directory / "summary.json").read_text())["state"], "stopped")
 
-    def test_complete_execution_stops_qwen_only_after_exact_total_validation(self):
-        child = Mock(returncode=0)
-        child.poll.return_value = 0
-        with ExitStack() as stack:
-            stack.enter_context(patch.object(campaign, 'freeze_coordinator', return_value=self.coordinator))
-            checks = stack.enter_context(patch.object(campaign, 'check_frozen_artifacts'))
-            wait = stack.enter_context(patch.object(campaign, 'wait_for_training'))
-            recover = stack.enter_context(patch.object(recover_interrupted, 'recover_interrupted', return_value={}))
-            qwen = stack.enter_context(patch.object(campaign, 'start_qwen'))
-            children = stack.enter_context(patch.object(campaign.subprocess, 'Popen', return_value=child))
-            systemctl = stack.enter_context(patch.object(campaign.subprocess, 'run'))
-            stack.enter_context(redirect_stdout(io.StringIO()))
-            campaign.execute(self.args, self.config)
-        wait.assert_called_once()
-        self.assertEqual(checks.call_count, 3)
-        self.assertEqual(recover.call_count, 2)
-        qwen.assert_called_once()
-        self.assertEqual(children.call_count, 2)
-        self.assertEqual([call.args[0][call.args[0].index('--run-dir') + 1] for call in children.call_args_list],
-                         [stage['run_dir'] for stage in self.stages])
-        systemctl.assert_called_once_with(['systemctl', '--user', 'stop', 'adaptvpr-lightx2v.service'], check=True)
-        summary = json.loads((self.output / 'summary.json').read_text())
-        self.assertEqual(summary['state'], 'complete')
-        self.assertEqual(summary['generated_images'], 4)
-        self.assertEqual(summary['quality_evaluated'], 4)
+    def test_competing_worker_lock_is_checked_before_stopping_qwen(self):
+        catalog = self.catalog()
+        stage = campaign.continuation(catalog, catalog.pending())
+        with run.run_lock(Path(stage["run_dir"])), patch.object(campaign, "stop_qwen") as stop:
+            with self.assertRaisesRegex(RuntimeError, "Another worker owns"):
+                campaign.execute(self.directory, self.config)
+        stop.assert_not_called()
 
-    def test_campaign_count_mismatch_cannot_publish_complete(self):
-        wrong_target = seal({**self.config, 'total_images': 5})
-        child = Mock(returncode=0)
-        child.poll.return_value = 0
-        with ExitStack() as stack:
-            stack.enter_context(patch.object(campaign, 'freeze_coordinator', return_value=self.coordinator))
-            stack.enter_context(patch.object(campaign, 'check_frozen_artifacts'))
-            stack.enter_context(patch.object(campaign, 'wait_for_training'))
-            stack.enter_context(patch.object(recover_interrupted, 'recover_interrupted', return_value={}))
-            stack.enter_context(patch.object(campaign, 'start_qwen'))
-            stack.enter_context(patch.object(campaign.subprocess, 'Popen', return_value=child))
-            stack.enter_context(redirect_stdout(io.StringIO()))
-            with self.assertRaisesRegex(ValueError, 'cumulative target'):
-                campaign.execute(self.args, wrong_target)
-        self.assertNotEqual(json.loads((self.output / 'summary.json').read_text())['state'], 'complete')
+    def test_stage_budget_and_exact_jobs_cannot_change(self):
+        catalog = self.catalog()
+        with self.assertRaisesRegex(ValueError, "1-1000 exact original"):
+            campaign.continuation(catalog, catalog.pending() * 501)
+        with self.assertRaisesRegex(ValueError, "1-1000 exact original"):
+            campaign.continuation(catalog, [{**self.jobs[2], "seed": 99}])
+        with self.assertRaisesRegex(ValueError, "1-1000 exact original"):
+            campaign.continuation(catalog, [self.jobs[0]])
 
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

@@ -1,119 +1,100 @@
-# 全部23城市：不限总张数的困难源图生成和原始SALAD训练
+# 全部 23 城市：继续生成、原始 SALAD 微调与 SVOX 测试
 
-已有任务已独立迁入 `generation_23city_v2`，采用当前最少16个匹配点、无空间覆盖率门限的审核规则。旧图片和账本保留，新结果记录旧审核来源。暂停、继续和进度命令见 [RESUME.md](RESUME.md)。
+当前任务使用 `outputs/qwen_curriculum/images/` 和 `outputs/qwen_curriculum/state/` 两个顶层目录。图片统一存放在 `images/train/`、`images/raw/`，通过审核的图片入口为 `images/accepted/`；当前计划、账本、进度及日志位于 `state/`，后续训练输出为 `state/training/`。
 
-本地已逐城市核对CSV对应图片文件、地点标签及至少4张真实视角的要求：23城市共有524701张有效真实图片、62514个地点。城市名自动从`dataset/gsv-cities/Dataframes/*.csv`发现，保留OSL、PRG、PRS、TRT等原始CSV名称。
+整理快照：已保存 21010 张、已审核 21009 张、通过 13710 张，另有 1 张已保存图片待审核；还需新生成 58416 张，总计划保持 79426 张。实时进度以 `state/summary.json` 为准。
 
-本轮全量源图筛选已完成：共79426张符合源图规则的候选，复用原7277张，新增72149张。新增生成预计需要约216.4GB存放原始PNG及训练PNG，另预留5GB；当前剩余空间和已生成张数以`summary.json`为准。按约27秒/张估算，新增生成约22.5天；这是候选数量，审核通过数量要在生成后确定。
+## 困难源图与生成配置
 
-保留原来四城的7277张生成图片和原签名结果。新增19城不设固定总张数，也不按每城250/500张截断：使用原始SALAD教师，可靠正样本相似度≥0.15，困难度位于各城70%–97.5%分位，每地点最多2张源图，保留全部符合条件的候选。源图筛选与生成后审核是两步，候选数量不等于最终审核通过数量。
+23 城市真实训练池已核对为 524701 张有效图片、62514 个至少含 4 张真实视角的地点。城市名来自 GSV-Cities 的 CSV，包括 OSL、PRG、PRS、TRT 等原始名称。源图筛选已完成，当前继续使用完整冻结计划，无需重新挖掘或准备旧批次。
 
-为控制32GB主存和磁盘读取，新增城市逐城使用磁盘memmap特征缓存，难度负样本来自该城市内其他地点，并排除25米近邻。历史四城的原评分和生成图继续引用，不改写。源图路径、内容及样本ID全局去重。全量源图筛选已通过后台`qwen-source-mining-23city.service`运行，未自动启动Qwen生成或模型训练。
+困难源图使用原始 SALAD 教师：可靠正样本相似度至少 0.15，困难度位于各城 70%–97.5% 分位，每地点最多 2 张源图，保留全部合格候选，不以每城固定张数截断。新增城市的难度负样本来自城内其他地点，排除 25 米近邻；原四城评分作为历史证据保留。样本 ID、源路径及源图内容全局去重。源图合格不等于生成后审核通过。
 
-## 1. 查看全量源图筛选
+天气比例为 night 50%、snow 20%、fog 20%、rain 10%，按完整计划分配，暂停和分批不会重排。生成不包含 overcast。
+
+仍使用 Qwen-Image-Edit-2511、Lightning 4steps BF16、guidance 1 和 `source_aspect_v1` 画布。48GB 显存配置为 `resident_bf16_48g`：32 个 DiT blocks 常驻，其余按原策略流式加载；不减步数、不量化。原始 PNG 保留，训练 PNG 以 LANCZOS 缩回源尺寸。历史稳定速度约 27 秒/张，实际耗时包含加载、审核及停机时间。
+
+当前审核 v2 要求最少 16 个匹配点、内点率至少 0.78、512 尺度的 homography 网格中位位移最多 16 像素，不设空间覆盖率门限。天气审核要求目标天气相对晴天的对比为正，且生成图的该对比高于源图。规则为实验验收标准。
+
+## 继续、暂停与查看进度
 
 ```bash
 cd /home/admin123/github/WORKSPACE
-cat outputs/qwen_curriculum/mining_23city/progress.json
-systemctl --user status qwen-source-mining-23city.service
+conda activate AdaptVPR
+
+python AdaptVPR/experiments/qwen_curriculum/resume_control.py resume
+python AdaptVPR/experiments/qwen_curriculum/resume_control.py status
 ```
 
-等待`state=complete`。最终`all_city_selection.json`提供每城候选数、总数、新增数；`additional_sources.jsonl`是19个新增城市的全部候选。中断或重启后恢复该源图任务：
+后台服务绑定 `campaign.py run --output-dir outputs/qwen_curriculum/state`，关闭终端后继续运行。需要使用电脑时执行：
 
 ```bash
-systemctl --user start qwen-source-mining-23city.service
+python AdaptVPR/experiments/qwen_curriculum/resume_control.py pause
 ```
 
-也可在服务已停止时直接运行：
+该命令同时停止协调器及独立 Qwen 服务，退出常驻模型，释放生成占用的显存和内存。稍后或重启后使用同一 `resume` 命令。已完成的图不重复生成，保存完整但未审核的图先补审核，没有完整输出的中断任务使用原参数在独立账本中重试；每次显式恢复同一任务至多新增一次尝试。
+
+查看日志及暂停后的完整性预检：
 
 ```bash
-OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 HF_HUB_OFFLINE=1 \
-/home/admin123/miniconda3/envs/AdaptVPR/bin/python \
-  AdaptVPR/experiments/qwen_curriculum/mine_all_cities.py run
+tail -f outputs/qwen_curriculum/state/generation.log
+
+python AdaptVPR/experiments/qwen_curriculum/campaign.py check
 ```
 
-## 2. 生成全部候选并审核
+启动及错误日志为 `state/coordinator.log`。预检不启动模型、不新增生成调用。空间不足时任务在生成前停止，`state/summary.json` 提供剩余图片所需空间估算；当前仍保留原始 PNG 与训练 PNG。
 
-原全量计划已经准备完成。以下命令迁移并检查已有任务；迁移已在本机完成，重复执行只校验，不启动Qwen：
-
-```bash
-/home/admin123/miniconda3/envs/AdaptVPR/bin/python \
-  AdaptVPR/experiments/qwen_curriculum/v2_campaign.py migrate \
-  --source-dir outputs/qwen_curriculum/generation_23city \
-  --output-dir outputs/qwen_curriculum/generation_23city_v2
-
-cat outputs/qwen_curriculum/generation_23city_v2/summary.json
-```
-
-累计天气比例保持night50%、snow20%、fog20%、rain10%，按累计目标精确整数分配。Qwen仍为同一2511模型、Lightning 4steps BF16、guidance1、source_aspect_v1高分辨率画布和32个常驻DiT blocks。审核按当前代码执行；训练PNG仍LANCZOS缩回源尺寸，原始PNG保留。
-
-不限张数可能需要比当前磁盘剩余空间更多的容量。`summary.json`中`required_free_bytes_estimate`为剩余图片预留估算（约3MB/图加5GB余量），`available_free_bytes`为实际可用空间；不足时生成入口在任何POST之前停止。若需要较大磁盘，在第一次生成前用该磁盘上的新`--output-dir`重新prepare/run；原四城图片继续引用原路径。单张稳定约27秒，可用最终新增数量估算总耗时。描述子缓存另约20GB，数字不包含已占用的旧数据。
-
-确认计划和空间后执行生成：
+服务停止后也可前台运行同一入口，与后台服务二选一：
 
 ```bash
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 HF_HUB_OFFLINE=1 \
 ADAPTVPR_CLIP_LOCAL_FILES_ONLY=1 \
-/home/admin123/miniconda3/envs/AdaptVPR/bin/python -u \
-  AdaptVPR/experiments/qwen_curriculum/v2_campaign.py run \
-  --output-dir outputs/qwen_curriculum/generation_23city_v2
+python -u AdaptVPR/experiments/qwen_curriculum/campaign.py run \
+  --output-dir outputs/qwen_curriculum/state
 ```
 
-所有新增任务被自动拆成不超过1000次调用的阶段。全局域和源图计划不因分批而重排。已完成图片不重复生成；已保存但未审核的图先补审核；中断且没有完整输出的任务在下次显式恢复时独立重试，原失败记录保留。每次恢复时同一任务最多新调用一次，再失败就停，避免无限重试。全部任务验证后发布`state=complete`并停止Qwen服务，`training_manifest.jsonl`只含通过审核的图。
+完整恢复说明见 [RESUME.md](RESUME.md)。
 
-后台服务已绑定新的v2目录，执行以下命令继续生成；关闭终端后继续运行，不要同时执行前台run：
+## 原始 SALAD 微调与 SVOX 测试
 
-```bash
-/home/admin123/miniconda3/envs/AdaptVPR/bin/python \
-  AdaptVPR/experiments/qwen_curriculum/resume_control.py resume
-/home/admin123/miniconda3/envs/AdaptVPR/bin/python \
-  AdaptVPR/experiments/qwen_curriculum/resume_control.py status
-```
-
-需要电脑空闲时，使用`resume_control.py pause`同时停止协调器和独立Qwen服务，释放显存、内存；稍后使用`resume`。断电后也执行同一恢复命令。完整说明见[RESUME.md](RESUME.md)。如果使用其他磁盘上的输出目录，使用对应前台命令，或先停止服务再安装该目录的覆盖配置；不要同时运行旧入口。
-
-## 3. 全23城训练命令
-
-生成全部完成后先检查：
+全部 79426 张生成和审核完成后，先检查训练数据：
 
 ```bash
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 HF_HUB_OFFLINE=1 \
-/home/admin123/miniconda3/envs/AdaptVPR/bin/python \
-  AdaptVPR/experiments/qwen_curriculum/finetune_all_cities.py check-data \
-  --generation-dir outputs/qwen_curriculum/generation_23city_v2 \
-  --output-dir outputs/qwen_curriculum/finetune_salad_pretrained_23city \
+python AdaptVPR/experiments/qwen_curriculum/finetune_all_cities.py check-data \
+  --generation-dir outputs/qwen_curriculum/state \
+  --output-dir outputs/qwen_curriculum/state/training \
   --epochs 10
 ```
 
-正式训练及随后六域SVOX评估：
+正式微调及随后自动进行的六域 SVOX 测试：
 
 ```bash
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 HF_HUB_OFFLINE=1 \
-/home/admin123/miniconda3/envs/AdaptVPR/bin/python -u \
-  AdaptVPR/experiments/qwen_curriculum/finetune_all_cities.py run \
-  --generation-dir outputs/qwen_curriculum/generation_23city_v2 \
-  --output-dir outputs/qwen_curriculum/finetune_salad_pretrained_23city \
+python -u AdaptVPR/experiments/qwen_curriculum/finetune_all_cities.py run \
+  --generation-dir outputs/qwen_curriculum/state \
+  --output-dir outputs/qwen_curriculum/state/training \
   --epochs 10
 ```
 
-加载用户指定的原始`salad/checkpoint/dino_salad.ckpt`完整骨干和原聚合器，不加载上轮微调模型；保持原始SALAD，不启用Reliability。训练参数保持与上一轮相同以便考察城市扩展：10轮、lr1e-5 cosine、AdamW weight_decay1e-4、末4个骨干block+聚合器可训、32地点×4图、224、FP32、workers0、无额外图像增强。完整23城真实池参加训练，仅合格源图按对应关系替换为生成图。实际生成图曝光比例由候选覆盖率及真实视角采样决定。
+加载指定的原始 `salad/checkpoint/dino_salad.ckpt`，使用完整原骨干和原 SALAD 聚合器，不启用 Reliability。训练为 10 轮、AdamW、lr 1e-5、cosine、weight_decay 1e-4；末 4 个骨干 block、norm 和聚合器可训练。每批 32 地点×4 图，224×224、FP32、workers 0、无额外图像增强。完整 23 城真实池参加训练，只有当前审核通过的源图按对应关系替换为生成图，数量动态读取。
 
-训练数量动态读取，不硬编码5004/7277。生成不完整、任一城市没有合格生成图、来源标签或图片校验失败时，拒绝进入部分城市训练。既定最后一轮之后自动评估原模型与微调模型的SVOX day/night/rain/snow/sun/overcast六个完整子集，均322×322、FP32、完整图库、25米正例；不使用SVOX挑选轮次。
+`state/data_config.json` 保存原权重、真实数据、骨干及城市 CSV 的独立输入证明，训练不再读取旧挖掘目录。生成尚未完成、缺少任一城市合格图、来源标签错误或校验失败时，训练入口会停止。
 
-查看训练进度：
-
-```bash
-cat outputs/qwen_curriculum/finetune_salad_pretrained_23city/progress.json
-tail -f outputs/qwen_curriculum/finetune_salad_pretrained_23city/training.log
-```
-
-默认目录还可使用已安装的后台训练服务（与前台run二选一）：
+后台训练与前台运行二选一：
 
 ```bash
 systemctl --user start salad-finetune-23city.service
 systemctl --user status salad-finetune-23city.service
 ```
 
-输出`accepted_manifest.jsonl`、`accepted_summary.json`、`finetuned/checkpoint.pt`及六域`comparison.json`。同一run命令恢复最近完整epoch及已通过协议校验的评估子集。10轮训练时间随524701张真实图规模增加，不沿用旧四城任务的运行时间估计。
+训练服务日志为 `state/training/coordinator.log`。进度及训练日志：
 
-上一轮四城微调的六域平均R@1下降约0.25个百分点。扩展数据覆盖是新的实验设置，当前没有证据保证召回提高，仍以同协议完整测试结果为准。
+```bash
+cat outputs/qwen_curriculum/state/training/progress.json
+tail -f outputs/qwen_curriculum/state/training/training.log
+```
+
+训练目录保存 `accepted_manifest.jsonl`、`accepted_summary.json`、`finetuned/checkpoint.pt` 和六域 `comparison.json`。同一训练命令可恢复最近完整 epoch 和已校验的评估结果。
+
+既定最后一轮之后，用同一协议评估原模型与微调模型的 SVOX day/night/rain/snow/sun/overcast 六个完整子集：322×322、FP32、完整图库、25 米正例。SVOX 不参与训练数据筛选或轮次选择。

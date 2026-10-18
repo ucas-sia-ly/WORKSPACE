@@ -128,13 +128,18 @@ class ReliabilityTargetCache:
 
 def load_teacher_image(path: Path, image_size: tuple[int, int]) -> torch.Tensor:
     """Exactly the non-augmented training image preprocessing."""
+    from PIL import Image
+    with Image.open(path) as original:
+        return preprocess_teacher_image(original, image_size)
+
+
+def preprocess_teacher_image(original, image_size: tuple[int, int]) -> torch.Tensor:
+    """Reuse an already decoded pair image without a second disk read/decode."""
     import numpy as np
     from PIL import Image
-
     height, width = image_size
-    with Image.open(path) as original:
-        image = original.convert("RGB").resize((width, height), Image.Resampling.BILINEAR)
-        pixels = np.asarray(image, dtype=np.float32).copy() / 255.0
+    image = original.convert("RGB").resize((width, height), Image.Resampling.BILINEAR)
+    pixels = np.asarray(image, dtype=np.float32).copy() / 255.0
     tensor = torch.from_numpy(pixels).permute(2, 0, 1)
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)

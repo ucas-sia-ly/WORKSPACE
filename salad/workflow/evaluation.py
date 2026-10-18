@@ -286,14 +286,15 @@ def load_evaluation_set(
 
 
 def extract_descriptors(model, images: Sequence[EvaluationImage], image_size: tuple[int, int],
-                        device: str, batch_size: int = 32, num_workers: int = 4):
+                        device: str, batch_size: int = 32, num_workers: int = 4,
+                        prefetch_factor: int = 2):
     """Extract float32 CPU descriptors with PIL resize and ImageNet normalization."""
     import numpy as np
     from PIL import Image
     import torch
     from torch.utils.data import DataLoader, Dataset
 
-    if batch_size <= 0 or num_workers < 0:
+    if batch_size <= 0 or num_workers < 0 or prefetch_factor < 1:
         raise ValueError("batch-size must be positive and num-workers nonnegative.")
 
     class ImageDataset(Dataset):
@@ -312,7 +313,8 @@ def extract_descriptors(model, images: Sequence[EvaluationImage], image_size: tu
             return (tensor - mean) / std
 
     loader = DataLoader(ImageDataset(), batch_size=batch_size, num_workers=num_workers,
-                        shuffle=False, pin_memory=torch.device(device).type == "cuda")
+                        shuffle=False, pin_memory=torch.device(device).type == "cuda",
+                        **({"prefetch_factor": prefetch_factor} if num_workers else {}))
     descriptors = None
     offset = 0
     model.eval()
@@ -336,6 +338,7 @@ def extract_descriptors(model, images: Sequence[EvaluationImage], image_size: tu
 def exact_retrieval(
     references, queries, positives: Sequence[Sequence[int]], *, device: str = "cpu",
     query_chunk_size: int = 32, reference_chunk_size: int = 4096,
+    reference_cache_bytes: int = 0,
 ) -> list[dict[str, Any] | None]:
     """Retrieve nearest references and exact 1-based rank of the first positive.
 
@@ -345,7 +348,7 @@ def exact_retrieval(
     """
     import torch
 
-    if query_chunk_size <= 0 or reference_chunk_size <= 0:
+    if query_chunk_size <= 0 or reference_chunk_size <= 0 or reference_cache_bytes < 0:
         raise ValueError("Retrieval chunk sizes must be positive.")
     references = torch.as_tensor(references, dtype=torch.float32).detach().cpu()
     queries = torch.as_tensor(queries, dtype=torch.float32).detach().cpu()
@@ -359,6 +362,20 @@ def exact_retrieval(
         if any(index < 0 or index >= len(references) for index in indices):
             raise ValueError("Positive reference index out of range.")
 
+    # A bounded optional device cache avoids transferring/reducing the same
+    # references twice per query chunk. The exact two-pass rank rule is unchanged.
+    cached_references = cached_norms = None
+    required_bytes = references.numel() * references.element_size() + len(references) * 4
+    if reference_cache_bytes >= required_bytes:
+        try:
+            cached_references = references.to(device)
+            cached_norms = torch.empty(len(references),device=device,dtype=torch.float32)
+            for start in range(0,len(references),reference_chunk_size):
+                part=cached_references[start:start+reference_chunk_size]
+                cached_norms[start:start+len(part)] = (part * part).sum(dim=1)
+        except torch.cuda.OutOfMemoryError:
+            cached_references = cached_norms = None
+            torch.cuda.empty_cache()
     result: list[dict[str, Any] | None] = []
     for q_start in range(0, len(queries), query_chunk_size):
         q = queries[q_start:q_start + query_chunk_size].to(device)
@@ -371,8 +388,11 @@ def exact_retrieval(
 
         def blocks():
             for r_start in range(0, len(references), reference_chunk_size):
-                r = references[r_start:r_start + reference_chunk_size].to(device)
-                distances = (q_norm + (r * r).sum(dim=1)[None, :] - 2 * q @ r.T).clamp_min_(0)
+                r = (cached_references[r_start:r_start + reference_chunk_size] if cached_references is not None
+                     else references[r_start:r_start + reference_chunk_size].to(device))
+                norms = (cached_norms[r_start:r_start + len(r)] if cached_norms is not None
+                         else (r * r).sum(dim=1))
+                distances = (q_norm + norms[None, :] - 2 * q @ r.T).clamp_min_(0)
                 yield r_start, distances
 
         for r_start, distances in blocks():

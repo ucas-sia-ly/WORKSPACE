@@ -1,64 +1,63 @@
-# 23 城市生成：按最新代码暂停与恢复
+# 23 城市生成：暂停、继续与当前目录
 
-当前后台入口是 `v2_campaign.py`，输出目录为 `outputs/qwen_curriculum/generation_23city_v2`。`resume_control.py` 自动读取后台服务绑定的目录；暂停、继续、查看进度不需要额外指定路径。
+`outputs/qwen_curriculum/` 顶层只保留两个目录：
 
-迁移采用当前审核 v2：最少16个匹配点，移除空间覆盖率门限，保留内点率、homography 位移和天气审核。原有16892张图片直接复用，利用已保存且经过校验的诊断数据重判，通过数从11049变为11056，未新增生成调用。Qwen 模型、4步 BF16、分辨率、提示词、种子、天气分配及79426张总目标保持不变。
+```text
+images/                 统一图片库及图片索引
+  train/                原尺寸训练 PNG
+  raw/                  高分辨率原始 PNG
+  accepted/             当前审核通过图片的入口
+  metadata/             生成元数据
+state/                  当前计划、账本、进度、日志与训练状态
+  history/legacy.tar.gz 原始历史配置、账本和其他证据的归档
+  training/             后续原始 SALAD 微调与 SVOX 测试输出
+```
 
-原 `generation_23city` 及更早目录保留原始图片、配置、审核结果和失败账本。新结果单独签名并记录旧结果来源；新目录引用原图片，不复制整批图片。旧源码通过 Git 历史中的精确字节校验来证明历史来源，新执行使用当前代码；不覆盖原配置或伪装成旧审核结果。
+后台入口为 `campaign.py run --output-dir outputs/qwen_curriculum/state`。`resume_control.py` 自动读取服务绑定的目录，常用命令无需额外指定路径。
+
+迁移快照共保存 **21010 张**，其中 **21009 张已审核、13710 张通过**，另有 **1 张中断时保存的图片等待补审核**。还需新生成 **58416 张**，全计划仍为 **79426 张**。本次整理没有新增生成调用；实时数量见 `state/summary.json`。
 
 ## 终端准备
-
-每次重新打开终端时执行：
 
 ```bash
 cd /home/admin123/github/WORKSPACE
 conda activate AdaptVPR
 ```
 
-## 暂停并释放显存、内存
+## 暂停并释放电脑
 
 ```bash
 python AdaptVPR/experiments/qwen_curriculum/resume_control.py pause
 ```
 
-协调器及其子进程先退出，独立 Qwen 服务随后停止。两者均已停止且主进程 PID 为0才报告资源已释放。其他训练或应用进程不受影响。不要用 `SIGSTOP` 挂起进程，它仍占用显存和内存。
+协调器及其子进程先退出，独立 Qwen 服务随后停止。只有两者均已停止且主进程 PID 为 0，才报告生成资源已释放。其他训练或应用进程不受影响。不要用 `SIGSTOP` 挂起生成进程，它仍会占用显存和内存。
 
-## 继续生成，包括断电或重启后恢复
+## 继续生成
 
 ```bash
 python AdaptVPR/experiments/qwen_curriculum/resume_control.py resume
 ```
 
-关闭终端后仍在后台运行。已完成图片（包括审核不通过的图片）不重新生成；已有完整图片但审核未完成时先补审核；没有完整输出的中断任务使用同样参数在独立执行目录重试，原失败账本保留。每次显式恢复，同一未完成任务至多新增一次尝试，再失败就停止，修复资源问题后可再次恢复。
+关闭终端后仍在后台运行。正常暂停、进程中断、电脑重启后都使用同一命令。已经完成的图片，包括审核不通过的图片，不重新生成。完整图片已保存时先补审核；没有完整输出的中断任务使用同样参数在独立执行目录重试，并保留原请求来源。每次显式恢复，同一个未完成任务最多新增一次尝试，再失败则停止，修复问题后可再次恢复。
 
-原已审核16892张；迁移另恢复了上次中断时已保存的1张原图，等待补审核。因此仍需新生成62533张，合计剩余待完成审核62534张。后续实时数量以新目录的 `summary.json` 为准。
-
-## 查看进度和日志
+## 查看进度与预检
 
 ```bash
 python AdaptVPR/experiments/qwen_curriculum/resume_control.py status
 
-tail -f outputs/qwen_curriculum/generation_23city_v2/generation.log
+tail -f outputs/qwen_curriculum/state/generation.log
 ```
 
-启动或错误日志位于同目录的 `coordinator.log`。恢复首先校验历史及已完成图片，此阶段尚未加载Qwen，可能需要几分钟。空间检查仍保留原始PNG与训练PNG，按剩余图数估算，不降低生成配置。
+启动或错误日志为 `state/coordinator.log`。恢复会先校验当前快照、账本及已完成图片，再加载 Qwen；校验阶段可能需要几分钟。状态文件中的磁盘估算继续为剩余原始 PNG 与训练 PNG 预留空间。
 
-只做完整性预检（不启动模型、不新增生成调用）：
+暂停后执行完整性预检，不启动模型或新增生成调用：
 
 ```bash
-python AdaptVPR/experiments/qwen_curriculum/v2_campaign.py check
+python AdaptVPR/experiments/qwen_curriculum/campaign.py check
 ```
 
-## 迁移重现与后续训练
+当前图片和账本包含内容校验及来源记录。不要手工删账本、修改签名、移动图片或同时运行多个生成入口。
 
-本机已准备迁移结果。以下命令可再次校验已有迁移，或在独立新目录重现；执行前保持生成服务停止：
+Qwen 模型、4 步 BF16、画布、提示词、种子和天气分配不变。审核继续使用当前 v2：最少 16 个匹配点、内点率至少 0.78、512 尺度的 homography 网格中位位移最多 16 像素，并通过天气审核；不设空间覆盖率门限。
 
-```bash
-python AdaptVPR/experiments/qwen_curriculum/v2_campaign.py migrate \
-  --source-dir outputs/qwen_curriculum/generation_23city \
-  --output-dir outputs/qwen_curriculum/generation_23city_v2
-```
-
-`migration_config.json` 记录原始文件快照、新代码SHA和重判数量；`historical_code_proofs.json` 保存旧源码证据；`imported/` 保存新审核结果及原调用来源。中断恢复继续使用已冻结的新配置，不能删除账本、移动原图片或同时启动旧入口。
-
-全部生成和审核完成后，[23城市训练说明](ALL_23_CITIES.md#3-全23城训练命令)中的训练入口会读取新目录，只用当前规则通过的图片微调原始SALAD，并测试六域SVOX。
+全部生成和审核完成后，按 [23 城市操作说明](ALL_23_CITIES.md#原始-salad-微调与-svox-测试)执行训练，输出位于 `state/training/`。

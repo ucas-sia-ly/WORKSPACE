@@ -1,4 +1,4 @@
-"""Serial, bounded Qwen generation and zero-call reuse of historical images.
+"""Serial, bounded Qwen generation and verification of already saved images.
 
 Each HTTP POST consumes a durable budget reservation before it is sent. Unknown
 or failed calls are never silently retried. Saved images can be verified again
@@ -10,7 +10,6 @@ import argparse
 from contextlib import contextmanager
 from collections import Counter
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -324,88 +323,10 @@ def generate(args):
         print(json.dumps(summary, ensure_ascii=False), flush=True)
 
 
-def historical_jobs(manifest, include_positive=False):
-    old_config = json.loads((manifest.parent / "generation_config.json").read_text())
-    original_fingerprint = old_config.pop("fingerprint")
-    # Historical runner fingerprints use the default JSON separators.
-    actual_fingerprint = hashlib.sha256(json.dumps(old_config, sort_keys=True, ensure_ascii=False,
-                                                   allow_nan=False).encode()).hexdigest()
-    if actual_fingerprint != original_fingerprint or old_config.get("mode") != "qwen":
-        raise ValueError("Historical generation configuration checksum/mode mismatch")
-    old_config["fingerprint"] = original_fingerprint
-    hashes = {row["source_path"]: row["source_sha256"] for row in old_config["sources"]}
-    prompts = {(row["cond"], row["prompt_variant"]): row["prompt"] for row in old_config["prompts"]}
-    selected = {}
-    for row in common.read_jsonl(manifest):
-        if row.get("status") != "ok" or row.get("mode") != "qwen" or row.get("cond") not in DOMAINS:
-            continue
-        if row.get("prompt_variant") not in ({"released", "positive"} if include_positive else {"released"}):
-            continue
-        if row.get("config_fingerprint") != old_config["fingerprint"]:
-            raise ValueError("Historical row belongs to another frozen configuration")
-        service_identity(row["service_health"])
-        if (row.get("prompt") != prompts.get((row["cond"], row["prompt_variant"]))
-                or row.get("negative_prompt") != old_config["negative_prompt"]
-                or row.get("seed") != common.candidate_seed(old_config["seed"], f"{row['source_path']}|{row['cond']}", 0)):
-            raise ValueError("Historical prompt or seed differs from its frozen configuration")
-        validate_image(row)
-        validate_image(row, "raw_output_path", "raw_output_sha256")
-        if common.file_sha256(Path(row["source_path"])) != hashes[row["source_path"]]:
-            raise ValueError("Historical source bytes changed")
-        sample_id = "reused_" + common.fingerprint({"output_sha256": row["output_sha256"],
-                                                    "source_sha256": hashes[row["source_path"]],
-                                                    "source_path": row["source_path"], "condition": row["cond"],
-                                                    "prompt": row["prompt"], "negative_prompt": row["negative_prompt"],
-                                                    "seed": row["seed"], "prompt_variant": row["prompt_variant"]})[:24]
-        parts = Path(row["source_path"]).name.split("_")
-        selected[sample_id] = {"sample_id": sample_id, "source_path": row["source_path"],
-                               "source_sha256": hashes[row["source_path"]], "output_path": row["output_path"],
-                               "output_sha256": row["output_sha256"], "raw_output_path": row["raw_output_path"],
-                               "raw_output_sha256": row["raw_output_sha256"], "condition": row["cond"],
-                               "city": parts[0], "place_id": int(parts[1]), "prompt": row["prompt"],
-                               "negative_prompt": row["negative_prompt"], "seed": row["seed"],
-                               "origin": "historical_qwen_pilot_not_new_hard_source_budget",
-                               "historical_manifest": str(manifest), "historical_config_fingerprint": old_config["fingerprint"],
-                               "historical_passed": row["passed"], "prompt_variant": row["prompt_variant"]}
-        with Image.open(row["source_path"]) as source, Image.open(row["output_path"]) as output:
-            source.load()
-            output.load()
-            if output.size != source.size:
-                raise ValueError("Historical normalized output differs from the source dimensions")
-    return list(selected.values())
-
-
-def import_existing(args):
-    directory = args.run_dir
-    with run_lock(directory):
-        jobs = historical_jobs(args.manifest, args.include_positive)
-        config = freeze(directory, {**execution_definition(args), "stage": "import_existing",
-                                   "manifest": str(args.manifest), "manifest_sha256": common.file_sha256(args.manifest),
-                                   "include_positive": args.include_positive, "calls": 0})
-        rows = read_rows(directory, "results.jsonl")
-        validate_records(rows, config, jobs)
-        done = {row["sample_id"] for row in rows}
-        verifier = None
-        for job in jobs:
-            if job["sample_id"] in done:
-                continue
-            try:
-                if verifier is None:
-                    verifier = QwenQualityVerifier(device=args.device, clip_device="cpu")
-                row = verify(job, verifier, config)
-            except Exception:
-                publish(directory, rows, len(jobs), 0, "stopped_on_verification_error")
-                raise
-            rows.append(row)
-            summary = publish(directory, rows, len(jobs), 0)
-            print(f"[reuse {len(rows)}/{len(jobs)}] {job['condition']} {row['status']} accepted={summary['accepted']}", flush=True)
-        print(json.dumps(publish(directory, rows, len(jobs), 0, "complete"), ensure_ascii=False), flush=True)
-
-
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     sub = parser.add_subparsers(dest="command", required=True)
-    for command in ("generate", "import-existing", "status"):
+    for command in ("generate", "status"):
         child = sub.add_parser(command, allow_abbrev=False)
         child.add_argument("--run-dir", type=Path, required=True)
         if command != "status":
@@ -415,10 +336,7 @@ def parse_args(argv=None):
         if command == "generate":
             child.add_argument("--max-calls", type=int, default=1000)
             child.add_argument("--qwen-url", default="http://127.0.0.1:8001/generate")
-            child.add_argument("--request-timeout", type=float, default=600)
-        if command == "import-existing":
-            child.add_argument("--manifest", type=Path, required=True)
-            child.add_argument("--include-positive", action="store_true")
+            child.add_argument("--request-timeout", type=float, default=600.0)
     args = parser.parse_args(argv)
     args.run_dir = args.run_dir.expanduser().resolve()
     if args.command != "status" and args.cpu_threads <= 0:
@@ -429,8 +347,6 @@ def parse_args(argv=None):
         url = urlparse(args.qwen_url)
         if url.hostname not in {"127.0.0.1", "localhost", "::1"} or url.scheme != "http":
             parser.error("Only the local Qwen service can read source paths")
-    if args.command == "import-existing":
-        args.manifest = args.manifest.expanduser().resolve()
     return args
 
 
@@ -441,8 +357,6 @@ def main(argv=None):
         torch.set_num_threads(args.cpu_threads)
     if args.command == "generate":
         generate(args)
-    elif args.command == "import-existing":
-        import_existing(args)
     else:
         print((args.run_dir / "summary.json").read_text())
 

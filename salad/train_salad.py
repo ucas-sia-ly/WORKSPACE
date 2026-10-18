@@ -52,6 +52,8 @@ def parse_args(argv=None):
     parser.add_argument("--cities", nargs="+", help="CSV city names; default all Dataframes/*.csv")
     parser.add_argument("--image-size", nargs=2, type=int, default=[224, 224], metavar=("HEIGHT", "WIDTH"))
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=2,
+                        help="Batches queued per worker; ignored when num-workers=0")
     parser.add_argument("--backbone", choices=["dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"], default="dinov2_vitb14",
                         help="Backbone for fresh runs; full checkpoint initialization infers this")
     parser.add_argument("--aggregator", choices=["salad"], default="salad")
@@ -108,6 +110,10 @@ def parse_args(argv=None):
                                 help="Fine-tune complete SALAD weights (raw, Lightning, or this entry point's checkpoint), with a fresh optimizer")
     parser.add_argument("--save-every", type=int, default=1, help="Keep a numbered checkpoint every N epochs")
     parser.add_argument("--max-batches-per-epoch", type=int, default=0, help="0 means all batches; positive for a small smoke run")
+    parser.add_argument("--max-steps", type=int, default=0,
+                        help="Optional total successful update budget; AMP skipped updates fail instead of counting toward the budget")
+    parser.add_argument("--stop-after-epoch", type=int, default=0,
+                        help="Pause after this completed epoch without changing the full cosine schedule; resume with identical training options")
     parser.add_argument("--profile-training", action="store_true",
                         help="Synchronize CUDA and log per-step compute time/allocator peaks; local distillation enables this automatically")
     parser.add_argument("--no-augment", action="store_true", help="Disable training image augmentation")
@@ -118,8 +124,10 @@ def parse_args(argv=None):
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.batch_size < 2:
         parser.error("--batch-size must be >= 2 places for metric-learning negatives")
-    if args.num_workers < 0 or args.max_batches_per_epoch < 0:
+    if args.num_workers < 0 or args.max_batches_per_epoch < 0 or args.prefetch_factor < 1:
         parser.error("Worker and batch limits cannot be negative")
+    if args.max_steps < 0 or not 0 <= args.stop_after_epoch <= args.epochs:
+        parser.error("max-steps must be nonnegative and stop-after-epoch must be between 0 and epochs")
     if args.teacher_batch_size < 0:
         parser.error("--teacher-batch-size cannot be negative")
     if args.teacher_batch_size and args.teacher_checkpoint is None:
@@ -319,6 +327,8 @@ def resolved_training_config(args, model_config, initialization=None, teacher=No
     }
     if teacher is not None:
         config["teacher"] = {**copy.deepcopy(teacher.provenance), "batch_size": args.teacher_batch_size}
+    if args.max_steps:
+        config["max_steps"] = args.max_steps
     if local_supervisor is not None:
         config["local_distillation"] = copy.deepcopy(local_supervisor.provenance)
         config["teacher"].update(targets="online_fixed_resize_source_and_generated",
@@ -411,6 +421,8 @@ def train(args):
         raise ValueError("Only CPU and CUDA devices are supported")
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable in this Python environment")
+    from workflow.resource_limits import configure_cuda_budget
+    configure_cuda_budget(device)
     if device.type == "cpu":
         os.environ["XFORMERS_DISABLED"] = "1"
     precision = ("16" if device.type == "cuda" else "32") if args.precision == "auto" else args.precision
@@ -446,6 +458,10 @@ def train(args):
             raise ValueError("--precision must match the resumed checkpoint")
         if resume["epoch"] >= args.epochs:
             raise ValueError("This checkpoint has already completed all configured epochs")
+        if args.max_steps and resume["global_step"] >= args.max_steps:
+            raise ValueError("This checkpoint has already completed its update budget")
+        if args.stop_after_epoch and args.stop_after_epoch <= resume["epoch"]:
+            raise ValueError("stop-after-epoch must be later than the resumed epoch")
     full_weights = resume is not None or initial_state is not None
     model = SALADModel(model_config, pretrained_backbone=not full_weights,
                        backbone_repo=args.backbone_repo,
@@ -454,6 +470,7 @@ def train(args):
         model.load_state_dict(resume["state_dict"], strict=True)
     elif initial_state is not None:
         load_model_state(model, initial_state, allow_new_reliability=args.reliability_ot)
+    del initial_state
     parameters = (p for p in model.parameters() if p.requires_grad)
     if args.reliability_ot:
         from workflow.reliability import reliability_losses
@@ -493,9 +510,14 @@ def train(args):
     if resume is not None and coverage_state is None:
         print(f"Checkpoint has no historical sampling statistics; coverage accounting starts at epoch {start_epoch + 1}.",
               flush=True)
+    # CPU checkpoint tensors are no longer needed; release them before workers
+    # fork so each worker does not inherit unnecessary checkpoint storage.
+    del resume, coverage_state
     place_batch_sampler = None
     loader_options = dict(num_workers=args.num_workers, pin_memory=device.type == "cuda",
                           generator=generator, worker_init_fn=seed_worker)
+    if args.num_workers:
+        loader_options["prefetch_factor"] = args.prefetch_factor
     if args.real_sampling == "coverage_pk":
         place_batch_sampler = CoveragePlaceBatchSampler(len(dataset), batch_size, args.seed)
         loader = DataLoader(dataset, batch_sampler=place_batch_sampler, **loader_options)
@@ -535,6 +557,8 @@ def train(args):
                              ot=args.ot_distill_weight)
         paired_exposure = 0
         for batch_index, batch in enumerate(loader):
+            if args.max_steps and global_step >= args.max_steps:
+                break
             if args.max_batches_per_epoch and batch_index >= args.max_batches_per_epoch:
                 break
             sampling_metadata = batch[-1]
@@ -669,8 +693,11 @@ def train(args):
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0,
                                           error_if_nonfinite=not scaler.is_enabled())
+            scale_before = scaler.get_scale() if args.max_steps else None
             scaler.step(optimizer)
             scaler.update()
+            if args.max_steps and scaler.get_scale() < scale_before:
+                raise RuntimeError("AMP skipped an optimizer update; fixed-budget run aborted. Resume from the last completed checkpoint or start a new precision configuration.")
             if profiling:
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
@@ -771,6 +798,8 @@ def train(args):
                                   **coverage.summary(), "places": coverage.place_statistics()},
                                  ensure_ascii=False) + "\n")
         print(json.dumps(row), flush=True)
+        if (args.max_steps and global_step >= args.max_steps) or (args.stop_after_epoch and epoch + 1 >= args.stop_after_epoch):
+            break
     print(f"Checkpoint: {args.output_dir / 'checkpoint.pt'}", flush=True)
 
 

@@ -79,7 +79,7 @@ class ResumeControlTests(unittest.TestCase):
             output = Path(temp) / "results with spaces"
             path = control.install_systemd_override(output, user_unit_dir=Path(temp) / "user", python="/env/bin/python")
             text = path.read_text()
-            self.assertIn("resume_campaign.py", text)
+            self.assertIn("campaign.py", text)
             self.assertIn('"--output-dir" "' + str(output.resolve()) + '"', text)
             self.assertIn("ExecStart=\nExecStart=", text)
             self.assertIn("ExecStopPost=/usr/bin/systemctl --user --no-block stop", text)
@@ -112,11 +112,11 @@ class ResumeControlTests(unittest.TestCase):
     def test_default_status_and_resume_follow_migrated_service_binding(self):
         import json
         with tempfile.TemporaryDirectory() as temp, patch.object(control.Path, "home", return_value=Path(temp)):
-            output = Path(temp) / "generation_23city_v2"
+            output = Path(temp) / "state"
             output.mkdir()
             (output / "migration_config.json").write_text('{}')
             override = control.install_systemd_override(output, python="/env/bin/python")
-            self.assertIn("v2_campaign.py", override.read_text())
+            self.assertIn("campaign.py", override.read_text())
             (output / "summary.json").write_text(json.dumps({"generated_images": 16892, "quality_version": 2}))
             with patch.object(control, "unit_state", side_effect=lambda unit: state(unit)):
                 report = control.status()
@@ -128,6 +128,16 @@ class ResumeControlTests(unittest.TestCase):
                 report = control.resume()
             self.assertEqual(report["output_dir"], str(output))
             ctl.assert_called_once_with("start", control.COORDINATOR_UNIT)
+
+    def test_controller_selection_does_not_depend_on_legacy_markers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "state"
+            output.mkdir()
+            (output / "migration_config.json").write_text('{}')
+            (output / "organization_config.json").write_text('{}')
+            path = control.install_systemd_override(output, user_unit_dir=Path(temp) / "user", python="/env/bin/python")
+            self.assertIn("campaign.py", path.read_text())
+            self.assertIn("KillMode=control-group", path.read_text())
 
 
 if __name__ == "__main__":

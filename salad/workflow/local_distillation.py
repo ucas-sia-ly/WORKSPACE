@@ -16,7 +16,7 @@ from PIL import Image
 import torch
 
 from .pair_correspondence import CorrespondenceCalibration, build_pair_correspondence
-from .reliability_cache import file_sha256, load_teacher_image
+from .reliability_cache import file_sha256, preprocess_teacher_image
 from .synthetic_losses import local_distillation_losses, local_target_weights
 from .training_data import _resolve_manifest_file
 
@@ -159,7 +159,7 @@ class LocalDistillationSupervisor:
                 source_size=source.size, generated_size=generated.size)
             geometry = self.geometry.get(self._geometry_key(identity))
             stats["geometry_cache_hits"] += int(geometry is not None)
-            inputs = torch.stack([load_teacher_image(Path(p), self.size) for p in (source_path, generated_path)])
+            inputs = torch.stack([preprocess_teacher_image(im, self.size) for im in (source, generated)])
             targets = []
             for _, descriptors, aux in self.teacher.iter_targets(inputs.to(self.device), self.chunk_size):
                 for j in range(len(descriptors)):

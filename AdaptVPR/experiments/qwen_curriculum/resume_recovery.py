@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -17,7 +18,7 @@ import warnings
 
 from PIL import Image
 
-from experiments.qwen_curriculum import common, run, recover_interrupted
+from experiments.qwen_curriculum import common, run
 
 
 def _sealed(body, field="fingerprint"):
@@ -119,6 +120,34 @@ def _warning(notes, path, reason):
     warnings.warn(f"Interrupted Qwen recovery skipped {path}: {reason}", RuntimeWarning, stacklevel=3)
 
 
+def _validate_metadata(metadata, directory, service_dir, job, config):
+    sample_id = job["sample_id"]
+    raw = Path(metadata.get("result_path", "")).resolve()
+    sidecar = Path(metadata.get("metadata_path", "")).resolve()
+    if (metadata.get("source_path") != str(directory / "source_inputs" / f"{sample_id}.png")
+            or metadata.get("seed") != job["seed"]
+            or raw.parent != service_dir or sidecar != raw.with_suffix(".json")):
+        raise ValueError("Recovery sidecar source, seed or owned paths differ")
+    canvas = config["service"].get("canvas", {})
+    if (canvas.get("target_shape_order") != "height,width"
+            or canvas.get("rounding") != "nearest_multiple"
+            or canvas.get("unsupported_aspect_ratio") != "reject"
+            or any(type(canvas.get(key)) is not int or canvas[key] <= 0
+                   for key in ("target_pixels", "multiple", "min_side", "max_side"))):
+        raise ValueError("Missing or invalid frozen source-aspect canvas definition")
+    width, height = job["source_dimensions"]
+    if max(width, height) / min(width, height) > canvas["max_side"] / canvas["min_side"]:
+        raise ValueError("Frozen source aspect ratio is unsupported")
+    scale = min(math.sqrt(canvas["target_pixels"] / (width * height)), canvas["max_side"] / max(width, height))
+    target = [max(canvas["min_side"], min(canvas["max_side"],
+                  round(side * scale / canvas["multiple"]) * canvas["multiple"])) for side in (height, width)]
+    if (metadata.get("canvas_policy") != "source_aspect_v1"
+            or metadata.get("source_dimensions") != job["source_dimensions"]
+            or metadata.get("target_shape") != target
+            or metadata.get("raw_dimensions") != target[::-1]):
+        raise ValueError("Matching service sidecar dimensions or canvas differ from frozen policy")
+
+
 def _discover(directory, job, execution, attempt, service_dir):
     notes = []
     local_raw = directory / "raw" / f"{job['sample_id']}.png"
@@ -139,7 +168,7 @@ def _discover(directory, job, execution, attempt, service_dir):
         if (metadata.get("source_path") != str(directory / "source_inputs" / f"{job['sample_id']}.png")
                 or metadata.get("seed") != job["seed"]):
             continue
-        recover_interrupted._validate_metadata(metadata, directory, service_dir, job, execution)
+        _validate_metadata(metadata, directory, service_dir, job, execution)
         original_metadata = Path(metadata["metadata_path"])
         if path not in {original_metadata, local_metadata}:
             raise ValueError("Matching recovery sidecar is outside its owned metadata path")
@@ -186,7 +215,7 @@ def _validate_intent(intent, directory, job, execution, attempt, service_dir):
         "parent_attempt_sha256": attempt["attempt_sha256"], "service_dir": str(service_dir), "http_calls": 0}
     if any(intent.get(key) != value for key, value in expected.items()):
         raise ValueError("Recovery intent belongs to a different original attempt")
-    recover_interrupted._validate_metadata(intent["metadata"], directory, service_dir, job, execution)
+    _validate_metadata(intent["metadata"], directory, service_dir, job, execution)
     raw_paths = {Path(intent["metadata"]["result_path"]), directory / "raw" / f"{job['sample_id']}.png"}
     metadata_paths = {Path(intent["metadata"]["metadata_path"]),
                       directory / "raw" / f"{job['sample_id']}.json"}

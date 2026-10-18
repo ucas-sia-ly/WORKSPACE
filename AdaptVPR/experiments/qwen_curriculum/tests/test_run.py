@@ -1,6 +1,5 @@
-"""No-model tests for the HTTP budget, durable resume and historical provenance."""
+"""No-model tests for the HTTP budget, saved-image verification and durable resume."""
 
-import hashlib
 import importlib
 import io
 import json
@@ -301,104 +300,6 @@ class RunTests(unittest.TestCase):
             imported = importlib.reload(run)
             self.assertIs(imported.common, common)
             self.assertEqual(imported.QwenQualityVerifier.__module__, "experiments.qwen_curriculum.quality")
-
-
-class HistoricalImportTests(unittest.TestCase):
-    def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.directory = self.root / "reuse"
-        self.manifest = self.root / "generation.jsonl"
-        self.source = self.root / "Bangkok_0000004_00_18.0_100.0.jpg"
-        Image.new("RGB", (20, 16), (10, 20, 30)).save(self.source)
-        self.output = self.root / "normalized.png"
-        Image.new("RGB", (20, 16), (40, 50, 60)).save(self.output)
-        self.raw = self.root / "raw.png"
-        Image.new("RGB", (30, 24), (40, 50, 60)).save(self.raw)
-        self.config = {"mode": "qwen", "seed": 42, "negative_prompt": "",
-                       "sources": [{"source_path": str(self.source), "source_sha256": common.file_sha256(self.source)}],
-                       "prompts": [{"cond": condition, "prompt_variant": variant, "prompt": f"{variant} {condition}"}
-                                   for condition in ("night", "snow", "overcast")
-                                   for variant in ("released", "positive", "no_negations")]}
-        self.write_config()
-        self.historical = [self.job(condition, variant)
-                           for condition, variant in (("night", "released"), ("snow", "released"),
-                                                      ("night", "positive"), ("night", "no_negations"), ("overcast", "released"))]
-        common.write_jsonl(self.manifest, self.historical)
-        self.verifier = Verifier()
-        self.args = run.parse_args(["import-existing", "--run-dir", str(self.directory),
-                                   "--manifest", str(self.manifest), "--device", "cpu"])
-
-    def write_config(self):
-        payload = dict(self.config)
-        payload.pop("fingerprint", None)
-        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
-        self.config = {**payload, "fingerprint": digest}
-        common.write_json(self.root / "generation_config.json", self.config)
-
-    def job(self, condition, variant):
-        return {"status": "ok", "mode": "qwen", "cond": condition, "prompt_variant": variant,
-                "prompt": f"{variant} {condition}", "negative_prompt": "", "source_path": str(self.source),
-                "output_path": str(self.output), "output_sha256": common.file_sha256(self.output),
-                "raw_output_path": str(self.raw), "raw_output_sha256": common.file_sha256(self.raw),
-                "seed": common.candidate_seed(42, f"{self.source}|{condition}", 0),
-                "service_health": dict(HEALTH), "config_fingerprint": self.config["fingerprint"], "passed": False}
-
-    def execute(self):
-        with patch.object(run.requests, "Session", side_effect=AssertionError("Historical reuse must not call HTTP")), \
-             patch.object(run, "QwenQualityVerifier", return_value=self.verifier), redirect_stdout(io.StringIO()):
-            run.import_existing(self.args)
-
-    def test_exact_import_rechecks_images_with_no_http_and_resume_skips_completed(self):
-        before = [path.read_bytes() for path in (self.source, self.output, self.raw)]
-        jobs = run.historical_jobs(self.manifest)
-        self.assertEqual([job["condition"] for job in jobs], ["night", "snow"])
-        # Equal pixels across distinct declared conditions remain distinct jobs.
-        self.assertNotEqual(jobs[0]["sample_id"], jobs[1]["sample_id"])
-        self.assertEqual(len(run.historical_jobs(self.manifest, True)), 3)
-        self.execute()
-        self.execute()
-        self.assertEqual(len(self.verifier.calls), 2)
-        rows = common.read_jsonl(self.directory / "training_manifest.jsonl")
-        self.assertEqual(len(rows), 2)
-        self.assertTrue(all(row["historical_passed"] is False for row in rows))
-        self.assertTrue(all(row["place_id"] == 4 and row["city"] == "Bangkok" for row in rows))
-        self.assertEqual([path.read_bytes() for path in (self.source, self.output, self.raw)], before)
-        self.assertEqual(json.loads((self.directory / "summary.json").read_text())["http_calls_reserved"], 0)
-
-    def test_import_verification_failure_resumes_without_new_calls(self):
-        self.verifier.error = RuntimeError("quality unavailable")
-        with self.assertRaisesRegex(RuntimeError, "quality unavailable"):
-            self.execute()
-        self.assertEqual(json.loads((self.directory / "summary.json").read_text())["state"], "stopped_on_verification_error")
-        self.verifier.error = None
-        self.execute()
-        self.assertEqual(len(common.read_jsonl(self.directory / "training_manifest.jsonl")), 2)
-
-    def test_original_config_prompt_seed_and_raw_image_changes_are_rejected(self):
-        for field, value in (("prompt", "unrecorded prompt"), ("seed", 123)):
-            rows = [dict(self.historical[0])]
-            rows[0][field] = value
-            common.write_jsonl(self.manifest, rows)
-            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "Historical prompt or seed"):
-                run.historical_jobs(self.manifest)
-        common.write_jsonl(self.manifest, self.historical)
-        self.raw.write_bytes(b"changed raw image")
-        with self.assertRaisesRegex(ValueError, "Recorded image missing or changed"):
-            run.historical_jobs(self.manifest)
-        self.config["seed"] = 43
-        common.write_json(self.root / "generation_config.json", self.config)
-        with self.assertRaisesRegex(ValueError, "configuration checksum"):
-            run.historical_jobs(self.manifest)
-
-    def test_resealed_import_record_with_wrong_metadata_is_rejected(self):
-        self.execute()
-        rows = common.read_jsonl(self.directory / "results.jsonl")
-        rows[0]["place_id"] = 99
-        common.write_jsonl(self.directory / "results.jsonl", [run.sealed(row) for row in rows])
-        with self.assertRaisesRegex(ValueError, "exact planned job"):
-            self.execute()
 
 
 if __name__ == "__main__":

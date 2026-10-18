@@ -169,173 +169,55 @@ state_dict、Lightning checkpoint 和新入口保存的 checkpoint，并从权�
 特征。输出为 `before/`、`after/` 下的结果 JSON、训练日志、实验配置及
 `comparison.json`，其中提升量的单位是百分点。已完成的输出目录拒绝覆盖。
 
-## 3.2 Qwen 困难原图挖掘、固定预算生成与来源替换训练
+## 3.2 当前 23 城市 Qwen 生成与原始 SALAD 微调
 
-新流程位于 `AdaptVPR/experiments/qwen_curriculum/`，按阶段执行，避免生成器、
-验证器和训练模型同时占用内存。先从真实 GSV 训练池提取困难视角，再为每张
-不同原图分配一个天气任务。独立评估集不参与挖掘或生成计划。
+当前源图筛选和完整 23 城市计划已经完成。Qwen 按 night/snow/fog/rain =
+50%/20%/20%/10% 生成，每张独立源图对应一个天气任务。生成图片统一位于
+`outputs/qwen_curriculum/images/`，计划、账本、进度及恢复状态位于
+`outputs/qwen_curriculum/state/`。
 
-```bash
-python AdaptVPR/experiments/qwen_curriculum/mine_sources.py \
-  --checkpoint salad/checkpoint/dino_salad.ckpt \
-  --real-data dataset/gsv-cities \
-  --cities Bangkok BuenosAires LosAngeles Medellin \
-  --output-dir outputs/qwen_curriculum/mining_4city \
-  --num-sources 1000 --batch-size 16 --num-workers 0 \
-  --query-chunk-size 128 --reference-chunk-size 1024 \
-  --backbone-repo /home/admin123/.cache/torch/hub/facebookresearch_dinov2_main \
-  --seed 42
-
-python AdaptVPR/experiments/qwen_curriculum/plan.py \
-  --sources outputs/qwen_curriculum/mining_4city/sources.jsonl \
-  --output-dir outputs/qwen_curriculum/generation_1000 \
-  --num-images 1000 --seed 42 \
-  --domain-weights night=0.5,snow=0.2,fog=0.2,rain=0.1
-
-python AdaptVPR/experiments/qwen_curriculum/run.py generate \
-  --run-dir outputs/qwen_curriculum/generation_1000 --max-calls 1000
-
-python AdaptVPR/experiments/qwen_curriculum/run.py status \
-  --run-dir outputs/qwen_curriculum/generation_1000
-```
-
-挖掘器使用同地点真实视角的留一法相似度和其他地点的困难负样本，按城市配额
-选择，并限制每地点来源数。描述子和地点中心保存为磁盘映射数组；不用把全部
-描述子读进 RAM。计划中的 1,000 个任务为 night 500、snow 200、fog 200、rain
-100；标签经过固定种子洗牌。这组比例是当前提出的先验，不是 GIFT 的精确
-配比。允许用 `--domain-stats` 提供含 `domain_weights` 和 `provenance` 的 JSON，
-或显式修改权重；不分配 overcast/sun 任务。
-
-计划复用发布版 Global 天气模板，负提示词为空；每张原图只计划一个变体。
-原图实际内容 SHA-256、尺寸、挖掘信息、提示词和种子写入 `plan.jsonl`，
-`plan_config.json` 固定请求及代码哈希。相同命令可恢复，修改配置需换输出目录。
-Qwen 保存原图对应的训练尺寸 PNG；如另存高分辨率原始输出，两种文件分开保留。
-`--max-calls` 限制本次新生成调用数，实际验收图片数以 `status` 为准。
-`attempts.jsonl` 记录调用预算，`generated.jsonl` 记录已保存的图片字节，
-`results.jsonl` 保留全部验收结果，`training_manifest.jsonl` 只供训练消费。
-
-原有 Qwen 诊断结果可单独导入和重新验收，不消耗新的生成调用：
+在工作区根目录、AdaptVPR 环境中操作后台生成：
 
 ```bash
-python AdaptVPR/experiments/qwen_curriculum/run.py import-existing \
-  --manifest outputs/gen_diagnosis/qwen_source_aspect_100src/results.jsonl \
-  --run-dir outputs/qwen_curriculum/reused_pilot
+python AdaptVPR/experiments/qwen_curriculum/resume_control.py resume
+python AdaptVPR/experiments/qwen_curriculum/resume_control.py status
+python AdaptVPR/experiments/qwen_curriculum/resume_control.py pause
 ```
 
-默认导入发布版提示词结果并排除 overcast；`--include-positive` 可另行纳入
-positive 提示词结果。导入输出与新生成批次分别记录来源和验收结果。
-
-生成、验证阶段结束后，先用下一节的 `train_compare.py prepare` 核验输入并固定
-人工复核后的训练快照。释放 Qwen 模型后，再从所选四城市的完整真实训练池
-微调 SALAD。以下是与正式对照设置一致的单支 `replace` 命令示例；正式
-REAL/REPLACE 配对实验使用下一节的 driver：
+已完成的图不重复生成；已保存但未审核的图先补审核；没有完整输出的中断任务
+在显式恢复时使用原参数重试。暂停同时停止 Qwen 服务，释放生成资源。
+暂停后可执行完整性检查：
 
 ```bash
-python salad/train_salad.py \
-  --real-data dataset/gsv-cities \
-  --synthetic-manifest outputs/qwen_curriculum/compare_4city/accepted_manifest.jsonl \
-  --cities Bangkok BuenosAires LosAngeles Medellin \
-  --init-checkpoint salad/checkpoint/dino_salad.ckpt \
-  --output-dir outputs/qwen_curriculum/manual_replace \
-  --synthetic-mode replace --synthetic-fraction 0.5 \
-  --images-per-place 4 --min-images-per-place 4 \
-  --epochs 4 --batch-size 8 --num-workers 0 \
-  --num-trainable-blocks 0 --image-size 224 224 \
-  --learning-rate 1e-6 --weight-decay 0 --no-augment \
-  --precision 32 --device cuda --save-every 4 \
-  --backbone-repo /home/admin123/.cache/torch/hub/facebookresearch_dinov2_main \
-  --seed 42
+python AdaptVPR/experiments/qwen_curriculum/campaign.py check
 ```
 
-首次使用与挖掘相同的四城市真实池，保留没有增强图的地点。当前四城市约
-45,661 张真实图；1,000 张增强图扩展到全部 23 城市约 53 万原图时，训练曝光会
-明显稀释。先固定保留评估集比较，再扩大真实池；省略 `--cities` 即使用全部
-训练城市。`replace` 先按原
-采样器选 K 个不同真实来源，再以 0.5 的概率替换有验收变体的来源槽位。
-替换图必须对应该槽位的**精确 `source_path`**；同一来源的真实图与增强图不会
-同时出现。无变体的来源仍使用原图；若 K 个槽位都被替换，则均匀选一个恢复
-为真实图，所以每地点至少保留一个真实视角。多个条件时先均匀选条件，再选
-条件内变体。磁盘上的原图全部保留。
-
-这里的 0.5 是可替换来源槽位的概率，不是整批图片有 50% 合成；实际比例写入
-`training_log.jsonl`。约 32 GB RAM 的机器建议从 8 地点 × 4 图片、0 workers
-开始；图片按需解码，worker 预取仍会占用 RAM。正式四城市对照固定使用
-0 workers 和 4 epochs。资源冒烟可另用独立目录与
-`--epochs 1 --max-batches-per-epoch 2`，其结果独立记录。
-
-训练配置与 checkpoint 保存 `synthetic_mode`；恢复必须使用原来的 mode 和
-概率。旧 checkpoint 缺少该字段时按 `mix` 恢复，旧混合采样和 summary 格式保持
-兼容。切换到来源替换是新的微调实验，使用新的输出目录和 `--init-checkpoint`。
-比较时使用相同真实池、初始化、训练预算及保留评估集，分别运行真实图 baseline、
-`mix` 和 `replace`。域权重和阈值在训练/开发数据上确定；最终测试集用于一次
-固定协议比较，不根据测试结果继续调整生成计划。
-
-## 3.3 固定 REAL / REPLACE 四城市对照
-
-`AdaptVPR/experiments/qwen_curriculum/train_compare.py` 按顺序训练两支模型。
-两支都从 `salad/checkpoint/dino_salad.ckpt` 初始化，使用 Bangkok、BuenosAires、
-LosAngeles、Medellin 的完整可用真实训练池，包含没有增强图的地点。REAL
-使用原图；REPLACE 按精确来源以 0.5 概率替换合格变体。共同设置固定为
-4 epochs、冻结全部 DINOv2、仅训练 SALAD 聚合器、学习率 `1e-6`、
-weight decay=0、无图像增广、224×224、FP32、每批 8 地点 × 4 视角、
-0 workers、seed=42。最终只使用第 4 epoch，不按测试分数选择 checkpoint。
-
-生成完成后，可先核验数据和固定协议，不加载训练或评估模型：
+全部生成和审核完成后，使用当前审核通过的图片微调原始
+`salad/checkpoint/dino_salad.ckpt`。完整 23 城市真实训练池参与训练，
+通过的生成图按精确来源替换对应原图，其他来源继续使用真实图。
 
 ```bash
-PYTHON=/home/admin123/miniconda3/envs/AdaptVPR/bin/python
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 HF_HUB_OFFLINE=1 \
+python AdaptVPR/experiments/qwen_curriculum/finetune_all_cities.py check-data \
+  --generation-dir outputs/qwen_curriculum/state \
+  --output-dir outputs/qwen_curriculum/state/training \
+  --epochs 10
 
-$PYTHON AdaptVPR/experiments/qwen_curriculum/train_compare.py prepare \
-  --generation-run-dir outputs/qwen_curriculum/generation_1000 \
-  --output-dir outputs/qwen_curriculum/compare_4city \
-  --review-exclusions outputs/qwen_curriculum/review_exclusions.jsonl \
-  --evaluate-svox
-
-$PYTHON AdaptVPR/experiments/qwen_curriculum/train_compare.py check-data \
-  --generation-run-dir outputs/qwen_curriculum/generation_1000 \
-  --output-dir outputs/qwen_curriculum/compare_4city \
-  --review-exclusions outputs/qwen_curriculum/review_exclusions.jsonl \
-  --evaluate-svox
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 HF_HUB_OFFLINE=1 \
+python -u AdaptVPR/experiments/qwen_curriculum/finetune_all_cities.py run \
+  --generation-dir outputs/qwen_curriculum/state \
+  --output-dir outputs/qwen_curriculum/state/training \
+  --epochs 10
 ```
 
-`prepare` 和 `check-data` 要求生成 `summary.json` 为 `complete`，且所有计划
-任务都有唯一结果。它们校验计划、调用账本、验收记录、真实来源、原始输出和
-训练尺寸图片的哈希，并确认 REAL/REPLACE 使用相同的可用真实地点。
-当前 `review_exclusions.jsonl` 按 `sample_id`、`source_sha256`、
-`output_sha256` 和复核理由排除两张已确认问题图；只改变
-`compare_4city/accepted_manifest.jsonl` 的冻结快照，保留生成目录的机器验收
-记录和全部图片。排除清单的内容及 SHA-256 写入 `comparison_config.json`；
-冻结后变更清单或训练设置需使用新输出目录。
+当前配置为 10 轮、学习率 `1e-5`、末 4 个骨干 block 与聚合器可训练，
+每批 32 地点 × 4 图、224×224、FP32、0 workers、无额外图像增强。
+训练完成后，用相同 322×322、FP32、25 米正例协议，评估原模型与微调模型的
+SVOX day/night/rain/snow/sun/overcast 六个完整子集。SVOX 不参与样本筛选或
+checkpoint 选择。同一训练命令可以恢复最近完整 epoch 和已经校验的评估结果。
 
-生成仍在进行时，可显式启动等待完整生成后执行的对照命令：
-
-```bash
-$PYTHON AdaptVPR/experiments/qwen_curriculum/train_compare.py run \
-  --generation-run-dir outputs/qwen_curriculum/generation_1000 \
-  --output-dir outputs/qwen_curriculum/compare_4city \
-  --wait-for-generation \
-  --generation-service qwen-curriculum-1000.service \
-  --stop-qwen-service \
-  --review-exclusions outputs/qwen_curriculum/review_exclusions.jsonl \
-  --evaluate-svox
-```
-
-等待每 60 秒只读取摘要和 systemd worker 状态，不加载模型或打开图片。
-完整摘要出现且生成 worker 退出后才继续；worker 停止但摘要不完整、停止状态
-或预算耗尽都会使训练中止。通过全部数据哈希核验后，`--stop-qwen-service`
-检查 `adaptvpr-lightx2v.service` 的 `ExecStart` 确实属于本工作区，再停止该
-Qwen 服务以释放资源。训练与评估模型按阶段加载。
-
-`--evaluate-svox` 是可选的固定终点评估。它使用原生 SVOX test 的完整
-17,166 张 gallery、14,278 张日间查询和 823 张夜间查询，25 米正样本半径、
-224×224、FP32。两支模型各提取自己的图库特征，仅评估第 4 epoch；测试集
-不用于调整训练预算、域配额或挑选 checkpoint。省略该 flag 则只完成训练。
-输出包含冻结配置与验收快照、`real/` 和 `replace/` checkpoint、分支训练日志、
-可选的 `evaluation/` 结果，以及带 checkpoint 哈希的 `comparison.json`。
-
-中断后重复相同 `run` 命令会在 epoch 边界恢复未完成的分支。已有最终
-checkpoint 会按协议检查后跳过该分支；完整 `comparison.json` 及两支权重
-校验通过时直接返回，不重新加载模型。输入、快照或代码指纹变化会拒绝复用。
+完整配置和操作说明见 [23 城市生成、微调与测试](../../AdaptVPR/experiments/qwen_curriculum/ALL_23_CITIES.md)，
+恢复细节见 [暂停与继续](../../AdaptVPR/experiments/qwen_curriculum/RESUME.md)。
 
 ## 4. 评估 SVOX
 
@@ -430,9 +312,9 @@ CPU 描述子仍需内存；`--query-chunk-size` 与 `--reference-chunk-size`
 
 ## 7. 训练池挖掘与评估反馈
 
-当前生成计划由 3.2 节的 `mine_sources.py` 从真实训练元数据构建，来源始终是
-精确的 GSV 文件和地点标签。使用新的学生 checkpoint 挖掘下一轮时，换一个
-输出目录，保留原有计划、生成结果及训练配置，便于比较。
+当前 23 城市源图筛选已经完成，生成计划保存在
+`outputs/qwen_curriculum/state/combined_plan.jsonl`，每项均绑定精确的 GSV
+源文件、内容校验和地点标签。继续生成使用现有计划和账本。
 
 外部 benchmark 检索错误不会伪造 GSV `source_id`，不直接用作生成来源。
 有真实来源映射的 GSV 派生查询可用于开发阶段诊断；独立保留评估集用于

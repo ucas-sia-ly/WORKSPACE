@@ -24,6 +24,8 @@ def parse_args(argv=None):
                         help="Explicit JSON references/queries/positive IDs; overrides dataset defaults.")
     parser.add_argument("--save-hard-cases", action="store_true",
                         help="Include all Recall@1 failures in error_queries, with exact positive rank.")
+    parser.add_argument("--save-query-results", action="store_true",
+                        help="Save every query ID, rank and validity for paired experiment comparisons")
     parser.add_argument("--split", choices=["train", "val", "test"], default="test")
     parser.add_argument("--query-subdirs", nargs="+", help="SVOX query folders, e.g. queries_night queries_rain.")
     parser.add_argument("--positive-radius", type=float, default=25.0, help="SVOX positive radius in meters.")
@@ -38,13 +40,16 @@ def parse_args(argv=None):
     parser.add_argument("--backbone-weights", type=Path, help="Local DINOv2 weights for offline loading.")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--reference-cache-mib", type=int, default=0,
+                        help="Optional bounded device cache for exact retrieval references; 0 disables")
     parser.add_argument("--query-chunk-size", type=int, default=32)
     parser.add_argument("--reference-chunk-size", type=int, default=4096)
     parser.add_argument("--limit-queries", type=int, help="Evaluate only the first N queries for smoke checks.")
     parser.add_argument("--check-data", action="store_true",
                         help="Validate dataset metadata and images, print summary, and exit without loading a model.")
     args = parser.parse_args(argv)
-    if args.batch_size <= 0 or args.num_workers < 0:
+    if args.batch_size <= 0 or args.num_workers < 0 or args.prefetch_factor < 1 or args.reference_cache_mib < 0:
         parser.error("--batch-size must be positive and --num-workers nonnegative.")
     if args.query_chunk_size <= 0 or args.reference_chunk_size <= 0:
         parser.error("Retrieval chunk sizes must be positive.")
@@ -89,21 +94,31 @@ def evaluate(args):
             raise ValueError("Evaluation supports cpu and cuda devices.")
         if parsed_device.type == "cuda" and not torch.cuda.is_available():
             raise ValueError(f"Requested {value}, but CUDA is unavailable; pass --device cpu.")
+    from workflow.resource_limits import configure_cuda_budget
+    for value in set((device, retrieval_device)):
+        configure_cuda_budget(torch.device(value))
     model = load_checkpoint_model(args.checkpoint, device=device, backbone_repo=args.backbone_repo,
                                   backbone_weights=args.backbone_weights)
     image_size = tuple(args.image_size or model.image_size)
     validate_image_size(image_size, model.config)
     print(f"Extracting {len(dataset.references)} reference descriptors on {device}...")
     references = extract_descriptors(model, dataset.references, image_size, device,
-                                    args.batch_size, args.num_workers)
+                                    args.batch_size, args.num_workers, args.prefetch_factor)
     print(f"Extracting {len(dataset.queries)} query descriptors on {device}...")
     queries = extract_descriptors(model, dataset.queries, image_size, device,
-                                 args.batch_size, args.num_workers)
+                                 args.batch_size, args.num_workers, args.prefetch_factor)
+    del model
+    if torch.device(device).type == "cuda":
+        torch.cuda.empty_cache()
     print(f"Computing exact positive ranks on {retrieval_device}...")
     retrieval = exact_retrieval(references, queries, dataset.positives, device=retrieval_device,
                                query_chunk_size=args.query_chunk_size,
-                               reference_chunk_size=args.reference_chunk_size)
+                               reference_chunk_size=args.reference_chunk_size,
+                               reference_cache_bytes=args.reference_cache_mib * 1024**2)
     result = build_results(dataset, retrieval, args.save_hard_cases)
+    if args.save_query_results:
+        result["query_results"] = [dict(query_id=query.id, rank=row["rank"] if row else None)
+                                   for query, row in zip(dataset.queries, retrieval)]
     result.update({"checkpoint": str(args.checkpoint.resolve()), "image_size": list(image_size),
                    "descriptor_dimension": references.shape[1]})
     args.output.parent.mkdir(parents=True, exist_ok=True)
