@@ -38,7 +38,36 @@ def load_config(path):
         if type(c[key]) is not int or c[key]<1: raise ValueError('Invalid '+key)
     for key in ('max_B0_drop_pp','max_B0_seed_delta_std_pp'):
         if not math.isfinite(c[key]) or c[key]<0: raise ValueError('Invalid gate')
+    if 'runtime_num_workers' in c and (type(c['runtime_num_workers']) is not int or c['runtime_num_workers']<0):
+        raise ValueError('runtime_num_workers must be a nonnegative integer')
     return c
+
+
+def runtime_parent(plan):
+    """Keep the inherited scientific protocol immutable; freeze runtime in Stage 4."""
+    parent=plan['parent']
+    if 'runtime_num_workers' not in plan['config']: return parent
+    return {**parent,'config':{**parent['config'],'num_workers':plan['config']['runtime_num_workers']}}
+
+
+def pilot_progress(directory):
+    """Expose interrupted runs even when no epoch/audit was completed."""
+    log=directory/'train.log'
+    resources=[]
+    if log.exists():
+        for line in log.read_text().splitlines():
+            if line.startswith('RESOURCE '):
+                try: resources.append(json.loads(line[len('RESOURCE '):]))
+                except json.JSONDecodeError: pass
+    status='incomplete' if log.exists() else 'not_started'
+    if resources:
+        last=resources[-1];limits=last['limits']
+        if (last['minimum_system_available_gib']<limits['host_available_reserve_gib']
+                or last['peak_tree_rss_gib']>limits['host_rss_limit_gib']):
+            status='resource_stopped'
+    if (directory/'audit.json').exists(): status='audited'
+    return dict(status=status,completed_epoch_checkpoint=(directory/'checkpoint.pt').exists(),
+                latest_resource=resources[-1] if resources else None)
 
 
 def prepare(c,out):
@@ -129,7 +158,7 @@ def specification(plan,method,global_weight=None):
 
 
 def command(plan,protocol,method,seed,directory,epoch,resume=False,global_weight=None,smoke=False):
-    parent=plan['parent'];c=parent['config'];s=specification(plan,method,global_weight)
+    parent=runtime_parent(plan);c=parent['config'];s=specification(plan,method,global_weight)
     cmd=am.baseline.training_command(parent,protocol['spec'],seed,directory,epoch,resume)
     cmd[1]=str(ccr.ROOT/'train_ccr4.py')
     cmd+=['--stage4-rng',s['rng'],'--stage4-local-mode',s['local_mode'],
@@ -151,7 +180,7 @@ def command(plan,protocol,method,seed,directory,epoch,resume=False,global_weight
 def checked(saved,plan,protocol,method,seed,global_weight,smoke):
     # Reconstruct the exact objective and stage-4 policy through the saved config
     # checks below; the trainer also requires full config equality on resume.
-    c=plan['parent']['config'];s=specification(plan,method,global_weight);t=saved['training_config']
+    c=runtime_parent(plan)['config'];s=specification(plan,method,global_weight);t=saved['training_config']
     expected_steps=am.run_plan(plan['parent'],protocol['spec'])['steps_per_epoch'][protocol['spec']['name']]
     if smoke: expected_steps=min(expected_steps,plan['config']['smoke_batches'])
     if (saved['global_step']!=saved['epoch']*expected_steps or saved['total_epochs']!=protocol['epochs']
@@ -215,7 +244,7 @@ def execute_one(plan,out,protocol,method,seed,stage,target,global_weight=None):
                       directory/'train.log',plan['parent']['config']['torch_threads'],limits=plan['parent']['config']['resource_limits'])
         if not checkpoint.exists(): raise RuntimeError('Missing completed checkpoint')
     if not smoke:
-        ccr.evaluate_checkpoint(am.ep_plan(plan['parent']),checkpoint,directory/'validation')
+        ccr.evaluate_checkpoint(am.ep_plan(runtime_parent(plan)),checkpoint,directory/'validation')
     ccr.run_child([sys.executable,str(Path(__file__).resolve()),'--config',str(out/'config.json'),'--worker','audit','--run-dir',str(directory)],
                   directory/'audit.log',plan['parent']['config']['torch_threads'],limits=plan['parent']['config']['resource_limits'])
 
@@ -413,11 +442,14 @@ def summarize(plan,out):
         missing_natural_weather_validation=parent['missing_natural_weather_validation'],B0_gate=b0_gate(plan,out),
         runs=[],paired_statistics=[],seed_distributions=[],support_comparison=[],limitations=plan['limitations'])
     report['pilot_runs']=[]
+    report['pilot_progress']=[]
     for stage in ('controls','global-screen','smoke'):
         root=out/stage/str(c['screen_seed'])
         if not root.exists(): continue
         baseline_result=result(plan,root/'A')
         for directory in sorted(root.iterdir()):
+            if not directory.is_dir(): continue
+            report['pilot_progress'].append(dict(stage=stage,method=directory.name,**pilot_progress(directory)))
             path=directory/'audit.json'
             if not path.exists(): continue
             audit=json.loads(path.read_text())
@@ -428,6 +460,13 @@ def summarize(plan,out):
             if values and baseline_result:
                 row['exploratory_delta_A_pp']=100*(values['svox_val']['recall']['R@1']-baseline_result['svox_val']['recall']['R@1'])
             report['pilot_runs'].append(row)
+    if any(r['status']=='resource_stopped' for r in report['pilot_progress']):
+        report['status']='pilot_resource_stopped'
+    elif report['pilot_progress']:
+        report['status']='pilot_progress_no_formal_results'
+    elif report['dependencies']['calibration'] or (out/'diagnostics').exists():
+        report['status']='diagnostics_ready_no_formal_results'
+    report['runtime_num_workers']=runtime_parent(plan)['config']['num_workers']
     controls={r['method']:r['audit'] for r in report['pilot_runs'] if r['stage']=='controls'}
     report['rng_controls']={method:dict(parameter_equal_A=controls[method]['parameter_sha256']==controls['A']['parameter_sha256'])
         for method in ('B0-zero','B0-zero-isolated') if method in controls and 'A' in controls}
@@ -498,6 +537,10 @@ def summarize(plan,out):
         lines.append(f"| {row['seed']} | {row['method']} | {row['recall']['svox_val']['R@1']:.4%} | {row['audit']['auxiliary_queries']} | {row['audit']['auxiliary_fraction']:.3%} |")
     lines+=['','| Module | Contrast | Evidence status |','|---|---|---|']
     lines += [f"| {r['module']} | {r['contrast']} | {r['status']} |" for r in report['module_assessment']]
+    lines+=['','## Pilot execution state','',f"DataLoader workers: {report['runtime_num_workers']}",
+            '', '| Phase | Method | State | Completed checkpoint |','|---|---|---|---|']
+    lines += [f"| {r['stage']} | {r['method']} | {r['status']} | {r['completed_epoch_checkpoint']} |"
+              for r in report['pilot_progress']]
     lines+=['','Inspect paired_statistics and seed_distributions; completion alone is not evidence of module benefit.',
         'B4/B5 support_comparison must be identical before interpreting confidence weighting.',
         'Gradients/layer Gram matrices, per-weather auxiliary losses, confidence bands and spatial support: each run attribution.jsonl.',
@@ -547,7 +590,7 @@ def main(argv=None):
             if args.seed is not None:
                 if args.seed not in seeds: raise ValueError('Seed not in declared phase')
                 seeds=[args.seed]
-            if args.phase!='smoke': ccr.evaluate_checkpoint(am.ep_plan(parent),Path(pc['checkpoint']),out/'initial')
+            if args.phase!='smoke': ccr.evaluate_checkpoint(am.ep_plan(runtime_parent(plan)),Path(pc['checkpoint']),out/'initial')
             for seed in seeds:
                 for method in methods:
                     execute_one(plan,out,protocol,method,seed,'formal' if args.phase in ('confirm-b0','local') else args.phase,

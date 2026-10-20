@@ -1,0 +1,9 @@
+{
+  "stage3_dir": "../../outputs/qwen_curriculum/state/finetuning/am_multiseed_v1",
+  "output_dir": "../../outputs/qwen_curriculum/state/finetuning/real_recovery_v1",
+  "window_steps": 100,
+  "budgets": [500, 1000],
+  "retention_weight": 0.1,
+  "retention_batch_size": 8,
+  "num_workers": 0
+}
