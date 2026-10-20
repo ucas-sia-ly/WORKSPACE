@@ -235,7 +235,12 @@ python salad/evaluate_salad.py \
 
 读取 `images/test/gallery/` 和 `images/test/queries_night/`，从文件名
 解析 UTM 坐标，以指定米制半径定义 positives。默认 query folder 是
-`queries`，可用 `--query-subdirs` 指定多个条件文件夹。
+`queries`，可用 `--query-subdirs` 指定多个条件文件夹，每个文件夹独立评测，
+gallery 特征只提取一次。单个文件夹仍写入 `--output` 指定的文件；多个文件夹
+会在输出文件名中追加目录名。例如 `--output results/svox.json --query-subdirs
+queries_night queries_rain` 分别写入 `results/svox_queries_night.json` 和
+`results/svox_queries_rain.json`，不生成合并结果。嵌套目录名中的 `/` 替换为 `__`。
+`--limit-queries` 分别限制每个文件夹的 query 数量；`--check-data` 也逐目录打印统计。
 输出中记录所用 protocol；不同 query 条件、半径、split 的结果不可混作同一协议。
 
 ## 5. 评估 Nordland

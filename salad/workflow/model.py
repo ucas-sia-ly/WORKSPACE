@@ -22,6 +22,17 @@ BACKBONE_CHANNELS = {
     "dinov2_vitg14": 1536,
 }
 
+# The original SALAD release is a raw state_dict, without training counters.
+# Pin the established local artifact by content, never by its filename. This
+# digest is also recorded by the existing Qwen curriculum and reliability runs;
+# it is not claimed to be a checksum published by the upstream author.
+REGISTERED_PRETRAINED_TEACHERS = {
+    "6b3f1720954293e83da6966c5cfcfc6713200d7fefadcca76fc51aeb80b3cada": {
+        "name": "salad_v1.0.0_dinov2_vitb14_gsv_cities",
+        "source_url": "https://github.com/serizba/salad/releases/download/v1.0.0/dino_salad.ckpt",
+    },
+}
+
 
 def default_model_config(backbone="dinov2_vitb14", image_size=(224, 224),
                          num_trainable_blocks=4, num_clusters=64,
@@ -270,55 +281,80 @@ def validate_teacher_compatibility(student_config, teacher_config, teacher_prepr
         raise ValueError("Teacher checkpoint preprocessing and model image_size disagree")
 
 
-class FrozenSALADTeacher(nn.Module):
-    """Strictly loaded, trained SALAD targets; never a random-aggregator fallback.
+def load_teacher_checkpoint(checkpoint: Path, student_config=None):
+    """Read teacher weights and provenance on CPU, without constructing a model.
 
-    Training provenance must include a positive global_step in a full workflow
-    or Lightning checkpoint. Raw tensor dictionaries cannot establish whether
-    an aggregator was trained, so they remain supported by the student loader
-    but are deliberately rejected here. Metadata is provenance, not a claim
-    that arbitrary tensor values can prove successful training.
+    Workflow/Lightning teachers require a positive training counter. Only exact
+    registered pretrained artifacts may omit it. Neither metadata nor tensor
+    inspection alone proves training quality; the model still loads strictly.
     """
+    path = Path(checkpoint).expanduser().resolve()
+    # Hash and deserialize the same open file in case a training process
+    # atomically replaces the path while this teacher is being initialized.
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+        handle.seek(0)
+        payload = torch.load(handle, map_location="cpu", weights_only=True)
+    sha256 = digest.hexdigest()
+    registered = None
+    if isinstance(payload, dict) and "state_dict" in payload:
+        trained = type(payload.get("global_step")) is int and payload["global_step"] > 0
+    else:
+        raw = isinstance(payload, dict) and bool(payload) and all(
+            isinstance(value, torch.Tensor) for value in payload.values())
+        registered = REGISTERED_PRETRAINED_TEACHERS.get(sha256) if raw else None
+        trained = registered is not None
+    if not trained:
+        raise ValueError("Teacher requires a full trained SALAD checkpoint with state_dict and positive global_step, "
+                         "or an exact SHA256-registered pretrained raw state_dict; "
+                         "random initialization and unregistered metadata-free weights are not a teacher")
+    try:
+        state, config = checkpoint_state_and_config(payload)
+    except (KeyError, AttributeError, TypeError) as exc:
+        raise ValueError("Teacher checkpoint must contain a complete SALAD backbone and aggregator") from exc
+    hparams = payload.get("hyper_parameters", {})
+    training_config = payload.get("training_config", {})
+    if not isinstance(hparams, dict) or not isinstance(training_config, dict):
+        raise ValueError("Teacher training metadata must contain dictionaries")
+    config.setdefault("image_size", [224, 224])
+    if registered is not None and student_config is not None:
+        # Raw release weights have no saved input resolution. Record the
+        # explicit workflow input policy, not an invented training resolution.
+        config["image_size"] = list(student_config["image_size"])
+    elif payload.get("model_config") is None and "image_size" in hparams:
+        size = hparams["image_size"]
+        config["image_size"] = [size, size] if isinstance(size, int) else list(size)
+    preprocessing_records = [container["image_preprocessing"] for container in (
+        payload, training_config, hparams) if "image_preprocessing" in container]
+    if any(record != preprocessing_records[0] for record in preprocessing_records):
+        raise ValueError("Teacher checkpoint contains conflicting preprocessing records")
+    preprocessing = preprocessing_records[0] if preprocessing_records else None
+    preprocessing_source = "checkpoint"
+    if preprocessing is None:
+        preprocessing = input_preprocessing(config["image_size"])
+        preprocessing_source = ("explicit_workflow_rgb_bilinear_imagenet_for_registered_raw_weights"
+                                if registered is not None else "legacy_salad_rgb_bilinear_imagenet_convention")
+    validate_teacher_compatibility(student_config or config, config, preprocessing)
+    provenance = {
+        "checkpoint": str(path), "checkpoint_sha256": sha256,
+        "checkpoint_global_step": payload.get("global_step"),
+        "model_config": copy.deepcopy(config), "image_preprocessing": preprocessing,
+        "preprocessing_source": preprocessing_source, "precision": "32",
+        "targets": "online_real_main_images", "distillation_loss": None,
+    }
+    if registered is not None:
+        provenance["training_evidence"] = {"kind": "registered_pretrained_artifact", **registered}
+    return state, config, provenance
+
+
+class FrozenSALADTeacher(nn.Module):
+    """Strictly loaded, trained SALAD targets; never a random-aggregator fallback."""
 
     def __init__(self, checkpoint: Path, student_config, *, device="cpu", backbone_repo=None):
         super().__init__()
-        path = Path(checkpoint).expanduser().resolve()
-        # Hash and load the same open file, even if another training process
-        # atomically replaces checkpoint.pt while we initialize this teacher.
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-            handle.seek(0)
-            payload = torch.load(handle, map_location="cpu", weights_only=True)
-        if (not isinstance(payload, dict) or "state_dict" not in payload or type(payload.get("global_step")) is not int
-                or payload["global_step"] <= 0):
-            raise ValueError("Teacher requires a full trained SALAD checkpoint with state_dict and positive global_step; "
-                             "random initialization or metadata-free raw weights are not a teacher")
-        try:
-            state, config = checkpoint_state_and_config(payload)
-        except (KeyError, AttributeError, TypeError) as exc:
-            raise ValueError("Teacher checkpoint must contain a complete SALAD backbone and aggregator") from exc
-        hparams = payload.get("hyper_parameters", {})
-        training_config = payload.get("training_config", {})
-        if not isinstance(hparams, dict) or not isinstance(training_config, dict):
-            raise ValueError("Teacher training metadata must contain dictionaries")
-        config.setdefault("image_size", [224, 224])
-        if payload.get("model_config") is None and "image_size" in hparams:
-            size = hparams["image_size"]
-            config["image_size"] = [size, size] if isinstance(size, int) else list(size)
-        preprocessing_records = [container["image_preprocessing"] for container in (
-            payload, training_config, hparams) if "image_preprocessing" in container]
-        if any(record != preprocessing_records[0] for record in preprocessing_records):
-            raise ValueError("Teacher checkpoint contains conflicting preprocessing records")
-        preprocessing = preprocessing_records[0] if preprocessing_records else None
-        preprocessing_source = "checkpoint"
-        if preprocessing is None:
-            # Existing workflow/Lightning SALAD checkpoints use this convention.
-            # Preserve compatibility, while explicitly recording this inference.
-            preprocessing = input_preprocessing(config["image_size"])
-            preprocessing_source = "legacy_salad_rgb_bilinear_imagenet_convention"
-        validate_teacher_compatibility(student_config, config, preprocessing)
+        state, config, provenance = load_teacher_checkpoint(checkpoint, student_config)
         if torch.device(device).type == "cpu":
             os.environ["XFORMERS_DISABLED"] = "1"
         # Construction initializes modules before strict loading. Isolate those
@@ -329,13 +365,7 @@ class FrozenSALADTeacher(nn.Module):
         self.model.to(device)
         self.requires_grad_(False)
         self.eval()
-        self.provenance = {
-            "checkpoint": str(path), "checkpoint_sha256": digest.hexdigest(),
-            "checkpoint_global_step": payload["global_step"],
-            "model_config": copy.deepcopy(config), "image_preprocessing": preprocessing,
-            "preprocessing_source": preprocessing_source, "precision": "32",
-            "targets": "online_real_main_images", "distillation_loss": None,
-        }
+        self.provenance = provenance
         self.oom_retries = 0
 
     def train(self, mode=True):

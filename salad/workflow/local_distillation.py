@@ -8,6 +8,7 @@ local view of the same exact source/generated files selected by that sampler.
 from __future__ import annotations
 
 import hashlib
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import time
@@ -28,6 +29,7 @@ class LocalDistillationSupervisor:
             raise ValueError("Stage 2C requires a teacher without a Reliability Head")
         self.size = tuple(args.image_size)
         self.mode = args.pair_confidence_mode
+        self.student_eval = getattr(args,'local_distill_eval',False)
         self.min_keep = args.ot_min_teacher_keep
         self.chunk_size = args.teacher_batch_size
         self.reliability_weight = args.reliability_generated_weight
@@ -103,6 +105,7 @@ class LocalDistillationSupervisor:
             min_teacher_keep=self.min_keep,
             feature_weight=args.feature_distill_weight, score_weight=args.score_distill_weight,
             ot_weight=args.ot_distill_weight)
+        if self.student_eval: self.provenance['student_local_mode']='eval_with_grad'
 
     @staticmethod
     def _geometry_key(identity):
@@ -208,8 +211,12 @@ class LocalDistillationSupervisor:
             teacher = {k: v.to(self.device) for k, v in pair["teacher"].items()}
             index, q = pair["index"].to(self.device), pair["q"].to(self.device)
             dtype = torch.float16 if precision == "16" else torch.bfloat16
-            with torch.autocast(device_type=self.device.type, dtype=dtype, enabled=precision != "32"):
-                descriptor, student = model(pair["image"].to(self.device), return_aux=True)
+            if self.student_eval:
+                from .real_retention import local_eval_with_grad
+            context=local_eval_with_grad(model) if self.student_eval else nullcontext()
+            with context:
+                with torch.autocast(device_type=self.device.type, dtype=dtype, enabled=precision != "32"):
+                    descriptor, student = model(pair["image"].to(self.device), return_aux=True)
             losses = local_distillation_losses(student, teacher, index, q, eps=eps, min_teacher_keep=self.min_keep)
             # This rescales each microbatch mean into the exact combined-batch
             # weighted mean, including the final epsilon only once.

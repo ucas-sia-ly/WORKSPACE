@@ -32,6 +32,7 @@
 | `outputs/qwen_curriculum/images/` | 训练 PNG、高清原图、元数据和通过审核的图片入口 |
 | `outputs/qwen_curriculum/state/` | 当前计划、账本、审核结果、进度和日志 |
 | `outputs/qwen_curriculum/state/training/` | 微调 checkpoint 与六域评估结果 |
+| `outputs/qwen_curriculum/state/finetuning/` | CCR A/M 等独立实验；每轮冻结当时的审核通过图片，保留后续增量入口 |
 
 生成与训练分阶段执行。生成服务的临时输出可能包含中断请求的完整图片，由恢复流程核验后收集。
 
@@ -41,6 +42,10 @@
 - [暂停和继续](../AdaptVPR/experiments/qwen_curriculum/RESUME.md)
 - [23 城市生成与训练命令](../AdaptVPR/experiments/qwen_curriculum/ALL_23_CITIES.md)
 - [SALAD 训练与评估](../salad/docs/workflow.md)
+- [Qwen 持续增加图片时的 CCR 微调](../salad/docs/qwen_finetuning.md)
+- [固定地点排除与全量真实 A 基线](../salad/docs/real_baseline.md)
+- [A/M 多种子公平对照与真实 val 统计](../salad/docs/am_multiseed.md)
+- [B0 归因及 Feature/OT/q 局部消融](../salad/docs/ccr_stage4.md)
 
 在工作区根目录、AdaptVPR 环境中运行当前流程测试：
 

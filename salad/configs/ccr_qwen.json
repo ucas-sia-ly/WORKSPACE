@@ -1,0 +1,170 @@
+{
+  "output_dir": "../../outputs/qwen_curriculum/state/finetuning/round_01",
+  "real_data": "../../dataset/gsv-cities",
+  "synthetic_manifest": "../../outputs/qwen_curriculum/state/training_manifest.jsonl",
+  "checkpoint": "../checkpoint/dino_salad.ckpt",
+  "teacher_checkpoint": "../checkpoint/dino_salad.ckpt",
+  "backbone_repo": "/home/admin123/.cache/torch/hub/facebookresearch_dinov2_main",
+  "pair_calibration": null,
+  "pair_geometry_cache": null,
+  "cities": [
+    "Bangkok",
+    "Barcelona",
+    "Boston",
+    "Brussels",
+    "BuenosAires",
+    "Chicago",
+    "Lisbon",
+    "London",
+    "LosAngeles",
+    "Madrid",
+    "Medellin",
+    "Melbourne",
+    "MexicoCity",
+    "Miami",
+    "Minneapolis",
+    "OSL",
+    "Osaka",
+    "PRG",
+    "PRS",
+    "Phoenix",
+    "Rome",
+    "TRT",
+    "WashingtonDC"
+  ],
+  "validation_places_per_weather": 32,
+  "partition_seed": 3041,
+  "steps": 5850,
+  "evaluation_interval": 1950,
+  "seeds": [
+    42,
+    43,
+    44
+  ],
+  "batch_size": 32,
+  "images_per_place": 4,
+  "learning_rate": 1e-05,
+  "num_trainable_blocks": 2,
+  "precision": "bf16",
+  "device": "cuda",
+  "num_workers": 4,
+  "exposure_probability": 0.5,
+  "global_weight": 0.1,
+  "feature_weight": 0.1,
+  "ot_weight": 0.1,
+  "mix_fraction": 0.5,
+  "max_real_drop_pp": 0.0,
+  "minimum_weather_gain_pp": 0.0,
+  "external_validations": [
+    {
+      "name": "svox_val",
+      "kind": "real",
+      "dataset": "SVOX",
+      "root": "../../dataset/svox",
+      "role": "validation",
+      "split": "val",
+      "query_subdirs": [
+        "queries"
+      ],
+      "cadence": "every"
+    },
+    {
+      "name": "svox_default",
+      "kind": "real",
+      "dataset": "SVOX",
+      "root": "../../dataset/svox",
+      "role": "test",
+      "split": "test",
+      "query_subdirs": [
+        "queries"
+      ],
+      "cadence": "final"
+    },
+    {
+      "name": "svox_night",
+      "kind": "natural_weather",
+      "dataset": "SVOX",
+      "root": "../../dataset/svox",
+      "role": "test",
+      "split": "test",
+      "query_subdirs": [
+        "queries_night"
+      ],
+      "cadence": "final"
+    },
+    {
+      "name": "svox_rain",
+      "kind": "natural_weather",
+      "dataset": "SVOX",
+      "root": "../../dataset/svox",
+      "role": "test",
+      "split": "test",
+      "query_subdirs": [
+        "queries_rain"
+      ],
+      "cadence": "final"
+    },
+    {
+      "name": "svox_snow",
+      "kind": "natural_weather",
+      "dataset": "SVOX",
+      "root": "../../dataset/svox",
+      "role": "test",
+      "split": "test",
+      "query_subdirs": [
+        "queries_snow"
+      ],
+      "cadence": "final"
+    },
+    {
+      "name": "svox_sun",
+      "kind": "natural_weather",
+      "dataset": "SVOX",
+      "root": "../../dataset/svox",
+      "role": "test",
+      "split": "test",
+      "query_subdirs": [
+        "queries_sun"
+      ],
+      "cadence": "final"
+    },
+    {
+      "name": "svox_overcast",
+      "kind": "natural_weather",
+      "dataset": "SVOX",
+      "root": "../../dataset/svox",
+      "role": "test",
+      "split": "test",
+      "query_subdirs": [
+        "queries_overcast"
+      ],
+      "cadence": "final"
+    }
+  ],
+  "calibration_places_per_weather": 3,
+  "calibration_tail_probability": 0.01,
+  "prefetch_factor": 1,
+  "torch_threads": 4,
+  "eval_batch_size": 64,
+  "teacher_batch_size": 2,
+  "eval_query_chunk_size": 128,
+  "eval_reference_chunk_size": 4096,
+  "eval_reference_cache_mib": 2048,
+  "resource_limits": {
+    "cuda_budget_gib": 40,
+    "cuda_reserve_gib": 4,
+    "host_rss_limit_gib": 20,
+    "host_available_reserve_gib": 3
+  },
+  "methods": [
+    "A",
+    "M"
+  ],
+  "include_proxy_evaluations": false,
+  "training_place_pool": "all_real",
+  "isolate_auxiliary_rng": true,
+  "log_mined_pairs": true,
+  "local_distill_eval": true,
+  "real_global_distill_batch_size": 2,
+  "real_global_distill_weight": 0.0
+}

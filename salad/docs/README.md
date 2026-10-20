@@ -5,6 +5,10 @@
 | 文档 | 内容 |
 |---|---|
 | [训练与评估](workflow.md) | 原生 PyTorch 入口、真实图与生成图采样、checkpoint、恢复与评估协议 |
+| [Qwen 持续增量图片微调](qwen_finetuning.md) | 推荐入口；直接读取活动目录，新实验纳入新增图片，续训使用冻结快照 |
+| [阶段二：全量真实 A 基线](real_baseline.md) | 固定地点排除、P/LR/blocks 单因素筛选、三 seed 确认与 SVOX 分类测试 |
+| [阶段三：A/M 多种子对照](am_multiseed.md) | P→LR→blocks 顺序选参、冻结 A/M25/M50、公平预算、真实 val 配对统计与 test 防泄漏 |
+| [阶段四：B0 与局部消融](ccr_stage4.md) | RNG/梯度归因、B0 行为门槛、Feature/OT/q 共同支持消融及独立报告 |
 | [Coverage PK Sampling](coverage_sampling.md) | 无状态真实图覆盖采样、epoch 与 worker 传递、恢复及曝光统计 |
 | [CCR-VPR Stage 1](ccr_vpr_stage1.md) | 真实主批次、精确源图生成辅助微批次、非对称全局损失、短程 A/B/C 命令 |
 | [CCR-VPR Stage 2A](ccr_vpr_stage2a.md) | SALAD 内部特征、冻结在线教师、分块前向、实测显存与 OT 回归 |
@@ -13,12 +17,19 @@
 | [CCR-VPR Stage 3](ccr_vpr_stage3.md) | 三态 Reliability、保留 V2 负监督、C0–C3 消融与未通过的短程效果验收 |
 | [CCR 可行性实验](ccr_feasibility.md) | A/M/B0/B4/B5 统一运行、固定更新预算、独立校准与验证、中断恢复、检索收益汇总 |
 | [4090 48GB / 32GB 运行配置](ccr_resources_4090.md) | 有界预取、BF16、精确检索缓存、显存预算与主机内存监控、本机短程测量 |
+| [首轮 13,710 张图片实验记录](ccr_accepted_13710.md) | 历史冻结配置与数据范围；新实验使用上方 Qwen 通用入口 |
+| [Stage 1 零更新诊断](ccr_stage1_diagnostics.md) | 固定batch梯度范数/夹角、P8/16/32 mining、Feature/Score/OT Dropout与精度对照 |
+| [200-batch 扫描与后续改进](ccr_followup.md) | 审核结论、来源明确的mining、可选真实描述子保持、局部eval、全真实池及三种子命令 |
 | [Reliability OT](reliability_ot.md) | 可选 patch 可靠性分支、dustbin 偏置、弱监督、单图推理与 v1 兼容性 |
 | [Reliability OT v2](reliability_v2.md) | 固定教师缓存、局部几何负监督、轻量上下文与消融设置 |
 | [原版 SALAD](../README.md) | 原版环境、数据集、Lightning 训练与论文引用 |
 
 ## 代码入口
 
+- [run_qwen_finetune.py](../run_qwen_finetune.py)：Qwen 当前 accepted 图片快照及微调入口，复用 CCR 实验运行器。
+- [run_real_baseline.py](../run_real_baseline.py)：纯真实 A 基线；默认仅准备，按筛选、确认、分类测试分阶段执行。
+- [run_am_multiseed.py](../run_am_multiseed.py)：独立 A/M 多种子实验；默认只预检查，不读取 test。
+- [run_ccr_stage4.py](../run_ccr_stage4.py)：第四阶段归因与局部消融；依赖第三阶段冻结协议，B0 未通过时拒绝正式局部训练。
 - [train_salad.py](../train_salad.py)：项目训练入口；可靠性分支默认关闭。
 - [evaluate_salad.py](../evaluate_salad.py)：项目 checkpoint 评估入口。
 - [cache_reliability_targets.py](../cache_reliability_targets.py)：离线构建可靠性目标缓存。

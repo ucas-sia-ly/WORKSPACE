@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import copy
 import hashlib
 import json
@@ -40,6 +41,16 @@ def parse_args(argv=None):
     parser.add_argument("--ot-distill-weight", type=float, default=0.0)
     parser.add_argument("--pair-confidence-mode", choices=["uniform", "verified"], default="uniform",
                         help="Same Stage 2B A correspondences: uniform q=1 or verified soft positive_conf")
+    parser.add_argument("--local-distill-eval", action="store_true",
+                        help="Disable stochastic layers only during local student supervision; keep gradients")
+    parser.add_argument("--real-global-distill-weight", type=float, default=0.0,
+                        help="Optional FP32 eval descriptor retention on current real inputs against frozen teacher")
+    parser.add_argument("--real-global-distill-batch-size", type=int, default=2,
+                        help="Bounded student/teacher chunk size for real descriptor retention")
+    parser.add_argument("--isolate-auxiliary-rng", action="store_true",
+                        help="Use separate deterministic per-step model RNG for auxiliary forwards")
+    parser.add_argument("--log-mined-pairs", action="store_true",
+                        help="Record directed mined pairs by real/synthetic anchor and reference source")
     parser.add_argument("--pair-calibration", type=Path,
                         help="Stage 2B calibration JSON for this teacher and preprocessing; required by local losses")
     parser.add_argument("--pair-calibration-index", type=int, default=0)
@@ -49,6 +60,8 @@ def parse_args(argv=None):
                         help="Exclude numerically negligible teacher cluster mass from conditional OT; default FP32 epsilon")
     parser.add_argument("--synthetic-places-only", action="store_true",
                         help="Train only eligible places with at least one accepted synthetic view")
+    parser.add_argument("--exclude-places", type=Path,
+                        help="JSON list of [city,place_id] held-out identities, excluded from real and synthetic pools")
     parser.add_argument("--cities", nargs="+", help="CSV city names; default all Dataframes/*.csv")
     parser.add_argument("--image-size", nargs=2, type=int, default=[224, 224], metavar=("HEIGHT", "WIDTH"))
     parser.add_argument("--num-workers", type=int, default=4)
@@ -132,6 +145,12 @@ def parse_args(argv=None):
         parser.error("--teacher-batch-size cannot be negative")
     if args.teacher_batch_size and args.teacher_checkpoint is None:
         parser.error("--teacher-batch-size requires --teacher-checkpoint")
+    if not math.isfinite(args.real_global_distill_weight) or args.real_global_distill_weight < 0:
+        parser.error("--real-global-distill-weight must be finite and nonnegative")
+    if args.real_global_distill_batch_size < 1:
+        parser.error("--real-global-distill-batch-size must be positive")
+    if args.real_global_distill_weight and args.teacher_checkpoint is None:
+        parser.error("Real descriptor retention requires --teacher-checkpoint")
     if args.learning_rate <= 0 or args.weight_decay < 0 or args.miner_margin < 0:
         parser.error("Learning rate must be positive; weight decay/miner margin cannot be negative")
     if args.synthetic_places_only and args.synthetic_manifest is None:
@@ -292,6 +311,34 @@ def filter_synthetic_places(dataset):
     })
 
 
+def exclude_places(dataset, path):
+    rows=json.loads(path.read_text())
+    if not isinstance(rows,list) or any(not isinstance(row,list) or len(row)!=2
+            or not isinstance(row[0],str) or type(row[1]) is not int for row in rows):
+        raise ValueError('exclude-places must contain a JSON list of [city, integer place_id]')
+    identities={tuple(row) for row in rows};before=len(dataset.places)
+    dataset.places=[place for place in dataset.places if (place.city,place.place_id) not in identities]
+    for label,place in enumerate(dataset.places): place.label=label
+    dataset.summary.update(num_places=len(dataset.places),
+        num_real_images=sum(len(p.real_paths) for p in dataset.places),
+        num_synthetic_images=sum(len(p.synthetic_paths) for p in dataset.places),
+        places_with_synthetic=sum(bool(p.synthetic_paths) for p in dataset.places),
+        excluded_places=dataset.summary['excluded_places']+before-len(dataset.places),
+        excluded_by_place_file=before-len(dataset.places),
+        exclusion_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+
+
+@contextmanager
+def auxiliary_model_rng(args,device,step,branch):
+    if not args.isolate_auxiliary_rng:
+        yield;return
+    import torch
+    devices=[device.index if device.index is not None else torch.cuda.current_device()] if device.type=='cuda' else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed((args.seed+19_000_003+step*1_000_003+branch*1009)%(2**63))
+        yield
+
+
 def resolved_training_config(args, model_config, initialization=None, teacher=None, local_supervisor=None):
     dataframes = args.real_data.expanduser().resolve() / "Dataframes"
     metadata = [dataframes / f"{city}.csv" for city in sorted(args.cities)] if args.cities else sorted(dataframes.glob("*.csv"))
@@ -329,6 +376,15 @@ def resolved_training_config(args, model_config, initialization=None, teacher=No
         config["teacher"] = {**copy.deepcopy(teacher.provenance), "batch_size": args.teacher_batch_size}
     if args.max_steps:
         config["max_steps"] = args.max_steps
+    if args.exclude_places:
+        config['excluded_places']={'path':str(args.exclude_places.resolve()),
+            'sha256':hashlib.sha256(args.exclude_places.read_bytes()).hexdigest()}
+    if args.real_global_distill_weight:
+        config['real_descriptor_retention']=dict(weight=args.real_global_distill_weight,
+            batch_size=args.real_global_distill_batch_size,student_mode='eval_with_grad_fp32',
+            teacher_mode='frozen_eval_no_grad_fp32',loss='half_squared_normalized_descriptor_distance',
+            input='same_current_augmented_real_images')
+    if args.log_mined_pairs: config['log_mined_pairs']=True
     if local_supervisor is not None:
         config["local_distillation"] = copy.deepcopy(local_supervisor.provenance)
         config["teacher"].update(targets="online_fixed_resize_source_and_generated",
@@ -343,6 +399,7 @@ def resolved_training_config(args, model_config, initialization=None, teacher=No
             "source_policy": "exact_current_batch_source_only",
             "rng": "independent_checkpointed_python_v1",
         }
+        if args.isolate_auxiliary_rng: config['synthetic_aux']['model_rng']='isolated_torch_per_step_v1'
     if args.reliability_ot:
         config["reliability"] = {
             "loss_weight": args.reliability_loss_weight,
@@ -408,6 +465,8 @@ def train(args):
         args.reliability_cache_integrity = dataset.reliability_target_cache.integrity_digest
     if args.synthetic_places_only:
         filter_synthetic_places(dataset)
+    if args.exclude_places:
+        exclude_places(dataset,args.exclude_places)
     aux_sampler = SyntheticAuxSampler(dataset, args.synthetic_exposure_prob, args.seed) if args.synthetic_aux else None
     if len(dataset) < 2:
         raise ValueError("Need at least two eligible places for metric-learning positives and negatives")
@@ -552,6 +611,7 @@ def train(args):
         teacher_statistics = None
         local_sums = {}
         runtime_sums = {}
+        retention_sums={};mining_sums={};mining_empty_batches=0;clip_batches=0
         profiling = local_supervisor is not None or args.profile_training
         local_weights = dict(feature=args.feature_distill_weight, score=args.score_distill_weight,
                              ot=args.ot_distill_weight)
@@ -580,13 +640,14 @@ def train(args):
                 images, labels, synthetic = batch
             images = images.flatten(0, 1).to(device, non_blocking=True)
             labels = labels.flatten().to(device, non_blocking=True)
+            retention_images=images[~synthetic.flatten().to(device)] if args.real_global_distill_weight else None
             if profiling:
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                     torch.cuda.reset_peak_memory_stats(device)
                 step_started = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
-            if teacher is not None and local_supervisor is None:
+            if teacher is not None and local_supervisor is None and not args.real_global_distill_weight:
                 # Stage 2A probes the online real-image target interface only.
                 # Consume chunks immediately; no teacher feature or OT loss yet.
                 teacher_images = images if not bool(synthetic.any()) else images[~synthetic.flatten().to(device)]
@@ -652,6 +713,20 @@ def train(args):
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Nonfinite loss at epoch={epoch + 1}, batch={batch_index}")
             loss_value = float(loss.detach())
+            if args.log_mined_pairs:
+                from workflow.mining_diagnostics import source_aware_mined_pair_statistics
+                mined=source_aware_mined_pair_statistics(descriptors.detach(),labels,synthetic.flatten().to(device),
+                    epsilon=args.miner_margin,include_per_anchor=False,
+                    loss_value=metric_loss.detach() if args.reliability_ot else loss.detach())
+                mining_empty_batches+=int(mined['empty_mining_mask'])
+                for key in ('positive_pairs','negative_pairs','mined_positive_pairs','mined_negative_pairs','batch_size'):
+                    mining_sums[key]=mining_sums.get(key,0)+mined[key]
+                for source,counters in mined['source_pairs'].items():
+                    for kind,value in counters.items():
+                        key=source+'_'+kind;mining_sums[key]=mining_sums.get(key,0)+value
+                for source,counters in mined['source_anchors'].items():
+                    for kind,value in counters.items():
+                        key=source+'_'+kind;mining_sums[key]=mining_sums.get(key,0)+value
             scaler.scale(loss).backward()
             if aux_sampler is not None:
                 real_loss_sum += float(metric_loss.detach()) if args.reliability_ot else loss_value
@@ -661,8 +736,9 @@ def train(args):
                 aux_batch = aux_sampler.sample(sampling_metadata)
                 if len(aux_batch["synthetic_images"]):
                     query_images = aux_batch["synthetic_images"].to(device, non_blocking=True)
-                    with torch.autocast(device_type=device.type, dtype=dtype, enabled=precision != "32"):
-                        queries = model(query_images)
+                    with auxiliary_model_rng(args,device,global_step,0):
+                        with torch.autocast(device_type=device.type, dtype=dtype, enabled=precision != "32"):
+                            queries = model(query_images)
                     aux_loss = asymmetric_multi_positive_infonce(
                         queries, aux_batch["synthetic_labels"].to(device), references, reference_labels,
                         temperature=args.synthetic_global_temperature,
@@ -679,8 +755,9 @@ def train(args):
                 if local_supervisor is not None:
                     try:
                         prepared, totals, local_stats = local_supervisor.prepare(aux_batch)
-                        local_metrics = local_supervisor.backward(model, prepared, totals, scaler,
-                                                                  precision, local_weights, global_step=global_step)
+                        with auxiliary_model_rng(args,device,global_step,1):
+                            local_metrics = local_supervisor.backward(model, prepared, totals, scaler,
+                                                                      precision, local_weights, global_step=global_step)
                     except (RuntimeError, ValueError):
                         optimizer.zero_grad(set_to_none=True)
                         raise
@@ -689,10 +766,21 @@ def train(args):
                         local_sums[key] = local_sums.get(key, 0.) + value
                     del prepared, totals, local_stats, local_metrics
                 del references, reference_labels, aux_batch
+            if args.real_global_distill_weight:
+                from workflow.real_retention import backward_real_retention
+                try:
+                    retention=backward_real_retention(model,teacher,retention_images,scaler,
+                        args.real_global_distill_weight,chunk_size=args.real_global_distill_batch_size)
+                except (RuntimeError,ValueError):
+                    optimizer.zero_grad(set_to_none=True);raise
+                loss_value+=retention['weighted_total']
+                for key,value in retention.items(): retention_sums[key]=retention_sums.get(key,0)+value
+            del retention_images
             # One unscale/clip/step/update for real, query, local and head gradients.
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0,
+            gradient_norm=torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0,
                                           error_if_nonfinite=not scaler.is_enabled())
+            if args.log_mined_pairs: clip_batches+=int(gradient_norm>1.)
             scale_before = scaler.get_scale() if args.max_steps else None
             scaler.step(optimizer)
             scaler.update()
@@ -734,6 +822,17 @@ def train(args):
             row["teacher"] = {**teacher_statistics,
                               "seconds_per_image": teacher_statistics["seconds"] / teacher_statistics["images"],
                               "mode": "online_targets_only_no_distillation"}
+        if args.real_global_distill_weight:
+            row['real_descriptor_retention']={k:(v if k in ('images','chunks','invalid_targets','valid_targets') else v/steps)
+                for k,v in retention_sums.items()}
+            row['real_descriptor_retention']['weight']=args.real_global_distill_weight
+        if args.log_mined_pairs:
+            anchor_exposures=mining_sums.pop('batch_size',0)
+            row['mining']={**mining_sums,'anchor_exposures':anchor_exposures,
+                'active_anchor_fraction':(mining_sums.get('real_active_anchors',0)+mining_sums.get('synthetic_active_anchors',0))/max(1,anchor_exposures),
+                'no_mined_pair_batches':mining_empty_batches,
+                'no_mined_pair_batch_fraction':mining_empty_batches/steps,
+                'clip_batches':clip_batches,'clip_batch_fraction':clip_batches/steps}
         if aux_sampler is not None:
             row["synthetic_aux"] = {
                 **aux_sampler.summary(), "loss_real": real_loss_sum / steps,

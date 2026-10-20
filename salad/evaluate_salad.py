@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 def parse_args(argv=None):
@@ -19,7 +19,8 @@ def parse_args(argv=None):
         "pitts30k_val", "pitts30k_test", "pitts250k_test",
     ])
     parser.add_argument("--dataset-root", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True, help="Evaluation results JSON.")
+    parser.add_argument("--output", type=Path, required=True,
+                        help="Evaluation results JSON; multiple query-subdirs append each folder name to the stem.")
     parser.add_argument("--eval-manifest", type=Path,
                         help="Explicit JSON references/queries/positive IDs; overrides dataset defaults.")
     parser.add_argument("--save-hard-cases", action="store_true",
@@ -27,7 +28,10 @@ def parse_args(argv=None):
     parser.add_argument("--save-query-results", action="store_true",
                         help="Save every query ID, rank and validity for paired experiment comparisons")
     parser.add_argument("--split", choices=["train", "val", "test"], default="test")
-    parser.add_argument("--query-subdirs", nargs="+", help="SVOX query folders, e.g. queries_night queries_rain.")
+    parser.add_argument("--query-subdirs", nargs="+",
+                        help="SVOX query folders to evaluate separately, e.g. queries_night queries_rain; shares gallery extraction.")
+    parser.add_argument("--svox-query-groups",type=Path,
+                        help="JSON mapping result names to SVOX query folders; shares gallery extraction, writes one JSON per group beside --output")
     parser.add_argument("--positive-radius", type=float, default=25.0, help="SVOX positive radius in meters.")
     parser.add_argument("--frame-window", type=int, default=10, help="Local Nordland positive frame tolerance.")
     parser.add_argument("--metadata-root", type=Path,
@@ -49,6 +53,8 @@ def parse_args(argv=None):
     parser.add_argument("--check-data", action="store_true",
                         help="Validate dataset metadata and images, print summary, and exit without loading a model.")
     args = parser.parse_args(argv)
+    if args.svox_query_groups and (args.dataset!='SVOX' or args.eval_manifest or args.query_subdirs):
+        parser.error('--svox-query-groups requires SVOX without eval-manifest or query-subdirs')
     if args.batch_size <= 0 or args.num_workers < 0 or args.prefetch_factor < 1 or args.reference_cache_mib < 0:
         parser.error("--batch-size must be positive and --num-workers nonnegative.")
     if args.query_chunk_size <= 0 or args.reference_chunk_size <= 0:
@@ -71,13 +77,38 @@ def evaluate(args):
     from workflow.evaluation import (build_results, exact_retrieval, extract_descriptors,
                                      load_evaluation_set)
 
-    dataset = load_evaluation_set(
-        args.dataset, args.dataset_root, manifest=args.eval_manifest, split=args.split,
-        query_subdirs=args.query_subdirs, positive_radius=args.positive_radius,
-        frame_window=args.frame_window, metadata_root=args.metadata_root,
-        limit_queries=args.limit_queries,
-    )
-    print(json.dumps(dataset.summary(), ensure_ascii=False, indent=2))
+    groups = {args.output.stem: args.query_subdirs}
+    outputs = {args.output.stem: args.output}
+    if args.svox_query_groups:
+        groups=json.loads(args.svox_query_groups.read_text())
+        if (not isinstance(groups,dict) or not groups
+                or any(not name.replace('_','').isalnum() or not isinstance(folders,list) or not folders
+                       or any(not isinstance(folder,str) or not folder for folder in folders)
+                       for name,folders in groups.items())):
+            raise ValueError('SVOX groups require simple names and nonempty lists of query folders')
+        outputs = {name: args.output.parent / (name + '.json') for name in groups}
+    elif (args.dataset == "SVOX" and len(args.query_subdirs or []) > 1
+          and not args.eval_manifest
+          and not (args.dataset_root.expanduser() / "evaluation_manifest.json").is_file()):
+        groups = {PurePosixPath(folder).as_posix(): [folder] for folder in args.query_subdirs}
+        if len(groups) != len(args.query_subdirs):
+            raise ValueError("Repeated query folders in --query-subdirs.")
+        outputs = {name: args.output.with_name(
+            f"{args.output.stem}_{name.replace('/', '__')}{args.output.suffix}") for name in groups}
+        if len(set(outputs.values())) != len(outputs):
+            raise ValueError("Query folder names produce duplicate output paths.")
+    datasets=[]
+    for name,folders in groups.items():
+        dataset = load_evaluation_set(
+            args.dataset, args.dataset_root, manifest=args.eval_manifest, split=args.split,
+            query_subdirs=folders, positive_radius=args.positive_radius,
+            frame_window=args.frame_window, metadata_root=args.metadata_root,
+            limit_queries=args.limit_queries,
+        )
+        if datasets and dataset.references!=datasets[0][1].references:
+            raise ValueError('Grouped evaluation requires an identical ordered gallery')
+        datasets.append((name,dataset))
+        print(json.dumps(dict(group=name,**dataset.summary()), ensure_ascii=False, indent=2))
     if args.check_data:
         return 0
 
@@ -101,30 +132,32 @@ def evaluate(args):
                                   backbone_weights=args.backbone_weights)
     image_size = tuple(args.image_size or model.image_size)
     validate_image_size(image_size, model.config)
-    print(f"Extracting {len(dataset.references)} reference descriptors on {device}...")
-    references = extract_descriptors(model, dataset.references, image_size, device,
+    print(f"Extracting {len(datasets[0][1].references)} reference descriptors on {device}...")
+    references = extract_descriptors(model, datasets[0][1].references, image_size, device,
                                     args.batch_size, args.num_workers, args.prefetch_factor)
-    print(f"Extracting {len(dataset.queries)} query descriptors on {device}...")
-    queries = extract_descriptors(model, dataset.queries, image_size, device,
-                                 args.batch_size, args.num_workers, args.prefetch_factor)
-    del model
-    if torch.device(device).type == "cuda":
-        torch.cuda.empty_cache()
-    print(f"Computing exact positive ranks on {retrieval_device}...")
-    retrieval = exact_retrieval(references, queries, dataset.positives, device=retrieval_device,
-                               query_chunk_size=args.query_chunk_size,
-                               reference_chunk_size=args.reference_chunk_size,
-                               reference_cache_bytes=args.reference_cache_mib * 1024**2)
-    result = build_results(dataset, retrieval, args.save_hard_cases)
-    if args.save_query_results:
-        result["query_results"] = [dict(query_id=query.id, rank=row["rank"] if row else None)
-                                   for query, row in zip(dataset.queries, retrieval)]
-    result.update({"checkpoint": str(args.checkpoint.resolve()), "image_size": list(image_size),
-                   "descriptor_dimension": references.shape[1]})
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(" ".join(f"{key}={value:.4f}" for key, value in result["recall"].items()))
-    print(f"Saved evaluation results to {args.output}")
+    for position,(name,dataset) in enumerate(datasets):
+        print(f"Extracting {name}: {len(dataset.queries)} query descriptors on {device}...")
+        queries = extract_descriptors(model, dataset.queries, image_size, device,
+                                     args.batch_size, args.num_workers, args.prefetch_factor)
+        if position==len(datasets)-1: del model
+        if torch.device(device).type == "cuda": torch.cuda.empty_cache()
+        print(f"Computing exact positive ranks on {retrieval_device}...")
+        retrieval = exact_retrieval(references, queries, dataset.positives, device=retrieval_device,
+                                   query_chunk_size=args.query_chunk_size,
+                                   reference_chunk_size=args.reference_chunk_size,
+                                   reference_cache_bytes=args.reference_cache_mib * 1024**2)
+        result = build_results(dataset, retrieval, args.save_hard_cases)
+        if args.save_query_results:
+            result["query_results"] = [dict(query_id=query.id, rank=row["rank"] if row else None)
+                                       for query, row in zip(dataset.queries, retrieval)]
+        result.update({"checkpoint": str(args.checkpoint.resolve()), "image_size": list(image_size),
+                       "descriptor_dimension": references.shape[1]})
+        output = outputs[name]
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(name+': '+" ".join(f"{key}={value:.4f}" for key, value in result["recall"].items()))
+        print(f"Saved evaluation results to {output}")
+        del queries,retrieval,result
     return 0
 
 

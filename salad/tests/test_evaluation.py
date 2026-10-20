@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from workflow.evaluation import (EvaluationImage, EvaluationSet, build_results,
                                  coordinate_positives, exact_retrieval,
                                  extract_descriptors, load_evaluation_set, load_manifest)
-from evaluate_salad import validate_image_size
+from evaluate_salad import evaluate, parse_args, validate_image_size
 
 
 class EvaluationMetadataTests(unittest.TestCase):
@@ -139,6 +142,113 @@ class EvaluationMetadataTests(unittest.TestCase):
             validate_image_size((320, 322), config)
         with self.assertRaisesRegex(ValueError, "more than 64"):
             validate_image_size((112, 112), config)
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
+class SVOXQuerySubdirTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        for folder in ("gallery", "queries", "queries_night", "queries_rain"):
+            for coordinate in (0, 100):
+                path = self.root / "images/test" / folder / f"@{coordinate}@{coordinate}@image@.jpg"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+
+    def args(self, *extra):
+        return parse_args(["--checkpoint", str(self.root / "checkpoint.pt"), "--dataset", "SVOX",
+                           "--dataset-root", str(self.root), "--output", str(self.root / "results.json"),
+                           "--device", "cpu", "--save-hard-cases", "--save-query-results", *extra])
+
+    def evaluate_with_descriptors(self, args):
+        import torch
+
+        def descriptors(model, images, *unused):
+            folder = images[0].path.parent.name
+            self.assertEqual({image.path.parent.name for image in images}, {folder})
+            return (torch.eye(2) if folder == "gallery" else
+                    torch.tensor([[0., 1.] if folder == "queries_rain" else [1., 0.]] * len(images)))
+
+        model = Mock(image_size=(224, 224), config={"agg_config": {"num_clusters": 64}})
+        with patch("workflow.model.load_checkpoint_model", return_value=model), \
+             patch("workflow.evaluation.extract_descriptors", side_effect=descriptors) as extract, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(evaluate(args), 0)
+        return extract
+
+    def test_multiple_folders_keep_metrics_and_limits_separate_and_share_gallery(self):
+        extract = self.evaluate_with_descriptors(self.args(
+            "--query-subdirs", "queries_night", "queries_rain", "--limit-queries", "1"))
+        self.assertEqual([call.args[1][0].path.parent.name for call in extract.call_args_list],
+                         ["gallery", "queries_night", "queries_rain"])
+        for folder, rank in (("queries_night", 1), ("queries_rain", 2)):
+            with self.subTest(folder=folder):
+                result = json.loads((self.root / f"results_{folder}.json").read_text())
+                self.assertEqual(result["protocol"]["query_subdirs"], [folder])
+                self.assertEqual(result["protocol"]["query_limit"], 1)
+                self.assertEqual(result["num_queries"], 1)
+                self.assertEqual(result["recall"], {"R@1": float(rank == 1), "R@5": 1., "R@10": 1.})
+                query_id = f"images/test/{folder}/@0@0@image@.jpg"
+                self.assertEqual(result["query_results"], [{"query_id": query_id, "rank": rank}])
+                self.assertEqual([(row["query_id"], row["rank"]) for row in result["error_queries"]],
+                                 [] if rank == 1 else [(query_id, rank)])
+        self.assertFalse((self.root / "results.json").exists())
+
+    def test_single_or_default_folder_preserves_output_path(self):
+        for folders in ([], ["--query-subdirs", "queries_night"]):
+            with self.subTest(folders=folders):
+                args = self.args(*folders)
+                self.assertEqual(self.evaluate_with_descriptors(args).call_count, 2)
+                result = json.loads(args.output.read_text())
+                self.assertEqual(result["protocol"]["query_subdirs"],
+                                 ["queries_night"] if folders else ["queries"])
+                self.assertEqual(list(self.root.glob("*.json")), [args.output])
+
+    def test_check_data_reports_each_folder_without_loading_model(self):
+        args = self.args("--query-subdirs", "queries_night", "queries_rain", "--check-data")
+        output = io.StringIO()
+        with patch("workflow.model.load_checkpoint_model") as load_model, \
+             patch("workflow.evaluation.extract_descriptors") as extract, \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(evaluate(args), 0)
+        load_model.assert_not_called()
+        extract.assert_not_called()
+        remaining = output.getvalue().strip()
+        summaries = []
+        while remaining:
+            summary, end = json.JSONDecoder().raw_decode(remaining)
+            summaries.append(summary)
+            remaining = remaining[end:].strip()
+        self.assertEqual([row["protocol"]["query_subdirs"] for row in summaries],
+                         [["queries_night"], ["queries_rain"]])
+        self.assertEqual([row["num_queries"] for row in summaries], [2, 2])
+        self.assertFalse(list(self.root.glob("*.json")))
+
+    def test_duplicate_folders_and_output_collisions_are_rejected(self):
+        for folders, message in ((["queries_night", "./queries_night/"], "Repeated query folders"),
+                                 (["weather/night", "weather__night"], "duplicate output paths")):
+            with self.subTest(folders=folders), self.assertRaisesRegex(ValueError, message):
+                evaluate(self.args("--query-subdirs", *folders, "--check-data"))
+
+    def test_manifest_override_remains_a_single_output(self):
+        manifest = self.root / "explicit.json"
+        manifest.write_text(json.dumps({
+            "references": [{"id": str(i), "path": f"images/test/gallery/@{i}@{i}@image@.jpg"}
+                           for i in (0, 100)],
+            "queries": [{"id": "q", "path": "images/test/queries/@0@0@image@.jpg", "positives": ["0"]}],
+        }))
+        for explicit in (True, False):
+            with self.subTest(explicit=explicit):
+                if not explicit:
+                    manifest = manifest.rename(self.root / "evaluation_manifest.json")
+                extra = ["--eval-manifest", str(manifest)] if explicit else []
+                args = self.args("--query-subdirs", "queries_night", "queries_rain", *extra)
+                self.assertEqual(self.evaluate_with_descriptors(args).call_count, 2)
+                result = json.loads(args.output.read_text())
+                self.assertEqual(result["protocol"]["ground_truth"], "explicit_manifest")
+                self.assertEqual(result["query_results"], [{"query_id": "q", "rank": 1}])
+                self.assertFalse(list(self.root.glob("results_*.json")))
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")

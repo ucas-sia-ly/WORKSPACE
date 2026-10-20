@@ -60,7 +60,10 @@ def load_config(path):
     optional = {'pair_geometry_cache','torch_threads','eval_batch_size','methods','augment',
                 'calibration_places_per_weather','calibration_tail_probability',
                 'prefetch_factor','teacher_batch_size','eval_query_chunk_size',
-                'eval_reference_chunk_size','eval_reference_cache_mib','resource_limits'}
+                'eval_reference_chunk_size','eval_reference_cache_mib','resource_limits',
+                'include_proxy_evaluations'}
+    optional.update({'training_place_pool','real_global_distill_weight','real_global_distill_batch_size',
+                     'local_distill_eval','log_mined_pairs','isolate_auxiliary_rng'})
     if required - c.keys() or c.keys() - required - optional:
         raise ValueError(f'Config keys missing={required-c.keys()}, unknown={c.keys()-required-optional}')
     for name in ('output_dir','real_data','synthetic_manifest','checkpoint','teacher_checkpoint',
@@ -88,6 +91,16 @@ def load_config(path):
     if c['precision'] not in ('16','bf16','32'):
         raise ValueError('Use explicit precision 16/bf16/32')
     c.setdefault('methods', list(METHODS)); c.setdefault('augment', True)
+    if type(c.get('include_proxy_evaluations',True)) is not bool:
+        raise ValueError('include_proxy_evaluations must be a boolean')
+    if c.get('training_place_pool','synthetic') not in ('synthetic','all_real'):
+        raise ValueError('training_place_pool must be synthetic or all_real')
+    for name in ('local_distill_eval','log_mined_pairs','isolate_auxiliary_rng'):
+        if name in c and type(c[name]) is not bool: raise ValueError(f'{name} must be boolean')
+    if 'real_global_distill_weight' in c and (not math.isfinite(c['real_global_distill_weight']) or c['real_global_distill_weight']<0):
+        raise ValueError('real_global_distill_weight must be finite and nonnegative')
+    if 'real_global_distill_batch_size' in c and (type(c['real_global_distill_batch_size']) is not int or c['real_global_distill_batch_size']<1):
+        raise ValueError('real_global_distill_batch_size must be positive')
     c.setdefault('torch_threads', 2); c.setdefault('eval_batch_size', 8)
     for name,default in [('prefetch_factor',2),('teacher_batch_size',1),
                          ('eval_query_chunk_size',32),('eval_reference_chunk_size',4096)]:
@@ -105,14 +118,16 @@ def load_config(path):
     if (type(c['calibration_places_per_weather']) is not int or c['calibration_places_per_weather'] < 1
             or not 0 < c['calibration_tail_probability'] < 1):
         raise ValueError('Calibration needs positive place count and an explicit tail probability in (0,1)')
-    if not c['methods'] or len(set(c['methods'])) != len(c['methods']) or set(c['methods']) - set(METHODS):
-        raise ValueError('methods must be unique members of A/M/B0/B4/B5')
+    if not c['methods'] or len(set(c['methods'])) != len(c['methods']) or set(c['methods']) - set((*METHODS,'B1')):
+        raise ValueError('methods must be unique members of A/M/B0/B1/B4/B5')
     for evaluation in c['external_validations']:
         evaluation.setdefault('cadence','final')
         if evaluation['cadence'] not in ('final','every'):
             raise ValueError('Evaluation cadence must be final or every')
-        if evaluation.get('role') != 'validation' or evaluation.get('split') != 'val':
-            raise ValueError('External evaluations must explicitly use role=validation, split=val; do not tune on test')
+        if (evaluation.get('role'),evaluation.get('split')) not in (('validation','val'),('test','test')):
+            raise ValueError('External evaluations require validation/val or test/test')
+        if evaluation['role']=='test' and evaluation['cadence']!='final':
+            raise ValueError('Test evaluations must use final cadence; do not select intermediate checkpoints on test')
         if evaluation.get('dataset') not in ('SVOX','manifest') or evaluation.get('kind') not in ('real','natural_weather'):
             raise ValueError('External validation supports SVOX or explicit manifests, kind real/natural_weather')
         evaluation['root'] = str((path.parent / evaluation['root']).resolve())
@@ -120,9 +135,14 @@ def load_config(path):
             evaluation['manifest']=str((path.parent/evaluation['manifest']).resolve())
         if evaluation['dataset']=='manifest' and not evaluation.get('manifest'):
             raise ValueError('Explicit evaluation dataset requires a manifest')
+        if 'query_subdirs' in evaluation:
+            folders=evaluation['query_subdirs']
+            if (evaluation['dataset']!='SVOX' or not isinstance(folders,list) or not folders
+                    or any(not isinstance(f,str) or not f or Path(f).is_absolute() or '..' in Path(f).parts for f in folders)):
+                raise ValueError('query_subdirs requires nonempty relative SVOX folders')
         if not evaluation['name'].replace('_','').isalnum():
             raise ValueError('Evaluation names must be simple alphanumeric/underscore names')
-    if not any(e['kind']=='real' for e in c['external_validations']):
+    if not any(e['kind']=='real' and e['role']=='validation' for e in c['external_validations']):
         raise ValueError('At least one independent external real validation is required')
     return c
 
@@ -139,18 +159,13 @@ def strings(value):
 def prepare(c, out):
     from workflow.training_data import MixedGSVCitiesDataset, CoveragePlaceBatchSampler, _resolve_manifest_file
     from workflow.evaluation import load_evaluation_set
-    from workflow.model import read_checkpoint, checkpoint_state_and_config, validate_teacher_compatibility, input_preprocessing
+    from workflow.model import read_checkpoint, checkpoint_state_and_config, load_teacher_checkpoint
     payload=read_checkpoint(c['checkpoint'])
     state,student_config=checkpoint_state_and_config(payload);del state,payload
-    payload=read_checkpoint(c['teacher_checkpoint'])
-    state,teacher_config=checkpoint_state_and_config(payload);del state
-    if payload.get('global_step',0) <= 0:
-        raise ValueError('Teacher must be a full trained checkpoint with positive global_step')
+    student_config['image_size']=[224,224]
+    state,teacher_config,teacher_provenance=load_teacher_checkpoint(c['teacher_checkpoint'],student_config);del state
     if any(cfg['agg_config'].get('reliability_ot',False) for cfg in (student_config,teacher_config)):
         raise ValueError('Core feasibility ablations require checkpoints without Reliability')
-    student_config['image_size']=[224,224]
-    validate_teacher_compatibility(student_config,teacher_config,payload.get('image_preprocessing',input_preprocessing(teacher_config['image_size'])))
-    del payload
     dataset = MixedGSVCitiesDataset(Path(c['real_data']), Path(c['synthetic_manifest']), cities=c['cities'],
         images_per_place=c['images_per_place'], min_images_per_place=c['images_per_place'], synthetic_fraction=0,
         image_size=(224,224), augment=c['augment'], real_sampling='coverage_pk')
@@ -199,6 +214,11 @@ def prepare(c, out):
         holdout.extend(selected)
     training = [r for r in canonical if (r['city'],r['place_id']) not in used | excluded]
     train_places = {(r['city'],r['place_id']) for r in training}
+    exclusion_path=None
+    if c.get('training_place_pool')=='all_real':
+        exclusion_path=out/'excluded_places.json'
+        immutable(exclusion_path,encoded([list(key) for key in sorted(used|excluded)]))
+        train_places={(p.city,p.place_id) for p in dataset.places if (p.city,p.place_id) not in used|excluded}
     if len(train_places) < 2: raise ValueError('Fewer than two training places remain')
     immutable(out/'train_manifest.jsonl', ''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in training))
     refs, real_queries = [], []
@@ -218,12 +238,13 @@ def prepare(c, out):
         immutable(path, encoded(dict(name=domain,references=refs,queries=queries)))
         evaluations.append(dict(name=domain,kind='real' if domain=='real_holdout' else 'synthetic_proxy',
             dataset='manifest',root=c['real_data'],manifest=str(path),split='val',role='validation'))
+    if not c.get('include_proxy_evaluations',True): evaluations=[]
     evaluations += c['external_validations']
     if len({e['name'] for e in evaluations}) != len(evaluations): raise ValueError('Duplicate evaluation names')
     evaluation_summaries = {}
     for e in evaluations:
         data = load_evaluation_set(e['dataset'], Path(e['root']), manifest=Path(e['manifest']) if e.get('manifest') else None,
-                                  split='val')
+                                  split=e['split'],query_subdirs=e.get('query_subdirs'))
         evaluation_summaries[e['name']] = data.summary()
         identities=[(item.id,str(item.path),item.path.stat().st_size,item.path.stat().st_mtime_ns)
                     for item in data.references+data.queries]
@@ -233,6 +254,7 @@ def prepare(c, out):
     epochs = math.ceil(c['steps']/per_epoch)
     inputs = [c['checkpoint'],c['teacher_checkpoint'],c['synthetic_manifest']]
     if c['pair_calibration']: inputs.append(c['pair_calibration'])
+    if exclusion_path: inputs.append(str(exclusion_path))
     inputs += [e['manifest'] for e in c['external_validations'] if e.get('manifest')]
     inputs += [str(Path(c['real_data'])/'Dataframes'/f'{city}.csv') for city in c['cities']]
     if c.get('pair_geometry_cache'): inputs += [str(p) for p in sorted(Path(c['pair_geometry_cache']).glob('*.json'))]
@@ -240,6 +262,8 @@ def prepare(c, out):
     sources = [ROOT/'train_salad.py', ROOT/'evaluate_salad.py',Path(__file__)]
     sources += sorted((ROOT/'workflow').glob('*.py')) + sorted((ROOT/'models/aggregators').glob('*.py'))
     return dict(config=c,train_places=len(train_places),train_generated_images=len(training),
+        **({'teacher_provenance':teacher_provenance} if 'training_evidence' in teacher_provenance else {}),
+        **({'training_exclude_places':str(exclusion_path)} if exclusion_path else {}),
         calibration_path=c['pair_calibration'] or str(out/'calibration.json'),
         calibration_pairs=calibration_rows,
         heldout_places=[list(key) for key in sorted(used)],calibration_excluded_places=len(excluded),
@@ -257,7 +281,7 @@ def prepare(c, out):
 def training_command(plan, method, seed, directory, stop_epoch, resume):
     c=plan['config']
     cmd=[sys.executable,str(ROOT/'train_salad.py'),'--real-data',c['real_data'],
-        '--synthetic-manifest',plan['train_manifest'],'--synthetic-places-only','--cities',*c['cities'],
+        '--synthetic-manifest',plan['train_manifest'],'--cities',*c['cities'],
         '--output-dir',str(directory),'--backbone-repo',c['backbone_repo'],
         '--epochs',str(plan['epochs']),'--stop-after-epoch',str(stop_epoch),'--max-steps',str(c['steps']),
         '--max-batches-per-epoch',str(plan['steps_per_epoch']),'--save-every',str(plan['epochs']),
@@ -268,16 +292,24 @@ def training_command(plan, method, seed, directory, stop_epoch, resume):
         '--weight-decay','0','--precision',c['precision'],'--device',c['device'],'--profile-training',
         '--resume' if resume else '--init-checkpoint',str(directory/'checkpoint.pt') if resume else c['checkpoint']]
     if not c['augment']: cmd+=['--no-augment']
+    if c.get('training_place_pool','synthetic')=='synthetic': cmd+=['--synthetic-places-only']
+    else: cmd+=['--exclude-places',plan['training_exclude_places']]
+    for name in ('local_distill_eval','log_mined_pairs','isolate_auxiliary_rng'):
+        if c.get(name): cmd+=['--'+name.replace('_','-')]
     if 'prefetch_factor' in c: cmd+=['--prefetch-factor',str(c['prefetch_factor'])]
     if method in ('A','M'): cmd+=['--synthetic-fraction',str(c['mix_fraction'] if method=='M' else 0)]
     else: cmd+=['--synthetic-aux','--synthetic-exposure-prob',str(c['exposure_probability']),
                 '--synthetic-global-weight',str(c['global_weight'])]
-    if method in ('B4','B5'):
+    retention=c.get('real_global_distill_weight',0.)
+    if retention>0:
+        cmd+=['--real-global-distill-weight',str(retention),'--real-global-distill-batch-size',str(c.get('real_global_distill_batch_size',2))]
+    if method in ('B1','B4','B5'):
         cmd+=['--teacher-checkpoint',c['teacher_checkpoint'],'--teacher-batch-size',str(c.get('teacher_batch_size',1)),
               '--pair-calibration',plan['calibration_path'],'--feature-distill-weight',str(c['feature_weight']),
-              '--ot-distill-weight',str(c['ot_weight']),'--score-distill-weight','0',
+              '--ot-distill-weight',str(c['ot_weight'] if method!='B1' else 0),'--score-distill-weight','0',
               '--pair-confidence-mode','verified' if method=='B5' else 'uniform']
         if c.get('pair_geometry_cache'): cmd+=['--pair-geometry-cache',c['pair_geometry_cache']]
+    elif retention>0: cmd+=['--teacher-checkpoint',c['teacher_checkpoint'],'--teacher-batch-size',str(c.get('teacher_batch_size',1))]
     return cmd
 
 
@@ -340,6 +372,7 @@ def calibrate(plan, out):
 
 def evaluate_checkpoint(plan, checkpoint, directory, *, final=True):
     c=plan['config']; checksum=digest(checkpoint)
+    pending=[]
     for e in plan['evaluations']:
         if e.get('cadence')=='final' and not final: continue
         dest=directory/(e['name']+'.json'); receipt=directory/(e['name']+'.receipt.json')
@@ -349,8 +382,17 @@ def evaluate_checkpoint(plan, checkpoint, directory, *, final=True):
                 and saved.get('result_sha256')==digest(dest)):
             # Parse cached JSON too: never silently skip corrupt output.
             json.loads(dest.read_text());continue
+        pending.append(e)
+    # Group SVOX categories sharing a gallery: one model/gallery extraction per
+    # split, then release each category's query descriptors before the next.
+    groups={}
+    for e in pending:
+        key=(e['dataset'],e['root'],e['split']) if e['dataset']=='SVOX' and not e.get('manifest') else (e['name'],)
+        groups.setdefault(key,[]).append(e)
+    for evaluations in groups.values():
+        e=evaluations[0];dest=directory/(e['name']+'.json')
         cmd=[sys.executable,str(ROOT/'evaluate_salad.py'),'--checkpoint',str(checkpoint),'--dataset',e['dataset'],
-             '--dataset-root',e['root'],'--split','val','--output',str(dest),'--backbone-repo',c['backbone_repo'],
+             '--dataset-root',e['root'],'--split',e['split'],'--output',str(dest),'--backbone-repo',c['backbone_repo'],
              '--image-size','224','224','--batch-size',str(c['eval_batch_size']),'--num-workers',str(c['num_workers']),
              '--device',c['device'],'--save-query-results']
         cmd+=['--prefetch-factor',str(c.get('prefetch_factor',2)),
@@ -358,10 +400,18 @@ def evaluate_checkpoint(plan, checkpoint, directory, *, final=True):
               '--reference-chunk-size',str(c.get('eval_reference_chunk_size',4096)),
               '--reference-cache-mib',str(c.get('eval_reference_cache_mib',0))]
         if e.get('manifest'): cmd+=['--eval-manifest',e['manifest']]
+        if len(evaluations)>1:
+            group_file=directory/f"{e['split']}_query_groups.json"
+            write_json(group_file,{item['name']:item.get('query_subdirs',['queries']) for item in evaluations})
+            cmd+=['--svox-query-groups',str(group_file)]
+        elif e.get('query_subdirs'): cmd+=['--query-subdirs',*e['query_subdirs']]
         run_child(cmd,directory/(e['name']+'.log'),c['torch_threads'],limits=c.get('resource_limits'))
-        result=json.loads(dest.read_text())
-        if not result.get('query_results'): raise RuntimeError('Evaluation missing per-query results')
-        write_json(receipt,{**expected,'result_sha256':digest(dest)})
+        for item in evaluations:
+            dest=directory/(item['name']+'.json')
+            result=json.loads(dest.read_text())
+            if not result.get('query_results'): raise RuntimeError('Evaluation missing per-query results')
+            write_json(directory/(item['name']+'.receipt.json'),dict(checkpoint_sha256=checksum,
+                protocol=item,result_sha256=digest(dest)))
 
 
 def paired_changes(left,right):
@@ -404,9 +454,10 @@ def summarize(plan,out):
                     if not p.exists() or not initial.exists(): continue
                     current,baseline=json.loads(p.read_text()),json.loads(initial.read_text())
                     records.append(dict(method=method,seed=seed,step=step,domain=e['name'],kind=e['kind'],
+                        role=e.get('role','validation'),split=e.get('split','val'),
                         **current['recall'],delta_initial_pp=100*(current['recall']['R@1']-baseline['recall']['R@1']),
                         **paired_changes(baseline,current)))
-    fields=['method','seed','step','domain','kind','R@1','R@5','R@10','delta_initial_pp',
+    fields=['method','seed','step','domain','kind','role','split','R@1','R@5','R@10','delta_initial_pp',
             'improved_to_correct','regressed_to_wrong','evaluated_queries']
     with (out/'learning_curves.csv').open('w',newline='') as handle:
         writer=csv.DictWriter(handle,fieldnames=fields);writer.writeheader();writer.writerows(records)
@@ -420,6 +471,7 @@ def summarize(plan,out):
                 for s in c['seeds'] if (candidate,s,e['name']) in lookup and (reference,s,e['name']) in lookup]
             if deltas:
                 domains[e['name']]=dict(kind=e['kind'],seeds=len(deltas),deltas_pp=deltas,
+                    role=e.get('role','validation'),split=e.get('split','val'),
                     mean_pp=statistics.mean(deltas),std_pp=statistics.stdev(deltas) if len(deltas)>1 else None)
                 changes=[]
                 for seed in c['seeds']:
@@ -430,22 +482,29 @@ def summarize(plan,out):
                 domains[e['name']]['paired_query_changes']=changes
         if not domains: continue
         complete=len(domains)==len(plan['evaluations']) and all(v['seeds']==len(c['seeds']) for v in domains.values())
-        real=[v['mean_pp'] for v in domains.values() if v['kind']=='real']
-        weather=[v['mean_pp'] for v in domains.values() if v['kind']=='synthetic_proxy']
-        natural=[v['mean_pp'] for v in domains.values() if v['kind']=='natural_weather']
-        signal=(complete and min(real)>=-c['max_real_drop_pp'] and statistics.mean(weather)>c['minimum_weather_gain_pp'])
+        validation=[v for v in domains.values() if v['role']=='validation']
+        real=[v['mean_pp'] for v in validation if v['kind']=='real']
+        weather=[v['mean_pp'] for v in validation if v['kind']=='synthetic_proxy']
+        natural=[v['mean_pp'] for v in validation if v['kind']=='natural_weather']
+        signal=(complete and bool(real) and bool(weather) and min(real)>=-c['max_real_drop_pp'] and statistics.mean(weather)>c['minimum_weather_gain_pp'])
         if natural: signal=signal and statistics.mean(natural)>c['minimum_weather_gain_pp']
         comparisons.append(dict(candidate=candidate,reference=reference,domains=domains,
             verdict=('incomplete' if not complete else 'proxy_signal_requires_multiseed_and_natural_weather_confirmation'
-                     if signal else 'no_prespecified_proxy_gain_or_real_regression'),
+                     if signal else 'descriptive_only_no_proxy_validation' if not weather
+                     else 'no_prespecified_proxy_gain_or_real_regression'),
             paired_seed_count=len(c['seeds']),natural_weather_domains=len(natural)))
     report=dict(final=final,comparisons=comparisons,limitations=plan['limitations'],
+                test_policy='Test categories are descriptive fixed-budget reports; excluded from validation decision gates.',
                 status='No natural-weather feasibility claim is made by this runner.')
     write_json(out/'report.json',report)
     lines=['# CCR 可行性实验报告','',report['status'],'',
            '| 对比 | 当前结论 |','|---|---|']
     lines += [f"| {r['candidate']} vs {r['reference']} | {r['verdict']} |" for r in comparisons]
-    lines+=['','完整数据：report.json；逐点评估：learning_curves.csv；损失/曝光/耗时/显存：training_metrics.csv。',
+    lines+=['','| 方法 | seed | 数据集类别 | split | R@1 | R@5 | R@10 |',
+            '|---|---|---|---|---:|---:|---:|']
+    lines += [f"| {r['method']} | {r['seed']} | {r['domain']} | {r['split']} | {100*r['R@1']:.2f}% | {100*r['R@5']:.2f}% | {100*r['R@10']:.2f}% |" for r in final]
+    lines+=['','Test 类别仅作固定预算结果报告，不参与 validation 决策门槛。',
+            '完整数据：report.json；逐点评估：learning_curves.csv；损失/曝光/耗时/显存：training_metrics.csv。',
             '真实图退化容许值和代理天气增益门槛在运行前固定；未达门槛不证明方法永远无效。',
             '单种子没有跨种子方差；多种子改善也不能替代自然天气验证。']
     (out/'report.md').write_text('\n'.join(lines)+'\n')
