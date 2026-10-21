@@ -125,8 +125,8 @@ def train(args):
         observer.aux=result
         return result
 
-    def global_loss(queries,labels,references,real_labels,temperature=.1,pair_valid=None):
-        value=asymmetric_multi_positive_infonce(queries,labels,references,real_labels,temperature,pair_valid)
+    def global_loss(queries,labels,references,real_labels,temperature=.1,pair_valid=None,denominator=None):
+        value=asymmetric_multi_positive_infonce(queries,labels,references,real_labels,temperature,pair_valid,denominator)
         observer.phase='syn'
         with torch.no_grad():
             conditions=observer.aux['condition']

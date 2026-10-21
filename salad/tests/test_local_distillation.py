@@ -196,7 +196,8 @@ class LocalWorkflowTests(unittest.TestCase):
         self.assertTrue(all(p.grad is None for m in teacher_models for p in m.parameters()))
         local = actual["metrics"]["local_distillation"]
         self.assertGreater(local["positive_a_fraction"],0)
-        expected_total = actual["metrics"]["synthetic_aux"]["loss_real"] + .1*actual["metrics"]["synthetic_aux"]["loss_syn_per_step"] + local["weighted_total"]
+        aux = actual["metrics"]["synthetic_aux"]
+        expected_total = aux["loss_real"] + aux["global_weight"]*aux["loss_syn_per_step"] + local["weighted_total"]
         self.assertAlmostEqual(actual["metrics"]["loss"],expected_total,places=6)
 
     def test_disabled_local_flags_exactly_match_stage1_and_do_not_load_calibration(self):

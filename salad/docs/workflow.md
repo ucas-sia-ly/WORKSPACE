@@ -84,7 +84,10 @@ python salad/train_salad.py \
 默认 `--synthetic-mode mix`：每地点使用 `floor(K × synthetic_fraction)` 个合成名额，最多 K−1 个，
 始终保留至少一个真实视角；合成不足由不同真实视角补齐。真实视角不足
 `min-images-per-place` 的地点不因有合成图而获得准入。
-默认增广为随机水平翻转及亮度/对比度/颜色变化，可用 `--no-augment` 关闭。
+默认增广与原版 SALAD 的 GSV-Cities 配方一致：Resize 后 `RandAugment(num_ops=3, magnitude=9, bilinear)`，
+不做水平翻转（`workflow/augmentation.py`）。每张图的抽样以 seed、epoch、地点、槽位和文件名为键，
+与 worker 数无关，也不消耗模型 Dropout RNG；成对的源图/生成图共享同一次抽样。可用 `--no-augment` 关闭。
+2026-10 之前的实验使用翻转 + 0.8–1.2 亮度/对比度/饱和度，这些 checkpoint 无法用当前代码逐位复现。
 `--num-trainable-blocks 0` 冻结整个 backbone，仅训练聚合器。
 
 显存不足时减小 batch-size。要求至少两个地点和每地点至少两张图。

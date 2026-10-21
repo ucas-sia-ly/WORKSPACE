@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
-from PIL import Image, ImageOps
+from PIL import Image
 
 import test_source_replacement as fixtures
 
@@ -96,9 +96,9 @@ class ReliabilityPairsTests(unittest.TestCase):
         self.assertEqual(after_default, after_explicit)
         self.assertEqual(after_default, after_paired)
 
-    def identical_asymmetric_pairs(self):
-        # The marker makes a horizontal flip observable. Byte-identical inputs
-        # must remain identical after every shared spatial/photometric transform.
+    def identical_asymmetric_pairs(self, **kwargs):
+        # The marker makes spatial transforms observable. Byte-identical inputs
+        # must remain identical after the shared RandAugment draw.
         for view in range(6):
             source = self.sources[(1, view)]
             image = Image.new("RGB", (13, 11), (20, 30, 40))
@@ -108,31 +108,24 @@ class ReliabilityPairsTests(unittest.TestCase):
             image.save(source)
             row = self.candidate((1, view), "fog")
             Path(row["output_path"]).write_bytes(source.read_bytes())
-        dataset = self.dataset(mode="mix", fraction=1, reliability_pairs=True)
+        dataset = self.dataset(mode="mix", fraction=1, reliability_pairs=True, **kwargs)
         dataset.augment = True
         return dataset
 
-    def test_horizontal_flip_is_shared_and_not_drawn_independently(self):
+    def test_randaugment_draw_is_shared_within_each_pair(self):
         dataset = self.identical_asymmetric_pairs()
-        original_mirror = ImageOps.mirror
-        with patch("workflow.training_data.random.random", side_effect=[0.1, 0.9] * 4) as draws:
-            with patch("PIL.ImageOps.mirror", wraps=original_mirror) as flips:
-                (images, _, kinds, companions, valid), _ = self.read_item(dataset)
-        self.assertEqual(draws.call_count, 8)
-        self.assertEqual(flips.call_count, 4 + int(valid.sum()))
-        self.assertTrue(torch.equal(kinds, valid))
-        self.assertTrue(torch.equal(images, companions))
-        self.assertTrue(bool((images[:, 0, :, -1].mean(1) > images[:, 0, :, 0].mean(1)).all()))
+        for epoch in range(4):
+            dataset.set_epoch(epoch)
+            (images, _, kinds, companions, valid), _ = self.read_item(dataset)
+            self.assertTrue(torch.equal(kinds, valid))
+            self.assertEqual(int(valid.sum()), 3)
+            self.assertTrue(torch.equal(images, companions))
 
-    def test_color_jitter_is_shared_without_extra_random_draws(self):
-        dataset = self.identical_asymmetric_pairs()
-        with patch("workflow.training_data.random.random", side_effect=[0.1, 0.1] * 4) as draws:
-            with patch("workflow.training_data.random.uniform", return_value=1.15) as factors:
-                (images, _, _, companions, valid), _ = self.read_item(dataset)
-        self.assertEqual(draws.call_count, 8)
-        self.assertEqual(factors.call_count, 12)
-        self.assertEqual(int(valid.sum()), 3)
-        self.assertTrue(torch.equal(images, companions))
+    def test_augmentation_ignores_global_python_rng(self):
+        dataset = self.identical_asymmetric_pairs(real_sampling="coverage_pk")
+        first, _ = self.read_item(dataset, seed=1)
+        second, _ = self.read_item(dataset, seed=2)
+        self.assertTrue(torch.equal(first[0], second[0]))
 
     def test_dataloader_collates_pair_validity_and_exact_companions(self):
         for view in range(6):
@@ -152,7 +145,7 @@ class ReliabilityPairsTests(unittest.TestCase):
         dataset = self.dataset(reliability_pairs=True)
         self.assertTrue(dataset.summary["reliability_pairs"])
         self.assertEqual(dataset.summary["reliability_pair_source"], "exact_manifest_source")
-        self.assertEqual(dataset.summary["reliability_pair_augmentation"], "shared_spatial_and_color_jitter")
+        self.assertEqual(dataset.summary["reliability_pair_augmentation"], "shared_randaugment_draw")
 
     def test_pairing_flag_rejects_non_boolean_value(self):
         with self.assertRaisesRegex(ValueError, "reliability_pairs must be a bool"):

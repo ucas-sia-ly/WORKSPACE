@@ -201,7 +201,8 @@ class SyntheticAuxWorkflowTests(unittest.TestCase):
         self.assertEqual(actual["metrics"]["synthetic_aux"]["triggered_places"], 2)
         metrics = actual["metrics"]
         self.assertAlmostEqual(metrics["loss"], metrics["synthetic_aux"]["loss_real"]
-                               + 0.1 * metrics["synthetic_aux"]["loss_syn_per_step"], places=6)
+                               + metrics["synthetic_aux"]["global_weight"]
+                               * metrics["synthetic_aux"]["loss_syn_per_step"], places=6)
 
     def test_resume_exact_and_auxiliary_configuration_checked(self):
         args = self.aux_arguments(self.root / "full", "--synthetic-exposure-prob", "0.7")

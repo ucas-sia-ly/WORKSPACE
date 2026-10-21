@@ -226,7 +226,7 @@ class ReliabilityCacheTests(unittest.TestCase):
     def test_live_pair_mode_summary_stays_unchanged_without_cache(self):
         dataset = self.dataset()
         self.assertNotIn("reliability_target_cache", dataset.summary)
-        self.assertEqual(dataset.summary["reliability_pair_augmentation"], "shared_spatial_and_color_jitter")
+        self.assertEqual(dataset.summary["reliability_pair_augmentation"], "shared_randaugment_draw")
 
     def test_integrity_digest_changes_with_teacher_or_tensor_provenance(self):
         self.build()

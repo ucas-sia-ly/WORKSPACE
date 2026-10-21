@@ -7,11 +7,14 @@ import torch.nn.functional as F
 
 
 def asymmetric_multi_positive_infonce(queries, query_labels, references, reference_labels,
-                                     temperature=0.1, pair_valid=None):
-    """Mean -log(sum positive exp / sum all real exp), with cosine logits.
+                                     temperature=0.1, pair_valid=None, denominator=None):
+    """-log(sum positive exp / sum all real exp) with cosine logits, averaged.
 
-    All same-place real images are positives, including the exact source.
-    Invalid/unmatched queries are excluded from the mean. Empty batches return
+    The default averages over valid queries. Pass ``denominator`` (the main
+    batch's image count) to sum valid queries and divide by it instead, so each
+    synthetic query weighs like one real MS anchor regardless of how few
+    queries the batch has. All same-place real images are positives, including
+    the exact source. Invalid/unmatched queries are excluded. Empty batches return
     a differentiable zero. Detaching references isolates this loss's DIRECT
     reference gradient; the synthetic branch still updates shared student weights.
     """
@@ -40,7 +43,8 @@ def asymmetric_multi_positive_infonce(queries, query_labels, references, referen
         # Centering also reduces cancellation for low temperatures.
         logits = logits - logits.max(dim=1, keepdim=True).values.detach()
         positive_logits = logits.masked_fill(~positives, -torch.inf)
-        return (torch.logsumexp(logits, dim=1) - torch.logsumexp(positive_logits, dim=1)).mean()
+        losses = torch.logsumexp(logits, dim=1) - torch.logsumexp(positive_logits, dim=1)
+        return losses.mean() if denominator is None else losses.sum() / denominator
 
 
 def _tokens(value, name):

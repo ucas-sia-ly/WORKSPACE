@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""A/M-only adapter: count consumed weather without changing shared trainer code."""
+"""Count consumed synthetic weather per epoch without changing shared trainer code.
+
+Used by the A/M and weather-round runners for real-only, mixed/replaced and
+auxiliary (B0) MS training on coverage_pk batches.
+"""
 from collections import Counter
 import train_salad
 from workflow import training_data
@@ -30,10 +34,10 @@ class WeatherCoverage(training_data.SamplingCoverage):
 
 
 def train(args):
-    if (args.synthetic_aux or args.teacher_checkpoint or args.reliability_ot or args.synthetic_places_only
-            or args.feature_distill_weight or args.score_distill_weight or args.ot_distill_weight
-            or args.real_global_distill_weight or args.real_sampling != 'coverage_pk' or args.synthetic_mode != 'mix'):
-        raise ValueError('This adapter permits only full-pool coverage A/M MS training')
+    if (args.reliability_ot or args.synthetic_places_only or args.feature_distill_weight
+            or args.score_distill_weight or args.ot_distill_weight or args.real_sampling != 'coverage_pk'):
+        raise ValueError('This adapter permits only coverage MS training with optional synthetic slots, '
+                         'global auxiliary queries and real descriptor retention')
     original = training_data.SamplingCoverage
     training_data.SamplingCoverage = WeatherCoverage
     try:

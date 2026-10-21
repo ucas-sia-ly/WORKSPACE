@@ -4,7 +4,7 @@
 
 ## 当前代码
 
-`AdaptVPR/experiments/qwen_curriculum/` 保留 11 个功能模块及包入口：
+`AdaptVPR/experiments/qwen_curriculum/` 保留 14 个功能模块及包入口：
 
 | 模块 | 职责 |
 |---|---|
@@ -12,6 +12,7 @@
 | `resume_control.py` | 后台暂停、继续与状态 |
 | `run.py` | 生成请求、调用账本及审核 |
 | `resume_recovery.py` | 中断输出恢复 |
+| `prompt_bank.py`、`quality_v3.py`、`weather_v3.py` | v3 多变体提示词、放宽几何门槛的审核、独立生成与旧图重新验收 |
 | `image_store.py` | 图片归集、索引及审核通过入口 |
 | `quality.py`、`weather_signal.py` | 几何和天气审核 |
 | `common.py` | 路径、原子写入及内容校验 |
@@ -33,6 +34,9 @@
 | `outputs/qwen_curriculum/state/` | 当前计划、账本、审核结果、进度和日志 |
 | `outputs/qwen_curriculum/state/training/` | 微调 checkpoint 与六域评估结果 |
 | `outputs/qwen_curriculum/state/finetuning/` | CCR A/M 等独立实验；每轮冻结当时的审核通过图片，保留后续增量入口 |
+| `outputs/qwen_curriculum/state/weather_validation/` | 由 SVOX train 天气 query 构建、距 test/val 至少 50 m 的自然天气 val |
+| `outputs/qwen_curriculum/state/external_validation/` | Nordland 探针与缩减图库 Tokyo247/SF-XL 清单 |
+| `outputs/qwen_curriculum/weather_v3*/` | v3 提示词库生成的图片、审核结果与训练清单（独立于 23 城市计划） |
 
 生成与训练分阶段执行。生成服务的临时输出可能包含中断请求的完整图片，由恢复流程核验后收集。
 
@@ -45,6 +49,7 @@
 - [Qwen 持续增加图片时的 CCR 微调](../salad/docs/qwen_finetuning.md)
 - [固定地点排除与全量真实 A 基线](../salad/docs/real_baseline.md)
 - [A/M 多种子公平对照与真实 val 统计](../salad/docs/am_multiseed.md)
+- [阶段五：天气验证、分层采样与 v3 生成图](../salad/docs/weather_round.md)
 - [B0 归因及 Feature/OT/q 局部消融](../salad/docs/ccr_stage4.md)
 
 在工作区根目录、AdaptVPR 环境中运行当前流程测试：

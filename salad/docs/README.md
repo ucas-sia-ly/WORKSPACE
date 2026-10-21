@@ -22,6 +22,7 @@
 | [200-batch 扫描与后续改进](ccr_followup.md) | 审核结论、来源明确的mining、可选真实描述子保持、局部eval、全真实池及三种子命令 |
 | [Reliability OT](reliability_ot.md) | 可选 patch 可靠性分支、dustbin 偏置、弱监督、单图推理与 v1 兼容性 |
 | [Reliability OT v2](reliability_v2.md) | 固定教师缓存、局部几何负监督、轻量上下文与消融设置 |
+| [阶段五：天气验证与生成图对照](weather_round.md) | RandAugment、SVOX train 天气 val、分层采样、按 anchor 计权的 B0、生成图难度探针 |
 | [原版 SALAD](../README.md) | 原版环境、数据集、Lightning 训练与论文引用 |
 
 ## 代码入口
@@ -30,6 +31,9 @@
 - [run_real_baseline.py](../run_real_baseline.py)：纯真实 A 基线；默认仅准备，按筛选、确认、分类测试分阶段执行。
 - [run_am_multiseed.py](../run_am_multiseed.py)：独立 A/M 多种子实验；默认只预检查，不读取 test。
 - [run_ccr_stage4.py](../run_ccr_stage4.py)：第四阶段归因与局部消融；依赖第三阶段冻结协议，B0 未通过时拒绝正式局部训练。
+- [run_weather_round.py](../run_weather_round.py)：第五阶段 A/A+保持/M/B0；每轮评估普通 val 与自然天气 val，最终评估外部集。
+- [build_weather_validation.py](../build_weather_validation.py)、[build_external_manifests.py](../build_external_manifests.py)：冻结天气 val 与外部检索清单。
+- [probe_synthetic_difficulty.py](../probe_synthetic_difficulty.py)：只读比较生成天气与 SVOX 真实天气造成的描述子位移。
 - [train_salad.py](../train_salad.py)：项目训练入口；可靠性分支默认关闭。
 - [evaluate_salad.py](../evaluate_salad.py)：项目 checkpoint 评估入口。
 - [cache_reliability_targets.py](../cache_reliability_targets.py)：离线构建可靠性目标缓存。

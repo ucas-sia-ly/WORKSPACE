@@ -34,7 +34,9 @@ def parse_args(argv=None):
                         help="CCR-VPR Stage 1: all-real main batch plus at most one exact-source synthetic query per place")
     parser.add_argument("--synthetic-exposure-prob", type=float, default=0.5,
                         help="Per-eligible-place auxiliary trigger probability, not a synthetic image fraction")
-    parser.add_argument("--synthetic-global-weight", type=float, default=0.1)
+    parser.add_argument("--synthetic-global-weight", type=float, default=1.0,
+                        help="Per synthetic query, relative to one real MS anchor: global and local auxiliary "
+                             "losses are summed over queries and divided by the main batch's image count")
     parser.add_argument("--synthetic-global-temperature", type=float, default=0.1)
     parser.add_argument("--feature-distill-weight", type=float, default=0.0)
     parser.add_argument("--score-distill-weight", type=float, default=0.0)
@@ -60,6 +62,10 @@ def parse_args(argv=None):
                         help="Exclude numerically negligible teacher cluster mass from conditional OT; default FP32 epsilon")
     parser.add_argument("--synthetic-places-only", action="store_true",
                         help="Train only eligible places with at least one accepted synthetic view")
+    parser.add_argument("--synthetic-place-slots", type=int, default=0,
+                        help="coverage_pk: reserve this many places per batch for places with accepted variants")
+    parser.add_argument("--prefer-synthetic-sources", action="store_true",
+                        help="coverage_pk: select sources with accepted variants first; use in real-only controls too")
     parser.add_argument("--exclude-places", type=Path,
                         help="JSON list of [city,place_id] held-out identities, excluded from real and synthetic pools")
     parser.add_argument("--cities", nargs="+", help="CSV city names; default all Dataframes/*.csv")
@@ -155,6 +161,11 @@ def parse_args(argv=None):
         parser.error("Learning rate must be positive; weight decay/miner margin cannot be negative")
     if args.synthetic_places_only and args.synthetic_manifest is None:
         parser.error("--synthetic-places-only requires --synthetic-manifest")
+    if (args.synthetic_place_slots or args.prefer_synthetic_sources) and (
+            args.synthetic_manifest is None or args.real_sampling != "coverage_pk"):
+        parser.error("--synthetic-place-slots/--prefer-synthetic-sources require --synthetic-manifest and coverage_pk")
+    if not 0 <= args.synthetic_place_slots < args.batch_size or (args.synthetic_place_slots and args.synthetic_places_only):
+        parser.error("--synthetic-place-slots must be in [0, batch-size) and excludes --synthetic-places-only")
     if args.synthetic_mode == "replace" and args.synthetic_manifest is None:
         parser.error("--synthetic-mode replace requires --synthetic-manifest")
     if not math.isfinite(args.synthetic_exposure_prob) or not 0 <= args.synthetic_exposure_prob <= 1:
@@ -365,6 +376,9 @@ def resolved_training_config(args, model_config, initialization=None, teacher=No
         "weight_decay": args.weight_decay,
         "miner_margin": args.miner_margin,
         "augment": not args.no_augment,
+        "augmentation": "randaugment_n3_m9_keyed_v1" if not args.no_augment else None,
+        "synthetic_place_slots": args.synthetic_place_slots,
+        "prefer_synthetic_sources": args.prefer_synthetic_sources,
         "max_batches_per_epoch": args.max_batches_per_epoch,
         "metadata_sha256": digest.hexdigest(),
         "seed": args.seed,
@@ -391,7 +405,8 @@ def resolved_training_config(args, model_config, initialization=None, teacher=No
                                  distillation_loss="independent_feature_score_conditional_ot")
     if args.synthetic_aux:
         config["synthetic_aux"] = {
-            "version": 1, "exposure_prob": args.synthetic_exposure_prob,
+            "version": 2, "exposure_prob": args.synthetic_exposure_prob,
+            "normalization": "sum_over_aux_queries_divided_by_main_batch_images",
             "global_weight": args.synthetic_global_weight,
             "global_temperature": args.synthetic_global_temperature,
             "loss": "asymmetric_multi_positive_infonce",
@@ -440,7 +455,8 @@ def train(args):
     from workflow.metric_loss import multi_similarity_loss
     from workflow.model import (SALADModel, FrozenSALADTeacher, atomic_save_checkpoint,
                                 input_preprocessing, load_model_state, profile_teacher_targets, read_checkpoint)
-    from workflow.training_data import CoveragePlaceBatchSampler, MixedGSVCitiesDataset, SamplingCoverage, SyntheticAuxSampler
+    from workflow.training_data import (CoveragePlaceBatchSampler, MixedGSVCitiesDataset, SamplingCoverage,
+                                        StratifiedCoverageBatchSampler, SyntheticAuxSampler)
     from workflow.synthetic_losses import asymmetric_multi_positive_infonce
 
     random.seed(args.seed)
@@ -458,6 +474,7 @@ def train(args):
         synthetic_fraction=0.0 if args.synthetic_aux else args.synthetic_fraction, image_size=tuple(args.image_size),
         augment=not args.no_augment, synthetic_mode=args.synthetic_mode,
         real_sampling=args.real_sampling, seed=args.seed, return_sampling_metadata=True,
+        prefer_synthetic_sources=args.prefer_synthetic_sources,
         **({"reliability_pairs": True} if args.reliability_ot else {}),
         **({"reliability_target_cache": args.reliability_target_cache} if args.reliability_target_cache else {}),
     )
@@ -577,7 +594,11 @@ def train(args):
                           generator=generator, worker_init_fn=seed_worker)
     if args.num_workers:
         loader_options["prefetch_factor"] = args.prefetch_factor
-    if args.real_sampling == "coverage_pk":
+    if args.synthetic_place_slots:
+        place_batch_sampler = StratifiedCoverageBatchSampler(
+            [bool(place.synthetic_paths) for place in dataset.places], batch_size, args.synthetic_place_slots, args.seed)
+        loader = DataLoader(dataset, batch_sampler=place_batch_sampler, **loader_options)
+    elif args.real_sampling == "coverage_pk":
         place_batch_sampler = CoveragePlaceBatchSampler(len(dataset), batch_size, args.seed)
         loader = DataLoader(dataset, batch_sampler=place_batch_sampler, **loader_options)
     else:
@@ -742,7 +763,7 @@ def train(args):
                     aux_loss = asymmetric_multi_positive_infonce(
                         queries, aux_batch["synthetic_labels"].to(device), references, reference_labels,
                         temperature=args.synthetic_global_temperature,
-                        pair_valid=aux_batch["pair_valid"].to(device))
+                        pair_valid=aux_batch["pair_valid"].to(device), denominator=len(reference_labels))
                     weighted_aux_loss = args.synthetic_global_weight * aux_loss
                     if not torch.isfinite(weighted_aux_loss):
                         optimizer.zero_grad(set_to_none=True)
@@ -755,9 +776,13 @@ def train(args):
                 if local_supervisor is not None:
                     try:
                         prepared, totals, local_stats = local_supervisor.prepare(aux_batch)
+                        # Local losses are means over this auxiliary batch's support;
+                        # rescale them to per-query sums over the main batch, like global.
+                        scale = len(prepared) / len(reference_labels)
                         with auxiliary_model_rng(args,device,global_step,1):
-                            local_metrics = local_supervisor.backward(model, prepared, totals, scaler,
-                                                                      precision, local_weights, global_step=global_step)
+                            local_metrics = local_supervisor.backward(
+                                model, prepared, totals, scaler, precision,
+                                {k: v * scale for k, v in local_weights.items()}, global_step=global_step)
                     except (RuntimeError, ValueError):
                         optimizer.zero_grad(set_to_none=True)
                         raise
@@ -837,6 +862,7 @@ def train(args):
             row["synthetic_aux"] = {
                 **aux_sampler.summary(), "loss_real": real_loss_sum / steps,
                 "loss_syn_per_step": aux_loss_sum / steps,
+                "loss_syn_semantics": "sum over queries / main batch images, before global_weight",
                 "loss_syn_nonempty": aux_loss_sum / aux_steps if aux_steps else 0.0,
                 "nonempty_batches": aux_steps, "global_weight": args.synthetic_global_weight,
             }

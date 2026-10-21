@@ -124,6 +124,64 @@ class CoveragePlaceBatchSampler:
         return count - int(self.batch_size == 2 and self.num_places > 2 and self.num_places % 2 == 1)
 
 
+class StratifiedCoverageBatchSampler:
+    """Reserve ``slots`` places per batch for places with accepted variants.
+
+    One epoch is one coverage pass over the OTHER places (P - slots per batch).
+    Eligible places follow their own continuous stream of keyed permutations,
+    continuing across epochs, so they are revisited about
+    ``len(self) * slots / num_eligible`` times per epoch. A place is never placed
+    twice in one batch; a duplicate at a permutation boundary moves to the next
+    batch. Real-only controls must use the same sampler to keep identical place
+    streams. Keys carry the epoch like ``CoveragePlaceBatchSampler``.
+    """
+
+    def __init__(self, eligible: list[bool], batch_size: int, slots: int, seed: int) -> None:
+        self.eligible = [i for i, flag in enumerate(eligible) if flag]
+        self.other = [i for i, flag in enumerate(eligible) if not flag]
+        if not 1 <= slots < batch_size:
+            raise ValueError("synthetic place slots must be in [1, batch_size)")
+        if len(self.eligible) < slots or not self.other:
+            raise ValueError("Need at least `slots` eligible places and one other place")
+        self.batch_size, self.slots, self.seed = batch_size, slots, seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("epoch must be nonnegative (zero-based)")
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        per_batch = self.batch_size - self.slots
+        return (len(self.other) + per_batch - 1) // per_batch
+
+    def _eligible_stream(self, start: int):
+        n = len(self.eligible)
+        cycle, offset = divmod(start, n)
+        while True:
+            order = list(self.eligible)
+            random.Random(_sampling_seed("stratified_eligible_v1", self.seed, cycle)).shuffle(order)
+            yield from order[offset:]
+            cycle, offset = cycle + 1, 0
+
+    def __iter__(self):
+        epoch, per_batch = self.epoch, self.batch_size - self.slots
+        other = list(self.other)
+        random.Random(_sampling_seed("stratified_other_v1", self.seed, epoch)).shuffle(other)
+        # Epochs start at fixed stream positions so resume is stateless; a place
+        # still deferred at the end of an epoch is simply not visited then.
+        stream = self._eligible_stream(epoch * len(self) * self.slots)
+        deferred: list[int] = []
+        for start in range(0, len(other), per_batch):
+            chosen: list[int] = []
+            pending, deferred = deferred, []
+            while len(chosen) < self.slots:
+                index = pending.pop(0) if pending else next(stream)
+                (deferred if index in chosen else chosen).append(index)
+            deferred = pending + deferred
+            yield [(epoch, index) for index in chosen + other[start:start + per_batch]]
+
+
 class SamplingCoverage:
     """Main-process accounting of consumed metric images, never prefetched data.
 
@@ -240,7 +298,8 @@ class SyntheticAuxSampler:
     def _read_image(self, path):
         import numpy as np
         import torch
-        from PIL import Image, ImageEnhance, ImageOps
+        from PIL import Image
+        from workflow.augmentation import randaugment
 
         height, width = self.dataset.image_size
         try:
@@ -249,11 +308,8 @@ class SyntheticAuxSampler:
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"Cannot decode auxiliary synthetic image {path}: {exc}") from exc
         if self.dataset.augment:
-            if self.rng.random() < 0.5:
-                image = ImageOps.mirror(image)
-            if self.rng.random() < 0.5:
-                for enhancement in (ImageEnhance.Brightness, ImageEnhance.Contrast, ImageEnhance.Color):
-                    image = enhancement(image).enhance(self.rng.uniform(0.8, 1.2))
+            # The key comes from this sampler's checkpointed RNG.
+            image, = randaugment([image], self.rng.getrandbits(63))
         pixels = np.asarray(image, dtype=np.float32).copy() / 255.0
         tensor = torch.from_numpy(pixels).permute(2, 0, 1)
         mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -386,8 +442,9 @@ def _metadata_filename(row: dict[str, str], location: str) -> tuple[str, int, st
 class MixedGSVCitiesDataset:
     """One item is a place containing K distinct real/synthetic training views.
 
-    ``image_size`` is ``(height, width)``. Images are resized, optionally flipped
-    and color-jittered, and ImageNet normalized. With ``synthetic_mode="mix"``
+    ``image_size`` is ``(height, width)``. Images are resized, optionally
+    RandAugment-ed with a keyed per-image draw (``workflow.augmentation``), and
+    ImageNet normalized. With ``synthetic_mode="mix"``
     (the default), ``synthetic_fraction`` controls ``floor(K * fraction)``
     synthetic slots, capped by availability and ``K-1``. With ``"replace"``, K
     distinct real sources are sampled first; each available source variant is
@@ -404,15 +461,16 @@ class MixedGSVCitiesDataset:
     With ``reliability_pairs=True``, two tensors are appended to each returned
     item: exact real-source companions and a bool validity mask. Only selected
     synthetic views have valid pairs. Real companions reuse the selected image
-    tensor. Spatial transforms and color-jitter factors are shared within each
-    pair, leaving the generator's weather change as the observed difference.
+    tensor. The RandAugment draw is shared within each pair, leaving the
+    generator's weather change as the observed difference.
 
     ``reliability_target_cache`` instead returns cached target/confidence grids
     in those two positions. This mode requires non-augmented paired training,
     validates exact image bytes, and never decodes real-source companions.
 
-    PyTorch DataLoader seeds Python's random module in each worker. Seeding
-    ``random`` in the main process also makes direct sampling reproducible.
+    ``random_pk`` sampling uses Python's random module, which PyTorch DataLoader
+    seeds per worker. Augmentation never uses it: draws are keyed by seed, epoch,
+    place and file name, independent of worker count, slot order and resume.
     Heavy image/tensor imports happen only when an item is read.
 
     ``coverage_pk`` selects K real source identities from the COMPLETE pool,
@@ -421,6 +479,11 @@ class MixedGSVCitiesDataset:
     ``(epoch, index)`` keys carry epoch to workers; direct callers can instead
     use ``set_epoch``. Optional sampling metadata is appended AFTER all normal
     outputs and identifies only real images actually used in the metric batch.
+
+    ``prefer_synthetic_sources`` (coverage_pk only) puts up to K-1 sources that
+    have accepted variants into each visit's K sources before the coverage
+    order fills the rest. Real-only controls should use the same flag so that
+    their real source stream is identical to the synthetic run's.
     """
 
     def __init__(
@@ -439,6 +502,7 @@ class MixedGSVCitiesDataset:
         real_sampling: str = "random_pk",
         seed: int = 42,
         return_sampling_metadata: bool = False,
+        prefer_synthetic_sources: bool = False,
     ) -> None:
         if images_per_place < 2:
             raise ValueError("images_per_place must be >= 2 to supply positive pairs")
@@ -452,6 +516,8 @@ class MixedGSVCitiesDataset:
             raise ValueError("real_sampling must be 'random_pk' or 'coverage_pk'")
         if not isinstance(reliability_pairs, bool):
             raise ValueError("reliability_pairs must be a bool")
+        if prefer_synthetic_sources and real_sampling != "coverage_pk":
+            raise ValueError("prefer_synthetic_sources requires coverage_pk real sampling")
         if reliability_target_cache is not None and (not reliability_pairs or augment):
             raise ValueError("Static reliability target cache requires reliability_pairs=True and augment=False")
         if len(image_size) != 2 or any(not isinstance(n, int) or n <= 0 for n in image_size):
@@ -467,6 +533,7 @@ class MixedGSVCitiesDataset:
         self.return_sampling_metadata = return_sampling_metadata
         self.image_size = tuple(image_size)
         self.augment = augment
+        self.prefer_synthetic_sources = prefer_synthetic_sources
         self.reliability_pairs = reliability_pairs
         self.reliability_target_cache = None
         dataframe_dir = self.real_data / "Dataframes"
@@ -543,6 +610,12 @@ class MixedGSVCitiesDataset:
             "synthetic_fraction": synthetic_fraction,
             "image_size": list(self.image_size),
         }
+        if augment:
+            from workflow.augmentation import RANDAUGMENT
+            self.summary["augmentation"] = {"policy": "randaugment", **RANDAUGMENT}
+        if prefer_synthetic_sources:
+            self.summary.update(source_selection="synthetic_bearing_sources_first_then_coverage_v1",
+                                max_preferred_sources=images_per_place - 1)
         if real_sampling == "coverage_pk":
             self.summary.update(real_sampling=real_sampling, sampling_seed=seed,
                                 coverage_algorithm="permutation_boundary_repair_v1")
@@ -564,7 +637,7 @@ class MixedGSVCitiesDataset:
             self.summary.update({
                 "reliability_pairs": True,
                 "reliability_pair_source": "exact_manifest_source",
-                "reliability_pair_augmentation": "shared_spatial_and_color_jitter",
+                "reliability_pair_augmentation": "shared_randaugment_draw",
             })
         if reliability_target_cache is not None:
             from workflow.reliability_cache import ReliabilityTargetCache, file_sha256
@@ -677,6 +750,14 @@ class MixedGSVCitiesDataset:
                 place_id=place.place_id, epoch=epoch)]
             rng = random.Random(_sampling_seed("coverage_variants_v1", self.seed, place.city,
                                                place.place_id, epoch, k))
+            if self.prefer_synthetic_sources and place.synthetic_by_source:
+                preferred = [path for path in place.real_paths if path in place.synthetic_by_source]
+                random.Random(_sampling_seed("preferred_sources_v1", self.seed, place.city,
+                                             place.place_id, epoch)).shuffle(preferred)
+                preferred = preferred[:k - 1]
+                rest = [path for path in sources if path not in preferred]
+                rest += [path for path in place.real_paths if path not in preferred and path not in rest]
+                sources = preferred + rest[:k - len(preferred)]
         if self.synthetic_mode == "replace":
             sources = sources if sources is not None else rng.sample(place.real_paths, k)
             selected = []
@@ -703,7 +784,8 @@ class MixedGSVCitiesDataset:
     def __getitem__(self, index: int | tuple[int, int]):
         import numpy as np
         import torch
-        from PIL import Image, ImageEnhance, ImageOps
+        from PIL import Image
+        from workflow.augmentation import augmentation_seed, randaugment
 
         epoch = self.epoch
         if isinstance(index, tuple):
@@ -740,16 +822,13 @@ class MixedGSVCitiesDataset:
                 # Do not substitute another same-place view for weak supervision.
                 companion = read_image(place.source_by_synthetic_path[path])
             if self.augment:
-                if random.random() < 0.5:
-                    image = ImageOps.mirror(image)
-                    if companion is not None:
-                        companion = ImageOps.mirror(companion)
-                if random.random() < 0.5:
-                    for enhancement in (ImageEnhance.Brightness, ImageEnhance.Contrast, ImageEnhance.Color):
-                        factor = random.uniform(0.8, 1.2)
-                        image = enhancement(image).enhance(factor)
-                        if companion is not None:
-                            companion = enhancement(companion).enhance(factor)
+                # Keyed by file, not slot: an image gets the same draw whatever
+                # order the mix/replace branch shuffled it into.
+                key = augmentation_seed(self.seed, epoch, place.city, place.place_id, path.name)
+                if companion is None:
+                    image, = randaugment([image], key)
+                else:
+                    image, companion = randaugment([image, companion], key)
             tensor = normalize(image)
             tensors.append(tensor)
             kinds.append(is_synthetic)
