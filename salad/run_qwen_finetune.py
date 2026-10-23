@@ -12,6 +12,7 @@ import fcntl
 import gzip
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 
@@ -29,21 +30,39 @@ TRAINING_FIELDS = (
       for suffix in ('_path', '_sha256')),
 )
 IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.webp'}
+WEATHER_DOMAINS = frozenset({'night', 'rainy_night', 'rain', 'snow', 'sun', 'fog', 'overcast'})
 
 
 def accepted_images(root):
-    """Read aliases, never infer an exact source from filenames or place IDs."""
+    """Read one domain level and historical flat aliases, with exact targets."""
+    root = Path(root).resolve()
     directory = root / 'images/accepted'
+    if (root / 'images').is_symlink() or directory.is_symlink():
+        raise ValueError(f'Accepted directory must be an owned directory: {directory}')
     if not directory.is_dir():
         raise FileNotFoundError(f'Missing Qwen accepted directory: {directory}')
-    train = (root / 'images/train').resolve()
-    result = {}
-    for alias in sorted(directory.iterdir()):
-        if alias.suffix.lower() not in IMAGE_SUFFIXES:
+    train = root / 'images/train'
+    if train.is_symlink() or not train.is_dir():
+        raise ValueError(f'Accepted aliases require an owned images/train directory: {train}')
+    aliases = [path for path in directory.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES]
+    for condition in sorted(WEATHER_DOMAINS):
+        domain = directory / condition
+        if not domain.exists() and not domain.is_symlink():
             continue
+        if domain.is_symlink() or not domain.is_dir():
+            raise ValueError(f'Accepted domain must be an owned directory: {domain}')
+        aliases.extend(path for path in domain.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES)
+    result = {}
+    for alias in sorted(aliases):
+        if not alias.is_symlink():
+            raise ValueError(f'Accepted images must be symbolic aliases inside images/train: {alias}')
+        expected = train / alias.name
+        lexical_target = Path(os.path.abspath(alias.parent / os.readlink(alias)))
+        if lexical_target != expected:
+            raise ValueError(f'Accepted alias must point to its matching filename inside images/train: {alias}')
         target = alias.resolve(strict=True)
-        if not target.is_file() or not target.is_relative_to(train):
-            raise ValueError(f'Accepted alias must resolve inside images/train: {alias}')
+        if expected.is_symlink() or target != expected or not target.is_file():
+            raise ValueError(f'Accepted alias requires a regular canonical file inside images/train: {alias}')
         if str(target) in result:
             raise ValueError(f'Duplicate accepted aliases for {target}')
         result[str(target)] = str(alias)
@@ -71,6 +90,8 @@ def verify_snapshot(inputs, request):
     if saved_request != request:
         raise ValueError('Frozen experiment configuration changed; use a new --output-dir')
     receipt = json.loads((inputs / 'receipt.json').read_text())
+    # Layout-reader updates never re-sign existing snapshots. If this guard
+    # fails, use the archived original entrypoint or a new output directory.
     if receipt['entrypoint_sha256'] != ccr.digest(__file__):
         raise ValueError('Qwen entrypoint changed since preparation; use a new --output-dir')
     for name, sha in receipt['files_sha256'].items():
@@ -136,6 +157,9 @@ def prepare_inputs(config, out):
                     raise ValueError(f'{manifest}:{line_number}: invalid exact real source')
                 if not isinstance(row.get('condition'), str) or not row['condition'].strip():
                     raise ValueError(f'{manifest}:{line_number}: missing weather condition')
+                alias = Path(aliases[str(output)])
+                if alias.parent.name != 'accepted' and alias.parent.name != row['condition'].lower():
+                    raise ValueError(f'{manifest}:{line_number}: accepted domain differs from manifest condition')
                 compact = {key: row[key] for key in TRAINING_FIELDS if key in row}
                 compact.update(source_path=str(original), output_path=str(output))
                 for path, key in ((original, 'source_sha256'), (output, 'output_sha256')):

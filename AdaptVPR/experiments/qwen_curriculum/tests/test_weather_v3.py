@@ -1,15 +1,12 @@
-"""CPU checks for the v3 prompt bank, verifier and planner."""
+"""CPU checks for the v3 prompt bank, verifier and journal reader."""
 
 from __future__ import annotations
 
-import csv
-import json
 import sys
 import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
-from types import SimpleNamespace
 
 from PIL import Image
 
@@ -17,7 +14,7 @@ ADAPTVPR_ROOT = Path(__file__).resolve().parents[3]
 if str(ADAPTVPR_ROOT) not in sys.path:
     sys.path.insert(0, str(ADAPTVPR_ROOT))
 
-from experiments.qwen_curriculum import prompt_bank, quality, weather_signal, weather_v3
+from experiments.qwen_curriculum import prompt_bank, quality, weather_signal, weather_io
 from experiments.qwen_curriculum.quality_v3 import QwenQualityVerifierV3, THRESHOLDS
 from test_quality import Evaluator, Matcher, Weather, raw_result
 
@@ -73,54 +70,15 @@ class VerifierTests(unittest.TestCase):
         self.assertEqual(quality.QUALITY_DEFAULTS["min_s_geo"], 0.78)
 
 
-class PlannerTests(unittest.TestCase):
-    def test_plan_quotas_distinct_domains_and_skip(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            gsv = root / "gsv"
-            (gsv / "Dataframes").mkdir(parents=True)
-            (gsv / "Images/City").mkdir(parents=True)
-            rows = []
-            for place in range(12):
-                for view in range(4):
-                    row = dict(place_id=str(place), year="2020", month="3", northdeg=str(view), city_id="City",
-                               lat="1.5", lon="2.5", panoid=f"p{place}v{view}")
-                    rows.append(row)
-                    Image.new("RGB", (8, 6), (place * 9, view * 40, 0)).save(
-                        gsv / "Images/City" / f"City_{place:07d}_2020_03_{view:03d}_1.5_2.5_p{place}v{view}.jpg")
-            with (gsv / "Dataframes/City.csv").open("w", newline="") as handle:
-                writer = csv.DictWriter(handle, rows[0].keys())
-                writer.writeheader()
-                writer.writerows(rows)
-            skip = root / "skip.jsonl"
-            skip.write_text(json.dumps(dict(city="City", place_id=0)) + "\n")
-            exclude = root / "exclude.json"
-            exclude.write_text(json.dumps([["City", 1]]))
-            args = SimpleNamespace(run_dir=root / "run", exclude_places=exclude, skip_manifest=skip, real_data=gsv,
-                                   min_images=4, places=10, sources_per_place=2, domains_per_source=2, seed=3)
-            weather_v3.plan(args)
-            jobs = weather_v3.read_rows(args.run_dir / "plan.jsonl")
-            self.assertEqual(len(jobs), 40)
-            self.assertFalse({j["place_id"] for j in jobs} & {0, 1})
-            self.assertEqual(Counter(j["condition"] for j in jobs), Counter(weather_v3.quotas(40, prompt_bank.DOMAIN_WEIGHTS)))
-            by_source = {}
-            for job in jobs:
-                by_source.setdefault(job["source_path"], []).append(job["condition"])
-            self.assertEqual(len(by_source), 20)
-            self.assertGreaterEqual(sum(len(set(v)) == 2 for v in by_source.values()), 18)
-            config, reloaded = weather_v3.load_plan(args.run_dir)
-            self.assertEqual(reloaded, jobs)
-            with self.assertRaises(ValueError):
-                weather_v3.plan(args)
-
+class JournalTests(unittest.TestCase):
     def test_torn_final_line_is_dropped(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "results.jsonl"
             path.write_text('{"a": 1}\n{"b": ')
-            self.assertEqual(weather_v3.read_rows(path), [{"a": 1}])
+            self.assertEqual(weather_io.read_rows(path), [{"a": 1}])
             path.write_text('{"a": \n{"b": 2}\n')
             with self.assertRaises(ValueError):
-                weather_v3.read_rows(path)
+                weather_io.read_rows(path)
 
 
 if __name__ == "__main__":

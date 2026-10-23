@@ -203,7 +203,7 @@ class CampaignTests(unittest.TestCase):
                 self.assertTrue(path.is_symlink())
                 self.assertTrue(path.resolve().is_relative_to(self.root / "images"))
                 self.assertEqual(common.file_sha256(path), row[field.replace("_path", "_sha256")])
-        self.assertEqual(len(list((self.root / "images/accepted").glob("*.png"))), 4)
+        self.assertEqual(len(list((self.root / "images/accepted/night").glob("*.png"))), 4)
 
     def test_runtime_seal_rejects_changed_input_and_ignores_legacy_code_evidence(self):
         self.assertEqual(campaign.check_inputs(self.directory), self.config)

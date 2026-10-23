@@ -18,6 +18,41 @@ def command_result(code=0, stderr=""):
 
 
 class ResumeControlTests(unittest.TestCase):
+    def test_night_first_controller_is_selected_for_the_new_place_plan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "outputs/weather_v3/state"
+            output.mkdir(parents=True)
+            (output / "plan_config.json").write_text('{"stage":"place_coverage_weather_v3"}')
+            path = control.install_systemd_override(output, user_unit_dir=Path(temp) / "user", python="/env/bin/python")
+            self.assertIn(str(Path(control.__file__).with_name("night_first_v3.py").resolve()), path.read_text())
+            self.assertIn(str(output), path.read_text())
+
+    def test_night_first_binding_keeps_explicit_state_directory_for_status_and_resume(self):
+        import json
+        with tempfile.TemporaryDirectory() as temp, patch.object(control.Path, "home", return_value=Path(temp)):
+            output = Path(temp) / "outputs/weather_v3/state"
+            output.mkdir(parents=True)
+            (output / "plan_config.json").write_text(json.dumps({"stage": "place_coverage_weather_v3"}))
+            (output / "summary.json").write_text(json.dumps({"state": "paused", "saved": 910}))
+            override = control.install_systemd_override(output, python="/env/bin/python")
+            text = override.read_text()
+            self.assertIn(str(Path(control.__file__).with_name("night_first_v3.py").resolve()), text)
+            self.assertIn('"--output-dir" "' + str(output) + '"', text)
+            self.assertIn("StandardOutput=append:" + str(output / "coordinator.log"), text)
+            self.assertEqual(control.configured_output_dir(), output)
+            with patch.object(control, "unit_state", side_effect=lambda unit: state(unit)), \
+                    patch.object(control, "systemctl") as ctl:
+                report = control.status()
+            self.assertEqual(report["output_dir"], str(output))
+            self.assertEqual(report["summary"]["saved"], 910)
+            ctl.assert_not_called()
+            with patch.object(control, "unit_state", side_effect=[state(control.COORDINATOR_UNIT),
+                    state(control.COORDINATOR_UNIT, "active", 91)]), \
+                    patch.object(control, "systemctl", return_value=command_result()) as ctl:
+                report = control.resume(output)
+            self.assertEqual(report["output_dir"], str(output))
+            ctl.assert_called_once_with("start", control.COORDINATOR_UNIT)
+
     def test_pause_stops_client_then_independent_qwen_and_checks_both(self):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(control, "systemctl", return_value=command_result()) as ctl, \

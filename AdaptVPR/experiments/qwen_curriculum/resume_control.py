@@ -101,7 +101,10 @@ def install_systemd_override(directory=DEFAULT_OUTPUT, *, user_unit_dir=None, py
     user_unit_dir = Path(user_unit_dir) if user_unit_dir else Path.home() / ".config/systemd/user"
     interpreter = Path(python) if python else Path.home() / "miniconda3/envs/AdaptVPR/bin/python"
     if controller is None:
-        controller = Path(__file__).with_name("campaign.py").resolve()
+        plan = directory / "plan_config.json"
+        is_v3 = plan.exists() and json.loads(plan.read_text()).get("stage") == "place_coverage_weather_v3"
+        entry = "night_first_v3.py" if is_v3 else "campaign.py"
+        controller = Path(__file__).with_name(entry).resolve()
     else:
         controller = Path(controller).resolve()
     command = " ".join(_systemd_argument(arg) for arg in

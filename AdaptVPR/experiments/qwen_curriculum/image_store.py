@@ -1,7 +1,7 @@
 """Collect committed Qwen images without changing signed historical records.
 
 ``train`` and ``raw`` contain the effective images, ``metadata`` their byte-exact
-sidecars, and ``accepted`` links only currently accepted training images. Extra
+sidecars, and ``accepted/<condition>`` links only currently accepted training images. Extra
 historical bytes differing from the effective image are kept by SHA in
 ``evidence``. Files outside an explicit scope are imported without modification.
 The owner of the generation controller freezes the layout and implementation;
@@ -36,9 +36,10 @@ KINDS = {"output": ("train", "output_path", "output_sha256"),
 def layout_definition(root=DEFAULT_ROOT):
     """Return static, fingerprintable layout settings without creating files."""
     root = Path(root).resolve()
-    return {"schema_version": 1, "root": str(root),
+    return {"schema_version": 2, "root": str(root),
         "directories": {name: str(root / name) for name in ("train", "raw", "metadata", "accepted", "evidence")},
         "selected_name": "sample_id + .png; sidecar sample_id + .json",
+        "accepted_name": "condition / sample_id + .png",
         "evidence_name": "content_sha256 + original media suffix",
         "source_policy": "same-filesystem hardlink or verified atomic copy; atomic scoped source symlink replacement",
         "record_policy": "committed signed image rows only; generation journals and seals unchanged"}
@@ -296,36 +297,73 @@ class ImageStore:
             raise ValueError(f"Frozen recovery sidecar changed: {path}")
         return path, digest
 
+    def _accepted_path(self, sid, condition):
+        if not isinstance(condition, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", condition):
+            raise ValueError("Unsafe image-store condition")
+        return self.root / "accepted" / condition / f"{sid}.png"
+
+    def _owned_accepted_alias(self, path, sid):
+        # Never follow an unknown domain directory while removing an alias.
+        if path.parent.is_symlink() or not path.parent.is_dir() or not path.is_symlink():
+            return False
+        target = Path(os.path.abspath(path.parent / os.readlink(path)))
+        return target == self.root / "train" / f"{sid}.png"
+
     def _accepted(self, selected, previous, report):
         accepted = {sid for sid, row in selected.items() if row["accepted"]}
-        known = set(selected) | {row["sample_id"] for row in previous}
-        for sid in sorted(known):
-            path = self.root / "accepted" / f"{sid}.png"
-            expected = f"../train/{sid}.png"
-            if sid in accepted:
-                if path.is_symlink():
-                    if os.readlink(path) != expected:
-                        raise ValueError(f"Accepted image alias conflicts with an unknown file: {path}")
-                    continue
-                if path.exists():
+        desired = {sid: self._accepted_path(sid, selected[sid]["condition"]) for sid in accepted}
+        # Commit all new domain links before removing any older view. If this
+        # process stops here, the authenticated old index still permits replay.
+        for sid, path in sorted(desired.items()):
+            directory = path.parent
+            if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+                raise ValueError(f"Accepted image directory conflicts with an unknown file: {directory}")
+            if not directory.exists():
+                directory.mkdir()
+                _sync_directory(directory.parent)
+            if path.is_symlink():
+                if not self._owned_accepted_alias(path, sid):
                     raise ValueError(f"Accepted image alias conflicts with an unknown file: {path}")
-                temporary = path.parent / f".image-store-accepted-{uuid.uuid4().hex}.tmp"
-                created = False
-                try:
-                    os.symlink(expected, temporary)
-                    created = True
-                    temporary.replace(path)
-                    _sync_directory(path.parent)
-                finally:
-                    if created:
-                        temporary.unlink(missing_ok=True)
-                report["accepted_links_created"] += 1
-            elif path.is_symlink() and os.readlink(path) == expected:
+                continue
+            if path.exists():
+                raise ValueError(f"Accepted image alias conflicts with an unknown file: {path}")
+            expected = os.path.relpath(self.root / "train" / f"{sid}.png", directory)
+            temporary = directory / f".image-store-accepted-{uuid.uuid4().hex}.tmp"
+            created = False
+            try:
+                os.symlink(expected, temporary)
+                created = True
+                temporary.replace(path)
+                _sync_directory(directory)
+            finally:
+                if created:
+                    temporary.unlink(missing_ok=True)
+            report["accepted_links_created"] += 1
+        candidates = set()
+        for row in previous:
+            sid = row["sample_id"]
+            # Only an authenticated prior index establishes ownership of flat
+            # legacy aliases. New/unindexed flat names must remain untouched.
+            flat = self.root / "accepted" / f"{sid}.png"
+            if row.get("accepted") is True and row.get("accepted_path") == str(flat):
+                candidates.add((flat, sid))
+            try:
+                candidates.add((self._accepted_path(sid, row.get("condition")), sid))
+            except ValueError:
+                pass
+        for sid, row in selected.items():
+            # A first synchronization can stop before its index commits. Its
+            # deterministic domain alias remains recoverable from signed rows.
+            candidates.add((self._accepted_path(sid, row["condition"]), sid))
+        for path, sid in sorted(candidates):
+            if path == desired.get(sid):
+                continue
+            if self._owned_accepted_alias(path, sid):
                 path.unlink()
                 _sync_directory(path.parent)
                 report["accepted_links_removed"] += 1
-            # Unknown names, regular files and differently targeted links are
-            # untouched. No generated image is deleted when review changes.
+            # Unknown names, regular files, directories and differently targeted
+            # links stay untouched. The underlying generated image is retained.
         return accepted
 
     def sync(self, generated_rows, result_rows, *, extra_evidence_rows=()):
@@ -389,7 +427,7 @@ class ImageStore:
                     "raw_output_sha256": row["raw_output_sha256"],
                     "metadata_path": str(metadata_target) if metadata_target is not None else None,
                     "metadata_sha256": metadata[1] if metadata is not None else None,
-                    "accepted_path": str(self.root / "accepted" / f"{sid}.png") if accepted else None,
+                    "accepted_path": str(self._accepted_path(sid, row["condition"])) if accepted else None,
                     "original_output_path": row["output_path"], "original_raw_output_path": row["raw_output_path"],
                     "generated_result_sha256": row["result_sha256"],
                     "original_result_sha256": original["result_sha256"],

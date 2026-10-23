@@ -153,8 +153,7 @@ $PY run_weather_round.py --phase report
 
 权重由下方 100 张 pilot 校准（`qwen_weather_bank_v3.1`）。
 
-每个源图编辑成 2 个不同域，每个地点 2 个源图，因此同一次访问中可同时出现同一地点的多种天气。
-每条记录保存 `prompt_variant`，难度探针按变体分组，用于在小规模 pilot 后保留、加强或删除变体。
+下述 pilot 使用每个源图 2 个不同域、每地点 2 个源图。现行全量方案已改为每个合格地点只生成 1 张，独立保存在 `outputs/weather_v3/`，优先完成 night；详见 [当前生成说明](../../AdaptVPR/experiments/qwen_curriculum/WEATHER_V3.md)。每条记录保存 `prompt_variant`，难度探针按变体分组。
 
 ### 100 张 pilot 结果
 
@@ -185,32 +184,27 @@ $PY run_weather_round.py --phase report
 - 几何门槛放宽为 `s_geo ≥ 0.70`、单应位移中位数 ≤ 32 px（原 0.78 / 16 px）。
   抽查原先被几何拒绝的夜晚图，大多是结构忠实、但点亮灯光或轻微重构图的编辑；
   这些重新验收的图描述子位移更大（rain 中位数 0.037 vs 0.021），即 v2 正好丢掉了更难的样本。
-  `weather_v3.py requalify` 只用已记录的测量值重新验收，得到 2,380 张，已加入本阶段快照。
+  历史 pilot 的重新验收处理只用已记录测量值，得到 2,380 张，已加入本阶段快照；旧 pilot CLI 现已移除。
 - 曾尝试在低光域先做亮度均衡再匹配；120 张 v2 几何拒绝的夜晚图中只有 6 张被挽回，没有保留。
 - 原 v2 `quality.py`/`weather_signal.py` 未修改，暂停中的 23 城市计划仍可按原指纹继续。
 
-### v3 生成命令
+### 当前 v3 生成的控制命令
+
+当前保持暂停。后台统一使用 `night_first_v3.py`，完整计划、来源筛选和中断账本位于 `outputs/weather_v3/state/`；域图片直接放在 `outputs/weather_v3/night/` 等目录。以下命令从工作区根目录执行：
 
 ```bash
 PY=/home/admin123/miniconda3/envs/AdaptVPR/bin/python
-V3=AdaptVPR/experiments/qwen_curriculum/weather_v3.py
 
-# 规划：跳过已有生成图的地点和保留地点
-$PY $V3 plan --run-dir outputs/qwen_curriculum/weather_v3 --places 6000 \
-  --exclude-places outputs/qwen_curriculum/state/finetuning/real_baseline_v1/excluded_places.json \
-  --skip-manifest outputs/qwen_curriculum/state/training_manifest.jsonl
-
-systemctl --user start adaptvpr-lightx2v.service
-$PY $V3 generate --run-dir outputs/qwen_curriculum/weather_v3     # 可随时中断，重跑继续
-$PY $V3 status --run-dir outputs/qwen_curriculum/weather_v3
+$PY AdaptVPR/experiments/qwen_curriculum/resume_control.py status
+$PY AdaptVPR/experiments/qwen_curriculum/resume_control.py pause
+$PY AdaptVPR/experiments/qwen_curriculum/resume_control.py resume
 
 # 按变体测量难度
 $PY salad/probe_synthetic_difficulty.py \
-  --manifest outputs/qwen_curriculum/weather_v3/training_manifest.jsonl \
+  --manifest outputs/weather_v3/state/training_manifest.jsonl \
   --output outputs/qwen_curriculum/state/analysis/difficulty_probe_v3
 ```
 
-单张约 25 s（pilot 实测 100 张 46 分钟）；6,000 地点 × 4 张约 7 天。
-已保存的输出可用 `weather_v3.py reverify` 按当前审核规则重新评分，不调用 Qwen。生成完成后，把
-`outputs/qwen_curriculum/weather_v3/training_manifest.jsonl` 加入 `configs/weather_round.json` 的
-`synthetic_manifests`，并改用新的 `output_dir` 重新跑本阶段对照。
+单张约 25 s（pilot 实测 100 张 46 分钟），实际耗时以当前生成日志为准。暂停后可使用 `night_first_v3.py check` 检查已保存输出和恢复状态，不调用 Qwen。旧 pilot CLI 已移除，当前计划统一使用上述入口。
+
+自动审核仍可能漏掉车辆新增和局部拼接缺陷，`accepted` 不代表人工确认无缺陷。后续完成质量复查并确定训练快照后，才将 `outputs/weather_v3/state/training_manifest.jsonl` 加入新的训练配置；旧阶段配置和历史训练结果保持独立。

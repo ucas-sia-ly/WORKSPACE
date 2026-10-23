@@ -30,6 +30,9 @@ def parse_args(argv=None):
                         help="mix: target synthetic slots; replace: probability of replacing each selected source view")
     parser.add_argument("--synthetic-mode", choices=["mix", "replace"], default="mix",
                         help="replace preserves the original sampler's source identities and substitutes exact-source variants")
+    parser.add_argument("--synthetic-camera-profile", type=Path,
+                        help="Opt-in JSON camera-response simulations for generated night/rainy_night training views; "
+                             "independent RNG, default off; --no-augment controls standard augmentation only")
     parser.add_argument("--synthetic-aux", action="store_true",
                         help="CCR-VPR Stage 1: all-real main batch plus at most one exact-source synthetic query per place")
     parser.add_argument("--synthetic-exposure-prob", type=float, default=0.5,
@@ -168,6 +171,10 @@ def parse_args(argv=None):
         parser.error("--synthetic-place-slots must be in [0, batch-size) and excludes --synthetic-places-only")
     if args.synthetic_mode == "replace" and args.synthetic_manifest is None:
         parser.error("--synthetic-mode replace requires --synthetic-manifest")
+    if args.synthetic_camera_profile is not None and args.synthetic_manifest is None:
+        parser.error("--synthetic-camera-profile requires --synthetic-manifest")
+    if args.synthetic_camera_profile is not None and args.reliability_target_cache is not None:
+        parser.error("--synthetic-camera-profile cannot use static reliability targets")
     if not math.isfinite(args.synthetic_exposure_prob) or not 0 <= args.synthetic_exposure_prob <= 1:
         parser.error("--synthetic-exposure-prob must be finite and in [0,1]")
     if not math.isfinite(args.synthetic_global_weight) or args.synthetic_global_weight < 0:
@@ -350,7 +357,8 @@ def auxiliary_model_rng(args,device,step,branch):
         yield
 
 
-def resolved_training_config(args, model_config, initialization=None, teacher=None, local_supervisor=None):
+def resolved_training_config(args, model_config, initialization=None, teacher=None, local_supervisor=None,
+                             camera_augmentation=None):
     dataframes = args.real_data.expanduser().resolve() / "Dataframes"
     metadata = [dataframes / f"{city}.csv" for city in sorted(args.cities)] if args.cities else sorted(dataframes.glob("*.csv"))
     if args.synthetic_manifest:
@@ -388,6 +396,10 @@ def resolved_training_config(args, model_config, initialization=None, teacher=No
     }
     if teacher is not None:
         config["teacher"] = {**copy.deepcopy(teacher.provenance), "batch_size": args.teacher_batch_size}
+    if getattr(args, "synthetic_camera_profile", None) is not None:
+        from workflow.camera_augmentation import CameraAugmentation
+        camera = camera_augmentation or CameraAugmentation.from_json(args.synthetic_camera_profile)
+        config["synthetic_camera_augmentation"] = camera.provenance
     if args.max_steps:
         config["max_steps"] = args.max_steps
     if args.exclude_places:
@@ -475,6 +487,7 @@ def train(args):
         augment=not args.no_augment, synthetic_mode=args.synthetic_mode,
         real_sampling=args.real_sampling, seed=args.seed, return_sampling_metadata=True,
         prefer_synthetic_sources=args.prefer_synthetic_sources,
+        synthetic_camera_profile=getattr(args, "synthetic_camera_profile", None),
         **({"reliability_pairs": True} if args.reliability_ot else {}),
         **({"reliability_target_cache": args.reliability_target_cache} if args.reliability_target_cache else {}),
     )
@@ -516,7 +529,8 @@ def train(args):
     if pair_supervision_enabled(args):
         from workflow.local_distillation import LocalDistillationSupervisor
         local_supervisor = LocalDistillationSupervisor(teacher, dataset, args)
-    training_config = resolved_training_config(args, model_config, initialization, teacher, local_supervisor)
+    training_config = resolved_training_config(args, model_config, initialization, teacher, local_supervisor,
+                                               camera_augmentation=dataset.camera_augmentation)
     if resume is not None:
         saved_training_config = {"synthetic_places_only": False, "synthetic_mode": "mix", "init_checkpoint": None,
                                  "init_checkpoint_sha256": None, "real_sampling": "random_pk", **resume["training_config"]}

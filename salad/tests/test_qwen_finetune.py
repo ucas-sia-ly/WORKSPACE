@@ -16,7 +16,7 @@ class QwenSnapshotTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
         self.curriculum = self.root / 'qwen_curriculum'
-        for name in ('state', 'images/accepted', 'images/train'):
+        for name in ('state', 'images/accepted/night', 'images/train'):
             (self.curriculum / name).mkdir(parents=True)
         self.real = self.root / 'gsv'
         (self.real / 'Images/City').mkdir(parents=True)
@@ -26,14 +26,16 @@ class QwenSnapshotTests(unittest.TestCase):
         self.rows = []
         self.add_pair('one')
 
-    def add_pair(self, name, accepted=True, **extra):
+    def add_pair(self, name, accepted=True, condition='night', **extra):
         original = self.real / f'Images/City/{name}.jpg'
         generated = self.curriculum / f'images/train/{name}.png'
         original.write_bytes(('real ' + name).encode())
         generated.write_bytes(('generated ' + name).encode())
         if accepted:
-            (self.curriculum / f'images/accepted/{name}.png').symlink_to(f'../train/{name}.png')
-        row = dict(sample_id=name, city='City', place_id=1, condition='night',
+            domain = self.curriculum / f'images/accepted/{condition}'
+            domain.mkdir(exist_ok=True)
+            (domain / f'{name}.png').symlink_to(f'../../train/{name}.png')
+        row = dict(sample_id=name, city='City', place_id=1, condition=condition,
                    source_path=str(original), output_path=str(generated),
                    source_sha256=qwen.ccr.digest(original), output_sha256=qwen.ccr.digest(generated),
                    passed=True, eligible_for_training=True, weather_ok=True,
@@ -72,7 +74,7 @@ class QwenSnapshotTests(unittest.TestCase):
         second = {**self.config, 'output_dir': str(self.root / 'run2')}
         self.assertEqual(self.prepare(second)['accepted_images'], 2)
         self.manifest.unlink()
-        (self.curriculum / 'images/accepted/one.png').unlink()
+        (self.curriculum / 'images/accepted/night/one.png').unlink()
         self.assertEqual(self.prepare()['accepted_images'], 1)
 
     def test_only_intersection_of_accepted_and_quality_flags_is_included(self):
@@ -145,10 +147,100 @@ class QwenSnapshotTests(unittest.TestCase):
             self.prepare(other)
 
     def test_alias_cannot_escape_train_pool_and_random_files_are_not_sources(self):
-        (self.curriculum / 'images/accepted/one.png').unlink()
-        (self.curriculum / 'images/accepted/one.png').symlink_to(self.rows[0]['source_path'])
+        (self.curriculum / 'images/accepted/night/one.png').unlink()
+        (self.curriculum / 'images/accepted/night/one.png').symlink_to(self.rows[0]['source_path'])
         with self.assertRaisesRegex(ValueError, 'inside images/train'):
             self.prepare()
+
+    def test_one_domain_level_includes_each_weather_without_recursing_unknown_folders(self):
+        for condition in sorted(qwen.WEATHER_DOMAINS - {'night'}):
+            self.add_pair(condition, condition=condition)
+        ignored = self.curriculum / 'images/accepted/notes'
+        ignored.mkdir()
+        (ignored / 'external.png').symlink_to(self.rows[0]['source_path'])
+        nested = self.curriculum / 'images/accepted/night/nested'
+        nested.mkdir()
+        (nested / 'external.png').symlink_to(self.rows[0]['source_path'])
+        receipt = self.prepare()
+        self.assertEqual(receipt['accepted_images'], 7)
+        self.assertEqual(receipt['conditions'], {condition: 1 for condition in qwen.WEATHER_DOMAINS})
+        self.assertTrue(all(Path(alias).parent.name in qwen.WEATHER_DOMAINS
+                            for alias in qwen.accepted_images(self.curriculum).values()))
+
+    def test_legacy_flat_alias_is_still_readable(self):
+        (self.curriculum / 'images/accepted/night/one.png').unlink()
+        flat = self.curriculum / 'images/accepted/one.png'
+        flat.symlink_to('../train/one.png')
+        self.assertEqual(self.prepare()['accepted_images'], 1)
+        self.assertEqual(qwen.accepted_images(self.curriculum), {self.rows[0]['output_path']: str(flat)})
+
+    def test_duplicate_flat_and_domain_aliases_are_rejected(self):
+        (self.curriculum / 'images/accepted/one.png').symlink_to('../train/one.png')
+        with self.assertRaisesRegex(ValueError, 'Duplicate accepted aliases'):
+            self.prepare()
+
+    def test_alias_must_target_same_filename_directly(self):
+        generated = self.curriculum / 'images/train/other.png'
+        generated.write_bytes(b'other image')
+        alias = self.curriculum / 'images/accepted/night/one.png'
+        alias.unlink()
+        alias.symlink_to('../../train/other.png')
+        with self.assertRaisesRegex(ValueError, 'matching filename'):
+            self.prepare()
+
+    def test_accepted_domain_and_train_directories_cannot_be_symlinks(self):
+        accepted = self.curriculum / 'images/accepted'
+        (accepted / 'night').rename(self.root / 'saved-night')
+        (accepted / 'night').symlink_to(self.root / 'saved-night', target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'Accepted domain must be an owned directory'):
+            self.prepare()
+        (accepted / 'night').unlink()
+        (self.root / 'saved-night').rename(accepted / 'night')
+        train = self.curriculum / 'images/train'
+        train.rename(self.root / 'saved-train')
+        train.symlink_to(self.root / 'saved-train', target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'owned images/train directory'):
+            self.prepare()
+
+    def test_non_alias_image_and_symlink_canonical_are_rejected(self):
+        alias = self.curriculum / 'images/accepted/night/one.png'
+        alias.unlink()
+        alias.write_bytes(b'copied image')
+        with self.assertRaisesRegex(ValueError, 'must be symbolic aliases'):
+            self.prepare()
+        alias.unlink()
+        alias.symlink_to('../../train/one.png')
+        generated = Path(self.rows[0]['output_path'])
+        generated.unlink()
+        generated.symlink_to(self.rows[0]['source_path'])
+        with self.assertRaisesRegex(ValueError, 'regular canonical file'):
+            self.prepare()
+
+    def test_manifest_condition_must_match_domain_alias(self):
+        self.rows[0]['condition'] = 'rain'
+        self.publish()
+        with self.assertRaisesRegex(ValueError, 'accepted domain differs'):
+            self.prepare()
+        self.assertFalse((self.root / 'run1/inputs').exists())
+
+    def test_layout_change_does_not_refresh_existing_frozen_snapshot(self):
+        self.prepare()
+        alias = self.curriculum / 'images/accepted/night/one.png'
+        alias.unlink()
+        (self.curriculum / 'images/accepted/one.png').symlink_to('../train/one.png')
+        with patch.object(qwen, 'accepted_images', side_effect=AssertionError('live pool must not be read')):
+            self.assertEqual(self.prepare()['accepted_images'], 1)
+
+    def test_entrypoint_checksum_guard_does_not_resign_old_snapshots(self):
+        self.prepare()
+        receipt_path = self.root / 'run1/inputs/receipt.json'
+        receipt = json.loads(receipt_path.read_text())
+        receipt['entrypoint_sha256'] = '0' * 64
+        receipt_path.write_text(json.dumps(receipt))
+        before = receipt_path.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'entrypoint changed'):
+            self.prepare()
+        self.assertEqual(receipt_path.read_bytes(), before)
 
 
 class QwenCommandTests(unittest.TestCase):

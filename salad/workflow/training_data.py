@@ -295,7 +295,7 @@ class SyntheticAuxSampler:
             raise ValueError("Unsupported synthetic auxiliary sampler checkpoint")
         self.rng.setstate(state["rng"])
 
-    def _read_image(self, path):
+    def _read_image(self, path, *, condition=None, camera_seed=None):
         import numpy as np
         import torch
         from PIL import Image
@@ -310,6 +310,8 @@ class SyntheticAuxSampler:
         if self.dataset.augment:
             # The key comes from this sampler's checkpointed RNG.
             image, = randaugment([image], self.rng.getrandbits(63))
+        if self.dataset.camera_augmentation is not None:
+            image = self.dataset.camera_augmentation.apply(image, seed=camera_seed, condition=condition)
         pixels = np.asarray(image, dtype=np.float32).copy() / 255.0
         tensor = torch.from_numpy(pixels).permute(2, 0, 1)
         mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -334,7 +336,7 @@ class SyntheticAuxSampler:
                     self.counts["available_sources"] += 1
                 flat_index += 1
         images, labels, source_indices = [], [], []
-        synthetic_paths, source_paths, conditions = [], [], []
+        synthetic_paths, source_paths, conditions, camera_seeds = [], [], [], []
         for place_index, candidates in groups.items():
             place = self.dataset.places[place_index]
             self.counts["main_places"] += 1
@@ -352,7 +354,16 @@ class SyntheticAuxSampler:
             if place.source_by_synthetic_path[output] != source:
                 raise ValueError("Auxiliary synthetic image has a conflicting exact source")
             condition = place.condition_by_synthetic_path.get(output, "unknown")
-            images.append(self._read_image(output))
+            if self.dataset.camera_augmentation is None:
+                images.append(self._read_image(output))
+            else:
+                from workflow.camera_augmentation import camera_seed
+                # Hash the existing private state instead of drawing another
+                # number: enabling the camera simulation cannot change source,
+                # variant, trigger or standard augmentation RNG trajectories.
+                key = camera_seed(self.dataset.seed, self.dataset.epoch, str(output), self.rng.getstate())
+                camera_seeds.append(key)
+                images.append(self._read_image(output, condition=condition, camera_seed=key))
             labels.append(place.label)
             source_indices.append(source_index)
             synthetic_paths.append(str(output))
@@ -360,13 +371,16 @@ class SyntheticAuxSampler:
             conditions.append(condition)
             self.conditions[condition] = self.conditions.get(condition, 0) + 1
             self.counts["triggered_places"] += 1
-        return {
+        result = {
             "synthetic_images": torch.stack(images) if images else torch.empty((0, 3, *self.dataset.image_size)),
             "synthetic_labels": torch.tensor(labels, dtype=torch.long),
             "source_indices": torch.tensor(source_indices, dtype=torch.long),
             "synthetic_paths": synthetic_paths, "source_paths": source_paths,
             "condition": conditions, "pair_valid": torch.ones(len(images), dtype=torch.bool),
         }
+        if self.dataset.camera_augmentation is not None:
+            result["camera_seeds"] = camera_seeds
+        return result
 
     def summary(self):
         c = self.counts
@@ -503,6 +517,7 @@ class MixedGSVCitiesDataset:
         seed: int = 42,
         return_sampling_metadata: bool = False,
         prefer_synthetic_sources: bool = False,
+        synthetic_camera_profile: Path | None = None,
     ) -> None:
         if images_per_place < 2:
             raise ValueError("images_per_place must be >= 2 to supply positive pairs")
@@ -534,6 +549,14 @@ class MixedGSVCitiesDataset:
         self.image_size = tuple(image_size)
         self.augment = augment
         self.prefer_synthetic_sources = prefer_synthetic_sources
+        self.camera_augmentation = None
+        if synthetic_camera_profile is not None:
+            if synthetic_manifest is None:
+                raise ValueError("A synthetic camera profile requires a synthetic manifest")
+            if reliability_target_cache is not None:
+                raise ValueError("Synthetic camera augmentation cannot use static reliability targets")
+            from workflow.camera_augmentation import CameraAugmentation
+            self.camera_augmentation = CameraAugmentation.from_json(synthetic_camera_profile)
         self.reliability_pairs = reliability_pairs
         self.reliability_target_cache = None
         dataframe_dir = self.real_data / "Dataframes"
@@ -613,6 +636,8 @@ class MixedGSVCitiesDataset:
         if augment:
             from workflow.augmentation import RANDAUGMENT
             self.summary["augmentation"] = {"policy": "randaugment", **RANDAUGMENT}
+        if self.camera_augmentation is not None:
+            self.summary["synthetic_camera_augmentation"] = self.camera_augmentation.provenance
         if prefer_synthetic_sources:
             self.summary.update(source_selection="synthetic_bearing_sources_first_then_coverage_v1",
                                 max_preferred_sources=images_per_place - 1)
@@ -829,6 +854,11 @@ class MixedGSVCitiesDataset:
                     image, = randaugment([image], key)
                 else:
                     image, companion = randaugment([image, companion], key)
+            if is_synthetic and self.camera_augmentation is not None:
+                from workflow.camera_augmentation import camera_seed
+                image = self.camera_augmentation.apply(image,
+                    seed=camera_seed(self.seed, epoch, place.city, place.place_id, str(path)),
+                    condition=place.condition_by_synthetic_path.get(path, "unknown"))
             tensor = normalize(image)
             tensors.append(tensor)
             kinds.append(is_synthetic)

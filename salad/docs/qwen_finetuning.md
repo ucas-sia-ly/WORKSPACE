@@ -10,7 +10,7 @@
 outputs/qwen_curriculum/
   images/train/                 生成的训练尺寸图片
   images/raw/                   原始高清图片
-  images/accepted/              当前审核通过的图片链接
+  images/accepted/<域>/         当前审核通过的图片链接，按域分开
   state/training_manifest.jsonl 当前通过审核的记录与精确源图映射
   state/finetuning/round_01/     本轮微调
     inputs/                     冻结清单、完整审核压缩档、配置、图片校验信息
@@ -19,7 +19,7 @@ outputs/qwen_curriculum/
     report.md                  实验结果汇总
 ```
 
-首次运行取活动 manifest 与 `images/accepted` 的交集，并要求审核标记合格。
+首次运行取活动 manifest 与 `images/accepted/<域>/` 的交集，并要求审核标记合格。
 没有审核记录的图片不能直接用于训练，不根据同地点或文件名补造源图。
 生成图必须实际位于 `images/train`，真实源图仍由 GSV 元数据检查地点归属。
 清单与 accepted 链接不同步的数量会记录到 `inputs/receipt.json`；如果快照过程

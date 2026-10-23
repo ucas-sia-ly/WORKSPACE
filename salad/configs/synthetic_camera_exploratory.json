@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "status": "exploratory",
+  "conditions": ["night", "rainy_night"],
+  "probability": 0.8,
+  "operations": {
+    "gain_gamma": {"probability": 1.0, "gain": [1.0, 1.4], "gamma": [0.8, 1.0]},
+    "bloom": {"probability": 0.5, "threshold": [0.8, 0.95], "strength": [0.0, 0.2], "radius": [1.0, 3.0]},
+    "motion_blur": {"probability": 0.5, "length": [1, 5], "angle": [-30.0, 30.0]},
+    "noise": {"probability": 0.8, "shot_peak": [200.0, 1000.0], "read_std": [0.0, 0.006]},
+    "jpeg": {"probability": 0.5, "quality": [75, 100]},
+    "saturation": {"probability": 1.0, "factor": [0.6, 1.0]},
+    "vignette": {"probability": 0.5, "strength": [0.0, 0.2]}
+  },
+  "provenance": {
+    "scope": "Bounded exploratory simulation; not calibrated to SVOX, RobotCar, Tokyo247 or SF-XL",
+    "limitation": "Gain/gamma cannot reconstruct detail already clipped to black. Matching global statistics does not identify a camera or guarantee real-night transfer.",
+    "augmentation_ablation": "Compare audited M with camera off/on using identical exposure and initialization. This profile does not change A."
+  }
+}

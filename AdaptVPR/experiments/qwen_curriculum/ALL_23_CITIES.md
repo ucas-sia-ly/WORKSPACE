@@ -1,6 +1,8 @@
-# 全部 23 城市：继续生成、原始 SALAD 微调与 SVOX 测试
+# 旧 23 城市计划：原始 SALAD 微调与 SVOX 测试
 
-当前任务使用 `outputs/qwen_curriculum/images/` 和 `outputs/qwen_curriculum/state/` 两个顶层目录。图片统一存放在 `images/train/`、`images/raw/`，通过审核的图片入口为 `images/accepted/`；当前计划、账本、进度及日志位于 `state/`，后续训练输出为 `state/training/`。
+本文保留旧 79426 张计划的配置和训练说明。新一轮 place 覆盖与 night 优先计划已独立移到 `outputs/weather_v3/`，当前操作见 [WEATHER_V3.md](WEATHER_V3.md) 和 [RESUME.md](RESUME.md)；后台 `resume` 绑定新计划。
+
+旧计划使用 `outputs/qwen_curriculum/images/` 和 `outputs/qwen_curriculum/state/`。旧图统一存放在 `images/train/`、`images/raw/`，通过审核的图片入口为 `images/accepted/<域>/`，例如 `images/accepted/night/`、`images/accepted/rain/`；旧计划、账本、进度及日志位于 `state/`，训练输出为 `state/training/`。分域目录只整理入口，图片内容与原审核记录保持不变。
 
 整理快照：已保存 21010 张、已审核 21009 张、通过 13710 张，另有 1 张已保存图片待审核；还需新生成 58416 张，总计划保持 79426 张。实时进度以 `state/summary.json` 为准。
 
@@ -16,25 +18,9 @@
 
 当前审核 v2 要求最少 16 个匹配点、内点率至少 0.78、512 尺度的 homography 网格中位位移最多 16 像素，不设空间覆盖率门限。天气审核要求目标天气相对晴天的对比为正，且生成图的该对比高于源图。规则为实验验收标准。
 
-## 继续、暂停与查看进度
+## 旧计划的日志和完整性检查
 
-```bash
-cd /home/admin123/github/WORKSPACE
-conda activate AdaptVPR
-
-python AdaptVPR/experiments/qwen_curriculum/resume_control.py resume
-python AdaptVPR/experiments/qwen_curriculum/resume_control.py status
-```
-
-后台服务绑定 `campaign.py run --output-dir outputs/qwen_curriculum/state`，关闭终端后继续运行。需要使用电脑时执行：
-
-```bash
-python AdaptVPR/experiments/qwen_curriculum/resume_control.py pause
-```
-
-该命令同时停止协调器及独立 Qwen 服务，退出常驻模型，释放生成占用的显存和内存。稍后或重启后使用同一 `resume` 命令。已完成的图不重复生成，保存完整但未审核的图先补审核，没有完整输出的中断任务使用原参数在独立账本中重试；每次显式恢复同一任务至多新增一次尝试。
-
-查看日志及暂停后的完整性预检：
+旧计划保持暂停，不与本轮 v3 同时生成。可单独查看旧日志、检查旧计划完整性：
 
 ```bash
 tail -f outputs/qwen_curriculum/state/generation.log
@@ -42,18 +28,7 @@ tail -f outputs/qwen_curriculum/state/generation.log
 python AdaptVPR/experiments/qwen_curriculum/campaign.py check
 ```
 
-启动及错误日志为 `state/coordinator.log`。预检不启动模型、不新增生成调用。空间不足时任务在生成前停止，`state/summary.json` 提供剩余图片所需空间估算；当前仍保留原始 PNG 与训练 PNG。
-
-服务停止后也可前台运行同一入口，与后台服务二选一：
-
-```bash
-OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 HF_HUB_OFFLINE=1 \
-ADAPTVPR_CLIP_LOCAL_FILES_ONLY=1 \
-python -u AdaptVPR/experiments/qwen_curriculum/campaign.py run \
-  --output-dir outputs/qwen_curriculum/state
-```
-
-完整恢复说明见 [RESUME.md](RESUME.md)。
+预检不启动模型、不新增生成调用。旧计划仍保留原始 PNG 与训练 PNG。当前后台的暂停、恢复与日志路径见 [RESUME.md](RESUME.md)。
 
 ## 原始 SALAD 微调与 SVOX 测试
 

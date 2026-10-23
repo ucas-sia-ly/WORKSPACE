@@ -52,7 +52,9 @@ class ImageStoreTests(unittest.TestCase):
     def test_static_layout_does_not_create_any_directory(self):
         self.assertFalse(self.root.exists())
         layout = image_store.layout_definition(self.root)
+        self.assertEqual(layout["schema_version"], 2)
         self.assertEqual(layout["directories"]["train"], str(self.root / "train"))
+        self.assertEqual(layout["accepted_name"], "condition / sample_id + .png")
         self.assertFalse(self.root.exists())
 
     def test_scoped_sync_collects_bytes_and_old_paths_atomically_become_links(self):
@@ -73,10 +75,11 @@ class ImageStoreTests(unittest.TestCase):
             self.assertEqual(canonical.read_bytes(), originals[field])
         self.assertEqual((self.root / "metadata/one.json").read_bytes(), metadata)
         self.assertTrue(sidecar.is_symlink())
-        accepted = self.root / "accepted/one.png"
+        accepted = self.root / "accepted/night/one.png"
         self.assertTrue(accepted.is_symlink())
-        self.assertEqual(os.readlink(accepted), "../train/one.png")
+        self.assertEqual(os.readlink(accepted), "../../train/one.png")
         index = common.read_jsonl(self.root / "metadata.jsonl")[0]
+        self.assertEqual(index["accepted_path"], str(accepted))
         self.assertEqual(index["original_result_sha256"], self.accepted["result_sha256"])
         self.assertEqual(index["original_output_path"], self.row["output_path"])
 
@@ -139,12 +142,130 @@ class ImageStoreTests(unittest.TestCase):
     def test_quality_change_only_updates_accepted_view_and_keeps_rejected_images(self):
         self.store.sync([self.row], [self.accepted])
         report = self.store.sync([self.row], [self.rejected])
-        self.assertFalse((self.root / "accepted/one.png").exists())
+        self.assertFalse((self.root / "accepted/night/one.png").exists())
         self.assertTrue((self.root / "train/one.png").exists())
         self.assertTrue((self.root / "raw/one.png").exists())
         self.assertEqual(report["accepted_links_removed"], 1)
         self.assertEqual(report["rejected_images"], 1)
         self.assertEqual(common.read_jsonl(self.root / "metadata.jsonl")[0]["status"], "rejected")
+
+    def legacy_flat_store(self):
+        """Build an authenticated pre-domain store, without a legacy runtime."""
+        self.store.sync([self.row], [self.accepted])
+        grouped = self.root / "accepted/night/one.png"
+        grouped.unlink()
+        flat = self.root / "accepted/one.png"
+        flat.symlink_to("../train/one.png")
+        rows = common.read_jsonl(self.root / "metadata.jsonl")
+        rows[0]["accepted_path"] = str(flat)
+        common.write_jsonl(self.root / "metadata.jsonl", rows)
+        summary = json.loads((self.root / "summary.json").read_text())
+        summary["metadata_sha256"] = common.file_sha256(self.root / "metadata.jsonl")
+        common.write_json(self.root / "summary.json", summary)
+        return flat
+
+    def test_legacy_flat_accepted_migrates_to_domain_and_updates_index_idempotently(self):
+        flat = self.legacy_flat_store()
+        report = self.store.sync([self.row], [self.accepted])
+        grouped = self.root / "accepted/night/one.png"
+        self.assertFalse(flat.is_symlink())
+        self.assertEqual(os.readlink(grouped), "../../train/one.png")
+        self.assertEqual(grouped.resolve(), self.root / "train/one.png")
+        self.assertEqual((report["accepted_links_created"], report["accepted_links_removed"]), (1, 1))
+        self.assertEqual(common.read_jsonl(self.root / "metadata.jsonl")[0]["accepted_path"], str(grouped))
+        restarted = image_store.ImageStore(self.root, self.scope)
+        report = restarted.sync([self.row], [self.accepted])
+        self.assertEqual((report["accepted_links_created"], report["accepted_links_removed"]), (0, 0))
+
+    def test_legacy_migration_preserves_unknown_flat_files_links_and_directories(self):
+        self.legacy_flat_store()
+        folder = self.root / "accepted"
+        regular = folder / "user.png"
+        regular.write_bytes(b"user bytes")
+        directory = folder / "other.png"
+        directory.mkdir()
+        (directory / "notes.txt").write_text("keep")
+        alien = folder / "alien.png"
+        alien.symlink_to("../train/alien.png")
+        foreign = folder / "foreign.png"
+        foreign.symlink_to("/unknown/user/path")
+        # Even a matching sid/target is unknown without an authenticated index.
+        extra = self.make_row("new", "not-yet-indexed", 55)
+        not_indexed = folder / "new.png"
+        not_indexed.symlink_to("../train/new.png")
+        self.store.sync([self.row, extra], [self.accepted])
+        self.assertEqual(regular.read_bytes(), b"user bytes")
+        self.assertEqual((directory / "notes.txt").read_text(), "keep")
+        self.assertEqual(os.readlink(alien), "../train/alien.png")
+        self.assertEqual(os.readlink(foreign), "/unknown/user/path")
+        self.assertEqual(os.readlink(not_indexed), "../train/new.png")
+        restarted = image_store.ImageStore(self.root, self.scope)
+        restarted.sync([self.row, extra], [self.accepted])
+        self.assertEqual(os.readlink(not_indexed), "../train/new.png")
+
+    def test_legacy_known_flat_link_to_different_target_is_preserved(self):
+        flat = self.legacy_flat_store()
+        flat.unlink()
+        flat.symlink_to("../train/foreign.png")
+        report = self.store.sync([self.row], [self.accepted])
+        self.assertEqual(os.readlink(flat), "../train/foreign.png")
+        self.assertTrue((self.root / "accepted/night/one.png").is_file())
+        self.assertEqual(report["accepted_links_removed"], 0)
+
+    def test_interruption_between_new_domain_link_and_flat_removal_resumes(self):
+        flat = self.legacy_flat_store()
+        before = (self.root / "metadata.jsonl").read_bytes()
+        original_unlink = Path.unlink
+        def interrupted(path, *args, **kwargs):
+            if path == flat:
+                raise OSError("legacy alias unlink interrupted")
+            return original_unlink(path, *args, **kwargs)
+        with patch.object(Path, "unlink", interrupted):
+            with self.assertRaisesRegex(OSError, "unlink interrupted"):
+                self.store.sync([self.row], [self.accepted])
+        self.assertTrue(flat.is_symlink())
+        self.assertTrue((self.root / "accepted/night/one.png").is_file())
+        self.assertEqual((self.root / "metadata.jsonl").read_bytes(), before)
+        restarted = image_store.ImageStore(self.root, self.scope)
+        restarted.sync([self.row], [self.accepted])
+        self.assertFalse(flat.is_symlink())
+        self.assertEqual(common.read_jsonl(self.root / "metadata.jsonl")[0]["accepted_path"],
+                         str(self.root / "accepted/night/one.png"))
+
+    def test_rejected_legacy_flat_link_removed_without_deleting_image(self):
+        flat = self.legacy_flat_store()
+        report = self.store.sync([self.row], [self.rejected])
+        self.assertFalse(flat.is_symlink())
+        self.assertEqual(report["accepted_links_removed"], 1)
+        self.assertEqual(report["accepted_images"], 0)
+        self.assertEqual(common.file_sha256(self.root / "train/one.png"), self.row["output_sha256"])
+
+    def test_changed_condition_moves_only_owned_accepted_alias(self):
+        self.store.sync([self.row], [self.accepted])
+        rain = sealed({**self.row, "condition": "rain"})
+        accepted = sealed({**rain, "status": "passed", "passed": True, "eligible_for_training": True})
+        self.store.sync([rain], [accepted])
+        self.assertFalse((self.root / "accepted/night/one.png").is_symlink())
+        self.assertEqual(os.readlink(self.root / "accepted/rain/one.png"), "../../train/one.png")
+        self.assertEqual(common.read_jsonl(self.root / "metadata.jsonl")[0]["accepted_path"],
+                         str(self.root / "accepted/rain/one.png"))
+
+    def test_accepted_domain_directory_cannot_escape_through_symlink(self):
+        self.root.mkdir()
+        (self.root / "accepted").mkdir()
+        outside = self.base / "outside-accepted"
+        outside.mkdir()
+        (self.root / "accepted/night").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "Accepted image directory"):
+            self.store.sync([self.row], [self.accepted])
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_unsafe_domain_cannot_create_accepted_path_outside_store(self):
+        row = sealed({**self.row, "condition": "../../outside"})
+        accepted = sealed({**row, "status": "passed", "passed": True, "eligible_for_training": True})
+        with self.assertRaisesRegex(ValueError, "Unsafe image-store condition"):
+            self.store.sync([row], [accepted])
+        self.assertFalse((self.base / "outside").exists())
 
     def test_scope_outside_and_import_only_never_replace_source_files(self):
         outside = self.make_row("outside", "outside", 60, scope=self.base / "external")
@@ -237,7 +358,7 @@ class ImageStoreTests(unittest.TestCase):
             self.assertEqual(common.file_sha256(Path(self.row[field])), self.row[hash_field])
         report = self.store.sync([self.row], [self.rejected])
         self.assertEqual(report["accepted_images"], 0)
-        self.assertFalse((self.root / "accepted/one.png").exists())
+        self.assertFalse((self.root / "accepted/night/one.png").exists())
 
     def test_new_process_can_resume_from_aliases_and_existing_canonical_bytes(self):
         self.store.sync([self.row], [self.accepted])

@@ -35,6 +35,7 @@ class LocalDistillationSupervisor:
         self.reliability_weight = args.reliability_generated_weight
         self.occlusion_weight = args.reliability_generated_occlusion_weight
         self.seed = args.seed
+        self.camera_augmentation = getattr(dataset, "camera_augmentation", None)
         self.device = next(teacher.parameters()).device
         path = args.pair_calibration.expanduser().resolve()
         calibration_bytes = path.read_bytes()
@@ -106,6 +107,9 @@ class LocalDistillationSupervisor:
             feature_weight=args.feature_distill_weight, score_weight=args.score_distill_weight,
             ot_weight=args.ot_distill_weight)
         if self.student_eval: self.provenance['student_local_mode']='eval_with_grad'
+        if self.camera_augmentation is not None:
+            self.provenance['student_camera_augmentation'] = self.camera_augmentation.provenance
+            self.provenance['camera_correspondence_policy'] = 'clean_teacher_and_support_corrupted_student_only'
 
     @staticmethod
     def _geometry_key(identity):
@@ -193,7 +197,16 @@ class LocalDistillationSupervisor:
             stats["excluded_b_patches"] += d["positive_b_count"]
             stats["patches"] += confidence.numel()
             stats["pairs"] += 1
-            prepared.append(dict(image=inputs[1:2], teacher={k: source_aux[k] for k in
+            student_image = inputs[1:2]
+            if self.camera_augmentation is not None:
+                seeds = auxiliary_batch.get("camera_seeds")
+                if seeds is None or len(seeds) != len(auxiliary_batch["synthetic_paths"]):
+                    raise ValueError("Camera-augmented local training requires auxiliary replay seeds")
+                resized = generated.resize((self.size[1], self.size[0]), Image.Resampling.BILINEAR)
+                altered = self.camera_augmentation.apply(resized, seed=seeds[i],
+                    condition=auxiliary_batch["condition"][i])
+                student_image = preprocess_teacher_image(altered, self.size).unsqueeze(0)
+            prepared.append(dict(image=student_image, teacher={k: source_aux[k] for k in
                 ("backbone_local_features", "score_logits", "log_assignment")}, index=index, q=confidence,
                 masses={k: float(v.sum()) for k, v in weights.items()}, positive=positive, negative=negative))
         if self.device.type == "cuda":
