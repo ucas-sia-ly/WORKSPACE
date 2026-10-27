@@ -1,0 +1,43 @@
+{
+  "version": "night_mechanisms_1",
+  "purpose": "Coverage categories and scene requirements, not complete editing prompt templates. All outputs remain condition=night.",
+  "references": {
+    "lamps": "https://edisontechcenter.org/sodium-lamps/",
+    "mercury": "https://edisontechcenter.org/mercury-vapor-lamps/",
+    "street": "https://jamesmaherphotography.com/night-city-street-photography/",
+    "reflections": "https://joeredski.com/blog/2021/6/8/5-cool-night-street-photography-tips",
+    "moon": "https://unsplash.com/photos/full-moon-illuminates-a-city-street-at-night-Lsyw49spJY8"
+  },
+  "styles": [
+    {"id":"sodium_lamps","name":"暖橙高压钠灯","requires":[["drivable_road","visible_lamps","walkable_ground"]],"mechanism":"Localized amber pools with dark intervals; retain variation in material colours, not an orange filter.","references":["lamps"]},
+    {"id":"low_pressure_sodium","name":"窄谱黄色钠灯","requires":[["drivable_road","visible_lamps"]],"mechanism":"Yellow-dominant illumination and reduced colour separation around existing or off-frame light sources.","references":["lamps"]},
+    {"id":"led_lamps","name":"冷白LED","requires":[["drivable_road","visible_lamps","walkable_ground"]],"mechanism":"Cool-white local illumination, darker gaps and limited highlight bloom.","references":["street"]},
+    {"id":"warm_led","name":"暖白LED","requires":[["drivable_road","visible_lamps","walkable_ground"]],"mechanism":"Warm-white pools with natural material colours and a dark nocturnal ambient field.","references":["street"]},
+    {"id":"neutral_led","name":"中性白LED","requires":[["drivable_road","visible_lamps","walkable_ground"]],"mechanism":"Neutral-white illumination with directional falloff; separate lit surfaces from dark surroundings.","references":["street"]},
+    {"id":"mercury_vapor","name":"旧式汞灯青绿光","requires":[["drivable_road","visible_lamps"]],"mechanism":"Pale greenish-white discharge-light pools; do not colour every pixel green.","references":["mercury"]},
+    {"id":"metal_halide","name":"金卤灯白光","requires":[["drivable_road","industrial_site","visible_lamps"]],"mechanism":"Bright white local illumination with restrained cool shadow cast, avoiding uniformly daytime exposure.","references":["street"]},
+    {"id":"mixed_sodium_led","name":"钠灯与LED混合","requires":[["drivable_road","visible_lamps"]],"mechanism":"Spatially distinct amber and cool-white illumination zones, not a global cinematic colour grade.","references":["lamps","street"]},
+    {"id":"mixed_window_street","name":"暖窗光与冷路灯","requires":[["windows"],["drivable_road","visible_lamps","walkable_ground"]],"mechanism":"Warm light through some existing windows contrasts with cool local exterior illumination.","references":["street"]},
+    {"id":"shopfronts","name":"已有店铺橱窗主照明","requires":[["shopfronts"]],"mechanism":"Light from actual visible shop windows spills onto nearby ground; do not create a store or new sign.","references":["street"]},
+    {"id":"existing_sign_glow","name":"已有标识局部发光","requires":[["signs"]],"mechanism":"Illuminate only an existing sign face; keep its lettering, outline and supporting structure unchanged.","references":["street"]},
+    {"id":"residential_windows","name":"稀疏住宅窗光","requires":[["windows"]],"mechanism":"A subset of existing windows glows softly while upper facades remain nocturnal and recognizable.","references":["street"]},
+    {"id":"porch_entrance","name":"入口门廊暖光","requires":[["entrances"]],"mechanism":"Light falls locally from an existing entrance or porch area without adding a doorway or fixture.","references":["street"]},
+    {"id":"covered_fluorescent","name":"有顶通道荧光照明","requires":[["covered_passage"]],"mechanism":"Cool fluorescent-like light within an actual covered passage contrasts with the dark exterior.","references":["street"]},
+    {"id":"industrial_security","name":"工业区域安保照明","requires":[["industrial_site"]],"mechanism":"Sparse directional security illumination across existing industrial surfaces; preserve all equipment and layout.","references":["street"]},
+    {"id":"sparse_lamps","name":"稀疏路灯深夜","requires":[["drivable_road","visible_lamps","walkable_ground"]],"mechanism":"Widely separated local pools of illumination with useful faint structure between them.","references":["street"]},
+    {"id":"dimmed_late_night","name":"深夜低照度照明","requires":[["drivable_road","visible_lamps","windows"]],"mechanism":"Reduced local lighting and fewer illuminated windows; retain enough place evidence without crushing all shadows.","references":["street"]},
+    {"id":"headlights","name":"已有车流前灯","requires":[["visible_traffic"],["drivable_road"]],"mechanism":"Light beams and restrained glare belong to visible vehicles; do not conjure headlights without a vehicle.","references":["street"]},
+    {"id":"tail_lights","name":"已有车流尾灯","requires":[["visible_traffic"],["drivable_road"]],"mechanism":"Red tail/brake lights and localized spill associated with appropriate vehicle orientation.","references":["street"]},
+    {"id":"passing_vehicle_lights","name":"可行新车流照明","requires":[["drivable_road"],["safe_vehicle_space"]],"mechanism":"A plausible passing vehicle may be added in visible free road space, with attached lights and natural perspective.","references":["street"]},
+    {"id":"short_light_trails","name":"短车灯拖影","requires":[["visible_traffic"],["drivable_road"]],"mechanism":"Restrained motion streaks confined to moving vehicle lights; buildings and road geometry stay stable.","references":["street"]},
+    {"id":"wet_reflections","name":"雨后湿路夜景","requires":[["paved_ground"]],"mechanism":"Wet existing pavement reflects scene-grounded night light; no rain or puddle is mandatory and no new geometry.","references":["reflections"]},
+    {"id":"damp_matte","name":"潮湿低反光夜景","requires":[["paved_ground"]],"mechanism":"Damp darker pavement with broken, subdued reflections rather than a perfect mirror across the whole road.","references":["reflections"]},
+    {"id":"light_haze","name":"轻薄夜雾散射","requires":[["drivable_road","visible_lamps","windows"]],"mechanism":"Thin nocturnal atmospheric scattering around plausible lights; nearby structural landmarks remain readable.","references":["street"]},
+    {"id":"moonlit_ambient","name":"月光与弱环境光","requires":[],"mechanism":"Weak cool natural ambient illumination with source-specific dark surfaces; a visible moon need not be inserted.","references":["moon"]},
+    {"id":"overcast_skyglow","name":"阴天城市夜间天光","requires":[],"mechanism":"Diffuse low nocturnal sky glow without daytime sun or daytime facade illumination; no visible sky is required.","references":["street"]},
+    {"id":"blue_hour","name":"蓝调末段入夜","requires":[],"mechanism":"Deep-blue late transition into night with clearly nocturnal ground illumination; reject a daylight-looking result.","references":["street"]},
+    {"id":"highlight_exposed","name":"保高光夜间曝光","requires":[["visible_lamps","windows","signs","visible_traffic"]],"mechanism":"Exposure protects bright local lights while leaving varied, readable dark structure elsewhere.","references":["street"]},
+    {"id":"shadow_lifted","name":"自动曝光提亮暗部","requires":[],"mechanism":"Moderately lifted shadow detail while keeping a coherent nighttime illumination field; avoid clean daylight relighting.","references":["street"]},
+    {"id":"high_iso_documentary","name":"高ISO纪实夜景","requires":[],"mechanism":"Natural high-ISO night rendering with modest grain and localized highlight bloom, without hiding place structure.","references":["street"]}
+  ]
+}

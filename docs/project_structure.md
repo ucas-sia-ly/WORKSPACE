@@ -50,6 +50,7 @@
 - [固定地点排除与全量真实 A 基线](../salad/docs/real_baseline.md)
 - [A/M 多种子公平对照与真实 val 统计](../salad/docs/am_multiseed.md)
 - [阶段五：天气验证、分层采样与 v3 生成图](../salad/docs/weather_round.md)
+- [三组夜景生成数据比较](night_dataset_comparison.md)：旧 accepted、weather_v3 与 weather_v5_pilot 的样图、审核、训练价值与使用建议。
 - [B0 归因及 Feature/OT/q 局部消融](../salad/docs/ccr_stage4.md)
 
 在工作区根目录、AdaptVPR 环境中运行当前流程测试：
