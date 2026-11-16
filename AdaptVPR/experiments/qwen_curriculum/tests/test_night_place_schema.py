@@ -2,7 +2,7 @@ import copy
 import unittest
 from unittest.mock import patch
 
-from experiments.qwen_curriculum import night_place_cohort_v2 as cohort
+from experiments.qwen_curriculum import night_place_cohort_v4 as cohort
 
 
 class SourceSchemaTests(unittest.TestCase):
@@ -12,30 +12,15 @@ class SourceSchemaTests(unittest.TestCase):
             features={key:dict(status='present', evidence='Visible source evidence')
                       for key in cohort.engine.policy.FEATURES})
 
-    def test_box_aliases_preserve_actual_coordinates(self):
-        for key in ('box','bbox','bounding_box','region'):
-            value=self.evidence()
-            value['protected_regions'][0][key]=value['protected_regions'][0].pop('box')
-            before=copy.deepcopy(value)
-            out=cohort.canonical_evidence(value)
-            self.assertEqual(out['protected_regions'][0]['box'],[0,0,900,900])
-            self.assertEqual(value,before)
-
-    def test_conflicting_or_absent_evidence_is_not_fabricated(self):
-        value=self.evidence()
-        value['protected_regions'][0]['bbox']=[10,10,200,200]
-        with self.assertRaisesRegex(ValueError,'Conflicting'): cohort.canonical_evidence(value)
-        value=self.evidence();value['protected_regions']=[]
-        with self.assertRaises(ValueError): cohort.canonical_evidence(value)
-        value=self.evidence();value['protected_regions'][0]['box']=[-1,0,900,900]
-        with self.assertRaises(ValueError): cohort.canonical_evidence(value)
-
-    def test_request_uses_explicit_schema(self):
-        self.assertIn('"box":[0,0,1000,1000]',cohort.analysis_request())
-        self.assertIn('not a proposed edit',cohort.analysis_request())
+    def test_source_evidence_does_not_mutate_inputs_or_require_predicted_boxes(self):
+        value=self.evidence();value.pop('protected_regions')
+        before=copy.deepcopy(value)
+        cohort.source_evidence(value)
+        self.assertEqual(value,before)
+        self.assertIn('Do not return bounding boxes',cohort.analysis_request())
 
     def test_bounded_analysis_repair_keeps_source_correspondence(self):
-        from experiments.qwen_curriculum import night_place_cohort_v3 as full
+        full=cohort
         import json
         good=json.dumps(self.evidence());calls=[]
         def ask(_self,directory,sources,requests,phase,attempt,cfg):
@@ -48,7 +33,7 @@ class SourceSchemaTests(unittest.TestCase):
         self.assertEqual(replies,[good]*4)
 
     def test_failed_repair_is_explicit_and_not_looped(self):
-        from experiments.qwen_curriculum import night_place_cohort_v3 as full
+        full=cohort
         planner=object.__new__(full.Planner)
         with patch.object(full._planner,'ask',return_value=['{}']) as ask:
             self.assertEqual(planner.ask(None,['a'],['x'],'analysis',0,{}),['{}'])

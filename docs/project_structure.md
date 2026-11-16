@@ -1,67 +1,39 @@
 # 项目结构
 
-当前主流程是全部 23 城市的 Qwen 天气生成、审核、原始 SALAD 微调与六域 SVOX 测试。源图筛选已经完成，生成继续使用现有计划。
+## 当前数据入口
 
-## 当前代码
+`outputs/night_dataset_v1/` 是 61,984 对真实/夜间生成图的统一入口。
 
-`AdaptVPR/experiments/qwen_curriculum/` 保留 14 个功能模块及包入口：
-
-| 模块 | 职责 |
-|---|---|
-| `campaign.py` | 计划校验、任务调度、恢复与完整性检查 |
-| `resume_control.py` | 后台暂停、继续与状态 |
-| `run.py` | 生成请求、调用账本及审核 |
-| `resume_recovery.py` | 中断输出恢复 |
-| `prompt_bank.py`、`quality_v3.py`、`weather_v3.py` | v3 多变体提示词、放宽几何门槛的审核、独立生成与旧图重新验收 |
-| `image_store.py` | 图片归集、索引及审核通过入口 |
-| `quality.py`、`weather_signal.py` | 几何和天气审核 |
-| `common.py` | 路径、原子写入及内容校验 |
-| `finetune_all_cities.py`、`finetune_pretrained.py` | 原始 SALAD 微调及训练恢复 |
-| `evaluate_pretrained_finetune.py` | 原模型与微调模型的六域 SVOX 评估 |
-
-旧批次协调器、一次性迁移和清理脚本、挖掘器、比例与可靠性对照实验已经移除。当前模块直接读取完整的 23 城市状态，不再串联旧实验入口。
-
-`salad/models/` 保存模型，`salad/workflow/` 保存训练、采样、checkpoint 和评估实现。当前质量审核还使用 `AdaptVPR/experiments/generation_diagnosis/verifier_controls.py` 的匹配统计，以及 `AdaptVPR/verification/` 的特征实现。LightX2V 和 VisMatch 分别提供 Qwen 推理与几何匹配。
-
-## 数据与输出
-
-| 路径 | 内容 |
-|---|---|
-| `dataset/gsv-cities/` | 全部 23 城市真实训练数据 |
-| `dataset/svox/` | SVOX 测试集 |
-| `salad/checkpoint/dino_salad.ckpt` | 原始 SALAD 预训练权重 |
-| `outputs/qwen_curriculum/images/` | 训练 PNG、高清原图、元数据和通过审核的图片入口 |
-| `outputs/qwen_curriculum/state/` | 当前计划、账本、审核结果、进度和日志 |
-| `outputs/qwen_curriculum/state/training/` | 微调 checkpoint 与六域评估结果 |
-| `outputs/qwen_curriculum/state/finetuning/` | CCR A/M 等独立实验；每轮冻结当时的审核通过图片，保留后续增量入口 |
-| `outputs/qwen_curriculum/state/weather_validation/` | 由 SVOX train 天气 query 构建、距 test/val 至少 50 m 的自然天气 val |
-| `outputs/qwen_curriculum/state/external_validation/` | Nordland 探针与缩减图库 Tokyo247/SF-XL 清单 |
-| `outputs/qwen_curriculum/weather_v3*/` | v3 提示词库生成的图片、审核结果与训练清单（独立于 23 城市计划） |
-
-生成与训练分阶段执行。生成服务的临时输出可能包含中断请求的完整图片，由恢复流程核验后收集。
-
-## 操作与验证
-
-- [Qwen 工作流](../AdaptVPR/experiments/qwen_curriculum/README.md)
-- [暂停和继续](../AdaptVPR/experiments/qwen_curriculum/RESUME.md)
-- [23 城市生成与训练命令](../AdaptVPR/experiments/qwen_curriculum/ALL_23_CITIES.md)
-- [SALAD 训练与评估](../salad/docs/workflow.md)
-- [Qwen 持续增加图片时的 CCR 微调](../salad/docs/qwen_finetuning.md)
-- [固定地点排除与全量真实 A 基线](../salad/docs/real_baseline.md)
-- [A/M 多种子公平对照与真实 val 统计](../salad/docs/am_multiseed.md)
-- [阶段五：天气验证、分层采样与 v3 生成图](../salad/docs/weather_round.md)
-- [三组夜景生成数据比较](night_dataset_comparison.md)：旧 accepted、weather_v3 与 weather_v5_pilot 的样图、审核、训练价值与使用建议。
-- [B0 归因及 Feature/OT/q 局部消融](../salad/docs/ccr_stage4.md)
-
-在工作区根目录、AdaptVPR 环境中运行当前流程测试：
-
-```bash
-CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 \
-python -m unittest discover -s AdaptVPR/experiments/qwen_curriculum/tests
+```text
+outputs/night_dataset_v1/
+  pairs/<city>/<place_id>/
+    source.jpg       # 精确真实源图链接
+    night.png        # 训练尺寸生成图硬链接
+    night_full.png   # 高清生成图硬链接
+    generation.json # 原始生成 sidecar
+  manifest.jsonl     # Prompt、源图、生成图、哈希、来源记录
+  pairs.tsv          # 可直接查看的一一对应表
+  index.sqlite       # 按城市/地点或图片 ID 查询
+  complete.json      # 数量、城市/风格统计、索引哈希
 ```
 
-暂停后核验现有计划、账本和图片，不启动生成模型：
+[完整说明](../salad/docs/night_dataset.md)。链接不改变图片像素，也不额外复制整批图。真实数据保存在 `dataset/`，链接依赖该路径。
 
-```bash
-python AdaptVPR/experiments/qwen_curriculum/campaign.py check
-```
+## 代码
+
+- `ccr-night`：已完成数据集状态、查询和完整性核验。
+- `AdaptVPR/experiments/qwen_curriculum/night_dataset.py`：CPU 汇总与精确配对。
+- `night_cleanup.py`：明确清理清单及审计。
+- `night_*` 当前双机与 Prompt 模块：本批的冻结策略、恢复与运行来源。
+- `AdaptVPR/generation/`、`LightX2V/`：Qwen 推理实现。
+- `salad/models/`、`salad/workflow/`、`salad/train_salad.py`、`salad/evaluate_salad.py`：模型、采样、训练、评估。
+
+## 保留的输出
+
+本批 `night_place_*`、`night_cluster_v1`、`night_original_no_mercury_v1`、`night_mercury_replacement_v1` 仍保存冻结记录与历史路径下的图片硬链接。不能把这些目录的 `du` 数字简单相加当作独立图片副本。
+
+`outputs/qwen_curriculum/state/finetuning` 和 `salad/outputs` 保留正式训练报告、最终 checkpoint、数据划分；重复的中间快照、旧图库和临时缓存已清理。旧实验记录中指向已删除旧图库或中间快照的路径属于历史记录，不应直接用于恢复旧实验。
+
+`outputs/coverage_run/checkpoint_epoch_050.pt` 是仍被训练配置引用的初始 checkpoint。Reliability V2 实验继续按先前要求保留。
+
+清理计划、删除清单和实际释放空间记录在 `outputs/maintenance/night_cleanup_20261113/`。见[清理报告](cleanup_20261113.md)。

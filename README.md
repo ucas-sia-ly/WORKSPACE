@@ -1,36 +1,29 @@
-# Qwen 天气增广与 SALAD 训练
+# Qwen 夜间增广与 SALAD 训练
 
-项目从 GSV-Cities 真实训练图中挖掘困难源图，用 Qwen 生成 night、snow、fog、rain
-变体，经结构与天气审核后参与 SALAD 训练。Reliability OT 是默认关闭的可选分支。
-当前操作入口是全部 23 城市流程，具体命令见
-[23 城市生成与微调](AdaptVPR/experiments/qwen_curriculum/ALL_23_CITIES.md)。
+当前夜间生成已完成：23 个城市、61,984 个地点，每地点一张精确源图和一张 night 生成图。保留原版 29 类风格，排除汞灯。图片已全部回传第一台，并统一整理到 `outputs/night_dataset_v1/`。
 
-## 从哪里开始
+## 查看数据
 
-| 工作 | 入口 |
+```bash
+./ccr-night status
+./ccr-night pair --city Chicago --place-id 5496
+./ccr-night manifest
+# CPU 文件完整性复核，不启动 GPU
+./ccr-night verify
+```
+
+[统一数据集说明](salad/docs/night_dataset.md)介绍逐地点目录、原图映射、清单及校验。`pairs.tsv` 可直接查看全部对应关系；`manifest.jsonl` 包含 Prompt、精确源图、生成记录和 SHA256。
+
+## 常用入口
+
+| 工作 | 说明 |
 |---|---|
-| 23 城市天气生成、审核和恢复 | [Qwen 流程](AdaptVPR/experiments/qwen_curriculum/README.md) |
-| SALAD 训练、checkpoint 恢复和评估 | [训练与评估](salad/docs/workflow.md) |
-| patch 可靠性与 dustbin | [Reliability OT](salad/docs/reliability_ot.md)、[v2](salad/docs/reliability_v2.md) |
-| Qwen 服务、显存配置和依赖安装 | [外部组件](AdaptVPR/docs/EXTERNAL_COMPONENTS.md)、[服务配置](AdaptVPR/configs/systemd/README.md) |
+| 当前生成数据 | [数据集与清理说明](salad/docs/night_dataset.md) |
+| 生成代码与依赖 | [Qwen 工作流](AdaptVPR/experiments/qwen_curriculum/README.md) |
+| SALAD 训练与评估 | [训练与评估](salad/docs/workflow.md)、[文档索引](salad/docs/README.md) |
+| 项目目录与清理记录 | [项目结构](docs/project_structure.md)、[清理记录](docs/cleanup_20261113.md) |
+| 服务与依赖 | [外部组件](AdaptVPR/docs/EXTERNAL_COMPONENTS.md)、[服务配置](AdaptVPR/configs/systemd/README.md) |
 
-## 目录职责
+`dataset/` 是真实数据；`models/`、`salad/checkpoint/` 是本地模型；`LightX2V/`、`vismatch/` 是推理与几何匹配依赖。
 
-| 目录 | 用途 |
-|---|---|
-| `AdaptVPR/` | Qwen 生成服务、审核、恢复和任务协调器 |
-| `salad/` | DINOv2 + SALAD、可靠性分支、训练、评估与单元测试 |
-| `LightX2V/` | 带本机兼容补丁的 Qwen 推理依赖 |
-| `vismatch/` | SuperPoint + LightGlue 几何验收依赖 |
-| `services/` | 可选 Qwen3-VL 规划服务；固定天气流程无需此服务 |
-| `dataset/` | 本地真实训练与评估数据，Git 忽略 |
-| `models/` | 本地模型权重，Git 忽略 |
-| `outputs/` | 生成图、清单、缓存、训练结果和评估报告，Git 忽略 |
-| `IC-Light/` | 历史上游许可证与来源说明 |
-| `docs/` | 当前项目结构说明 |
-
-生成与训练分阶段执行，适配单张 48GB 显卡和 32GB 主存。启动器只启动 Qwen。
-当前 Qwen 工作流只保留生成、恢复、图片管理、原始 SALAD 微调及 SVOX 测试所需模块。
-
-[项目结构说明](docs/project_structure.md) 列出当前入口和数据路径。
-第三方组件分别保留各自许可证，版本以本工作区 Git 提交及 LightX2V 的来源标记为准。
+旧生成目录中仍有本批数据的硬链接和冻结运行记录，用于追溯；它们不占第二份图片空间。旧天气图库、失败试验和回传缓存已清理。最终训练 checkpoint、报告和数据划分保留。生成图仍为待质量审核状态，文件完整不代表已获准训练。没有启动训练或重新生图。

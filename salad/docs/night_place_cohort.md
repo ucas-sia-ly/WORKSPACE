@@ -1,10 +1,12 @@
 # 全量地点：先确定全部night Prompt，再单独生图
 
+2026-10-31 已接入[两台电脑协同生成](night_cluster.md)。存在 `state/cluster_ownership.json` 时，统一使用仓库根目录 `./ccr-night status/pause/resume`，原来的单机全量启动入口会拒绝运行，避免与第二台重复生成。原有图片、Prompt 和冻结计划保留。
+
 每个拥有至少4张**不同且实际存在**真实图的训练地点，稳定选择1张真实源图，生成1个night Prompt。不是从旧生成图记录抽地点，也不是每个地点生成多种天气或多张图。
 
 保留30类照明机制、场景适配排除、稀缺机制优先、VLM逐图开放描述；保留永久地点结构，允许合理的人车增删与干湿变化。只启用night。源图选择不把Sobel、纹理或低亮度冒充建筑语义真值，也不使用SVOX test错例选择源图。
 
-本次索引为62,374个地点，排除140个校准/验证地点。v1短程检查暴露了坐标字段别名问题，已停止并保留原始响应；v2检查又发现模型会照抄JSON示例占位词；v3有限检查仍频繁缺少框。沿用v4 Prompt策略：当前任务只需Prompt，不要求VLM框选地标；整图框仅作为永久结构保护约定，明确记录origin=deterministic_preservation_contract、usable_as_correspondence_or_semantic_evidence=false。这不是检测结果、语义掩码或局部蒸馏监督，仍允许人车和干湿变化。可见照明条件仍必须由VLM逐图提供；格式失败最多重新看图纠正1次，仍然失败则单列跳过。v1/v2/v3检查记录均保留，不作为最终队列。
+本次索引为62,374个地点，排除140个校准/验证地点。当前策略不要求VLM框选地标；整图框仅用于永久结构保护，明确标为策略约定，不是检测结果、语义掩码或局部蒸馏监督。可见照明条件仍由VLM逐图判断，允许合理的人车和干湿变化；格式失败最多重新看图纠正1次。失败的cohort v1/v2/v3试运行及v2/v3包装代码已清理，当前仍引用的v4源图和导入证据保留。
 
 默认目录：`outputs/night_place_fast_v1/`。沿用真实训练地点排除清单；CSV重复行不增加图片数，缺失文件不计数。按seed/city/place_id/真实文件名稳定选源图，选中图不可解码时尝试该地点下一个稳定候选，不在地点间冒充精确配对。
 
@@ -122,12 +124,38 @@ journalctl --user -u ccr-night-place-prompts-fast-v1.service -n 30 --no-pager
 
 每次启动的实际策略保存于`resource_runs/<run-id>/guard_policy.json`。退出报告另记`peak_task_swap_gib`、task_cgroup与swap_scope，系统swap仍可用于诊断。配置备份及变更理由保存在`resource_guard_repairs/`。60项CPU测试包含全系统swap增长但任务swap为0、真实内存/显存超限、读取失败、共享cgroup拒绝与既有恢复逻辑。
 
-## 将来生图时
+## 全量生图：先生成，后审核
 
-必须先有`prompts_complete.json`。例如先试生32张：
+2026-10-28全量Prompt已完成：62,374个地点有终态，其中61,984条ready、390条格式或源图分析失败。已导出485个冻结分片。2026-10-31已转入两机协同生成，保留相同冻结分片和已生成图片。
+
+当前启动或继续生成：
 
 ```bash
-"$PY" -B "$RUN" run --pipeline places --execute --max-calls 32
+./ccr-night resume
 ```
 
-此阶段只生图，后端在分片之间保持加载，结束后释放；不在同一时间加载几何/CLIP或VLM审核模型。之后按导出分片，使用`--pipeline balanced --output-dir <分片state路径>`分别verify/audit/report。每地点一次请求的预算与总调用预算均生效，失败请求不自动追加。全量图像与raw证据可能占用上百GB磁盘，启动前检查所请求规模的空间。
+原单机 `ccr-night-place-images-v1.service` 已加 ownership 保护，不能与协同队列同时启动。当前各节点的资源配置、服务及性能测量见[协同生成说明](night_cluster.md)。CUDA监控是采样保护，不能代替显存预约；其他进程占用增加时仍可能中止。
+
+模型沿用已验证的Lightning 4步、BF16、24个常驻DiT块、缓存text encoder/VAE/DiT和原source-aspect生成画布。服务只加载一次，跨485个分片保持常驻；不混入VLM看图、LightGlue/CLIP或源图内容审核模型。DeferredVerifier只把输出标记pending_verification，不执行质量网络，不伪装成通过审核或可训练图像。Prompt阶段的64张批次优化不等于生图批次或速度，不能据此推算生图耗时。
+
+查看累计进度与服务状态：
+
+```bash
+./ccr-night status
+journalctl --user -u ccr-night-controller.service -f
+```
+
+暂停并释放资源、之后继续（已保存的图片复用）：
+
+```bash
+./ccr-night pause
+./ccr-night resume
+```
+
+退出时生图服务也会停止，重启先尝试从服务raw/sidecar恢复已生成但未提交的图片。HTTP请求仍有冻结调用预算；没有完整raw的失败请求并不承诺无限重试，预算或输入异常会明确停止而不是覆盖旧结果。每张图和每片都保留自己的生成、请求和待审核记录。
+
+图片目录：`outputs/night_place_fast_v1/images/`（night与raw子目录）；只有后续审核明确通过的图才能进入accepted/训练清单。本次不自动启动审核或训练。
+
+本机保留20GiB磁盘余量保护，低于余量时暂停，不删除既有图；可释放空间后继续。内存保护仍要求本机至少4GiB系统可用内存；第二台按实际24GB显存/64GB内存单独配置，不能照搬本机的48GB显存设置。
+
+后续审核可按分片使用`--pipeline balanced --output-dir <分片state路径>`分别verify/audit/report，必须与生图阶段分开进行。63项相关CPU测试加1项图像汇总测试通过；首次与末次冻结分片及全量完成屏障已只读校验，未执行GPU生图试跑。

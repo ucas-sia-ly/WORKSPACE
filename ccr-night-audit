@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+CCRAUDIT_WORKSPACE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$CCRAUDIT_WORKSPACE/AdaptVPR${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONDONTWRITEBYTECODE=1
+exec /home/admin123/miniconda3/envs/AdaptVPR/bin/python -B -m experiments.qwen_curriculum.night_full_audit "$@"

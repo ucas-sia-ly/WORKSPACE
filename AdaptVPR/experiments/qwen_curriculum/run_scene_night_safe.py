@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -75,7 +76,7 @@ def task_cgroup(proc_file=Path('/proc/self/cgroup'), root=Path('/sys/fs/cgroup')
     if maximum=='max':
         raise RuntimeError('Task swap monitoring requires a finite service memory limit')
     if (group/'memory.swap.max').read_text().strip()!='0':
-        raise RuntimeError('Prompt service must retain MemorySwapMax=0')
+        raise RuntimeError('Owned service must retain MemorySwapMax=0')
     return group
 
 
@@ -86,7 +87,23 @@ def task_swap(group):
         raise RuntimeError('Cannot read task cgroup swap accounting') from error
 
 
+def owned_swap(group,include_generator=False):
+    """Count both owned service cgroups during generation, without double count."""
+    total=task_swap(group)
+    owner=service_pid() if include_generator else 0
+    if owner:
+        try:
+            generator=task_cgroup(Path(f'/proc/{owner}/cgroup'))
+            if generator!=group: total+=task_swap(generator)
+        except (OSError,RuntimeError):
+            # Normal shutdown may remove its cgroup between the PID and file read.
+            if service_pid(): raise
+    return total
+
+
 def violation(value, args):
+    if value.get('disk_free_gib',float('inf'))<getattr(args,'reserve_disk_gib',5):
+        return 'output filesystem free space below reserve'
     if value['available_gib'] < args.reserve_ram_gib:
         return 'system available RAM below reserve'
     if value['owned_rss_gib'] > args.max_rss_gib:
@@ -143,6 +160,7 @@ def main(argv=None):
     parser.add_argument('--max-new-swap-gib', type=float, default=1)
     parser.add_argument('--swap-scope', choices=('system','task'),default='system')
     parser.add_argument('--max-task-swap-gib',type=float,default=0)
+    parser.add_argument('--reserve-disk-gib',type=float,default=5)
     parser.add_argument('--service-memory-high-gib', type=float, default=12)
     parser.add_argument('--service-memory-max-gib', type=float, default=16)
     args = parser.parse_args(argv)
@@ -159,8 +177,8 @@ def main(argv=None):
         if args.output_dir and (args.output_dir/'cohort_config.json').exists():
             version=json.loads((args.output_dir/'cohort_config.json').read_text())['version']
             readers={'night_place_fast_v1':'night_place_fast',
-                     **{f'night_place_cohort_v{n}':('night_place_cohort' if n==1 else f'night_place_cohort_v{n}')
-                        for n in range(1,5)}}
+                     'night_place_cohort_v1':'night_place_cohort',
+                     'night_place_cohort_v4':'night_place_cohort_v4'}
             if version not in readers: raise ValueError('Unknown frozen place cohort')
             night_place_cohort=importlib.import_module('experiments.qwen_curriculum.'+readers[version])
         script, root = Path(night_place_cohort.__file__).resolve(), night_place_cohort.ROOT
@@ -174,6 +192,10 @@ def main(argv=None):
     args.output_dir = args.output_dir or root/'state'
     args.image_root = args.image_root or root
     args.output_dir = args.output_dir.resolve()
+    ownership=args.output_dir/'cluster_ownership.json'
+    if args.command=='run' and args.execute and ownership.exists():
+        raise RuntimeError('This cohort is assigned to the two-machine generator. '
+                           'Use ./ccr-night resume/status; the old all-shard launcher would duplicate remote work.')
     if args.command == 'report':
         if args.pipeline == 'places':
             print((args.output_dir/'progress.json').read_text())
@@ -202,12 +224,12 @@ def main(argv=None):
     if not actual:
         return subprocess.call(command)
     if any(not 0 < x < float('inf') for x in (args.reserve_ram_gib, args.max_rss_gib,
-                                            args.max_gpu_gib, args.max_new_swap_gib)):
+                                            args.max_gpu_gib, args.max_new_swap_gib,args.reserve_disk_gib)):
         raise ValueError('Resource limits must be finite and positive')
     if not 0 <= args.max_task_swap_gib < float('inf'):
         raise ValueError('Task swap limit must be finite and nonnegative')
-    if args.swap_scope=='task' and not (args.command=='prepare' and args.pipeline=='places'):
-        raise ValueError('Task swap scope currently supports local place Prompt preparation only')
+    if args.swap_scope=='task' and not (args.command in ('prepare','run') and args.pipeline=='places'):
+        raise ValueError('Task swap scope supports place Prompt preparation and image generation')
     if service_pid():
         raise RuntimeError('Generator already running; inspect/reuse its existing task before launching another')
     if args.command == 'run':
@@ -230,8 +252,9 @@ def main(argv=None):
     command.append('--execute')
     owned_cgroup=task_cgroup() if args.swap_scope=='task' else None
     initial = snapshot()
+    initial['disk_free_gib']=shutil.disk_usage(args.output_dir).free/GIB
     if owned_cgroup is not None:
-        initial['task_swap_used_gib']=task_swap(owned_cgroup)
+        initial['task_swap_used_gib']=owned_swap(owned_cgroup,args.command=='run')
     if initial['gpu_used_gib'] > 2:
         raise RuntimeError('GPU already occupied; leave the existing workload untouched')
     if reason := violation(initial, args):
@@ -259,6 +282,7 @@ def main(argv=None):
             swap_scope=args.swap_scope,task_cgroup=str(owned_cgroup) if owned_cgroup else None,
             max_task_swap_gib=args.max_task_swap_gib,max_new_system_swap_gib=args.max_new_swap_gib,
             system_swap_role='informational only' if owned_cgroup else 'stop on growth',
+            includes_generator_cgroup=args.command=='run',reserve_disk_gib=args.reserve_disk_gib,
             reserve_ram_gib=args.reserve_ram_gib,max_gpu_gib=args.max_gpu_gib,max_rss_gib=args.max_rss_gib))
         if args.command == 'run':
             runtime = Path(os.environ['XDG_RUNTIME_DIR'])/'systemd/user'/f'{SERVICE}.d'
@@ -281,8 +305,9 @@ def main(argv=None):
                                        start_new_session=True, env=env)
             while True:
                 value = snapshot(process.pid)
+                value['disk_free_gib']=shutil.disk_usage(args.output_dir).free/GIB
                 if owned_cgroup is not None:
-                    value['task_swap_used_gib']=task_swap(owned_cgroup)
+                    value['task_swap_used_gib']=owned_swap(owned_cgroup,args.command=='run')
                     peak_task_swap=max(peak_task_swap,value['task_swap_used_gib'])
                 value['new_swap_gib'] = max(0, value['swap_used_gib']-initial['swap_used_gib'])
                 peak_new_swap = max(peak_new_swap, value['new_swap_gib'])
@@ -327,6 +352,7 @@ def main(argv=None):
                       limits=dict(reserve_ram_gib=args.reserve_ram_gib, max_rss_gib=args.max_rss_gib,
                                   max_gpu_gib=args.max_gpu_gib, max_new_swap_gib=args.max_new_swap_gib,
                                   swap_scope=args.swap_scope,max_task_swap_gib=args.max_task_swap_gib,
+                                  reserve_disk_gib=args.reserve_disk_gib,
                                   service_memory_high_gib=args.service_memory_high_gib,
                                   service_memory_max_gib=args.service_memory_max_gib, service_swap_max_gib=0), sampling_seconds=1,
                       accounting='RSS includes launcher, child process group and systemd generator; shared pages may repeat')

@@ -4,6 +4,8 @@
 
 | 文档 | 内容 |
 |---|---|
+| [当前夜间数据集](night_dataset.md) | 已完成的61,984对精确原图/生成图，统一目录、TSV/JSONL/SQLite查询及完整性核验 |
+| [双机生成归档](night_generation_completion.md) | 本批原队列与汞灯替代的来源和资源策略；生成已完成 |
 | [训练与评估](workflow.md) | 原生 PyTorch 入口、真实图与生成图采样、checkpoint、恢复与评估协议 |
 | [Qwen 持续增量图片微调](qwen_finetuning.md) | 推荐入口；直接读取活动目录，新实验纳入新增图片，续训使用冻结快照 |
 | [阶段二：全量真实 A 基线](real_baseline.md) | 固定地点排除、P/LR/blocks 单因素筛选、三 seed 确认与 SVOX 分类测试 |

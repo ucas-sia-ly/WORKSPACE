@@ -1,0 +1,710 @@
+{
+  "version": "night_mechanisms_2",
+  "purpose": "Scene-grounded coverage categories, not complete prompt templates. Only night; allocate among positively supported mechanisms. Mercury vapor is retired.",
+  "references": {
+    "lamps": "https://edisontechcenter.org/sodium-lamps/",
+    "street": "https://jamesmaherphotography.com/night-city-street-photography/",
+    "reflections": "https://joeredski.com/blog/2021/6/8/5-cool-night-street-photography-tips",
+    "moon": "https://unsplash.com/photos/full-moon-illuminates-a-city-street-at-night-Lsyw49spJY8"
+  },
+  "styles": [
+    {
+      "id": "sodium_lamps",
+      "name": "暖橙高压钠灯",
+      "requires": [
+        [
+          "drivable_road",
+          "visible_fixed_luminaires",
+          "walkable_ground"
+        ]
+      ],
+      "mechanism": "Localized amber illumination on supported surfaces, with dark intervals and varied material colours, never a whole-image orange filter. Use actual visible fixed fixtures only where evidenced; otherwise place the source explicitly outside the frame.",
+      "references": [
+        "lamps"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "visible_fixture",
+          "off_frame"
+        ]
+      ]
+    },
+    {
+      "id": "low_pressure_sodium",
+      "name": "窄谱黄色钠灯",
+      "requires": [
+        [
+          "drivable_road",
+          "visible_fixed_luminaires"
+        ]
+      ],
+      "mechanism": "Narrow yellow-dominant directional illumination with reduced local colour separation and visible falloff. Preserve fixture geometry; when no fixture is visible, keep the emitter off frame and describe only its effect on existing surfaces.",
+      "references": [
+        "lamps"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "visible_fixture",
+          "off_frame"
+        ]
+      ]
+    },
+    {
+      "id": "led_lamps",
+      "name": "冷白LED",
+      "requires": [
+        [
+          "drivable_road",
+          "visible_fixed_luminaires",
+          "walkable_ground"
+        ]
+      ],
+      "mechanism": "Cool-white directional light pools and darker gaps on actual surfaces, with limited highlight bloom. Preserve evidenced fixtures; an unevidenced light emitter must remain outside the crop.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "visible_fixture",
+          "off_frame"
+        ]
+      ]
+    },
+    {
+      "id": "warm_led",
+      "name": "暖白LED",
+      "requires": [
+        [
+          "drivable_road",
+          "visible_fixed_luminaires",
+          "walkable_ground"
+        ]
+      ],
+      "mechanism": "Warm-white local illumination with natural material colours and dark nocturnal ambient light. Use evidenced fixtures or an explicitly off-frame source; do not draw fixtures to explain the light.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "visible_fixture",
+          "off_frame"
+        ]
+      ]
+    },
+    {
+      "id": "neutral_led",
+      "name": "中性白LED",
+      "requires": [
+        [
+          "drivable_road",
+          "visible_fixed_luminaires",
+          "walkable_ground"
+        ]
+      ],
+      "mechanism": "Neutral-white directional illumination and falloff separating lit surfaces from dark surroundings. Keep visible fixtures unchanged or explicitly use off-frame illumination.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "visible_fixture",
+          "off_frame"
+        ]
+      ]
+    },
+    {
+      "id": "metal_halide",
+      "name": "金卤灯白光",
+      "requires": [
+        [
+          "drivable_road",
+          "industrial_site",
+          "visible_fixed_luminaires"
+        ]
+      ],
+      "mechanism": "Bright localized white illumination with restrained cool shadows across actual supported surfaces, not daytime exposure. A nonvisible emitter stays off frame; do not add floodlights or poles.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "visible_fixture",
+          "off_frame"
+        ]
+      ]
+    },
+    {
+      "id": "mixed_sodium_led",
+      "name": "钠灯与LED混合",
+      "requires": [
+        [
+          "drivable_road",
+          "visible_fixed_luminaires"
+        ]
+      ],
+      "mechanism": "Spatially separate amber and cool-white lighting zones on actual surfaces, with distinct directions and falloff rather than a global colour grade. Nonvisible emitters remain outside the frame.",
+      "references": [
+        "lamps",
+        "street"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "visible_fixture",
+          "off_frame"
+        ]
+      ]
+    },
+    {
+      "id": "mixed_window_street",
+      "name": "暖窗光与冷路灯",
+      "requires": [
+        [
+          "building_windows"
+        ],
+        [
+          "drivable_road",
+          "visible_fixed_luminaires",
+          "walkable_ground"
+        ]
+      ],
+      "mechanism": "Some positively evidenced BUILDING windows emit warm light, contrasted with cool directional exterior light on nearby ground. Vehicle windows do not qualify. The exterior source may be off frame; preserve every opening and fixture.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "existing_opening",
+        "visible_fixture",
+        "off_frame",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "existing_opening"
+        ],
+        [
+          "visible_fixture",
+          "off_frame"
+        ]
+      ]
+    },
+    {
+      "id": "shopfronts",
+      "name": "已有店铺橱窗主照明",
+      "requires": [
+        [
+          "shopfront_display_windows"
+        ],
+        [
+          "building_windows"
+        ]
+      ],
+      "mechanism": "Spill from positively evidenced existing shop DISPLAY windows onto immediately adjacent ground. A plain glass door or billboard is not a display window. Preserve the business frontage, display layout, sign content and all openings.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "existing_opening",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "existing_opening"
+        ]
+      ]
+    },
+    {
+      "id": "existing_sign_glow",
+      "name": "已有标识局部发光",
+      "requires": [
+        [
+          "existing_signs"
+        ]
+      ],
+      "mechanism": "Only the positively evidenced existing sign face emits localized light; retain its exact outline, lettering and support. A billboard does not become a shop or a newly illuminated storefront.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "existing_sign",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "existing_sign"
+        ]
+      ]
+    },
+    {
+      "id": "residential_windows",
+      "name": "稀疏住宅窗光",
+      "requires": [
+        [
+          "building_windows"
+        ],
+        [
+          "residential_windows"
+        ]
+      ],
+      "mechanism": "A sparse subset of positively evidenced residential BUILDING windows emits soft warm light. Vehicle windows never qualify. Keep their exact location, count and shape, and keep unlit facade surfaces nocturnal.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "existing_opening",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "existing_opening"
+        ]
+      ]
+    },
+    {
+      "id": "porch_entrance",
+      "name": "入口门廊暖光",
+      "requires": [
+        [
+          "building_entrances"
+        ]
+      ],
+      "mechanism": "Localized warm illumination on the existing entrance threshold and nearby surfaces. An ordinary entrance is not a roofed passage. Unless an existing fixture is visibly evidenced, put the source off frame and describe direction and falloff without drawing a porch light.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "visible_fixture",
+          "off_frame"
+        ]
+      ]
+    },
+    {
+      "id": "covered_fluorescent",
+      "name": "有顶通道荧光照明",
+      "requires": [
+        [
+          "covered_passage"
+        ]
+      ],
+      "mechanism": "Cool elongated illumination within an actual visibly roofed PASSAGE with depth, contrasting with the dark exterior. An ordinary doorway is insufficient. When no luminaire is visible, describe light on the existing ceiling/walls from an emitter outside the crop, never a new row of tubes.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "visible_fixture",
+          "off_frame"
+        ]
+      ]
+    },
+    {
+      "id": "industrial_security",
+      "name": "工业区域安保照明",
+      "requires": [
+        [
+          "industrial_site"
+        ]
+      ],
+      "mechanism": "Sparse directional security light across actual industrial surfaces and ground, preserving equipment and layout. If no luminaire is visible, explicitly keep all emitters outside the frame; describe lit patches, incidence direction and decay, never rows of wall-mounted lamps.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "visible_fixture",
+          "off_frame"
+        ]
+      ]
+    },
+    {
+      "id": "sparse_lamps",
+      "name": "稀疏路灯深夜",
+      "requires": [
+        [
+          "drivable_road",
+          "visible_fixed_luminaires",
+          "walkable_ground"
+        ]
+      ],
+      "mechanism": "Widely separated light pools with visible dark intervals and faint useful structure between them. Use existing evidenced luminaires or off-frame emitters, without adding lamp poles.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "visible_fixture",
+          "off_frame"
+        ]
+      ]
+    },
+    {
+      "id": "dimmed_late_night",
+      "name": "深夜低照度照明",
+      "requires": [
+        [
+          "drivable_road",
+          "visible_fixed_luminaires",
+          "building_windows"
+        ]
+      ],
+      "mechanism": "Low-output localized lighting and, only where actual BUILDING windows are evidenced, fewer illuminated windows. Vehicle glazing does not qualify. Preserve readable nocturnal structure instead of uniformly crushing shadows.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient",
+        "existing_opening",
+        "existing_sign",
+        "existing_vehicle"
+      ],
+      "required_origin_groups": []
+    },
+    {
+      "id": "headlights",
+      "name": "已有车流前灯",
+      "requires": [
+        [
+          "visible_vehicles"
+        ],
+        [
+          "visible_headlight_faces"
+        ],
+        [
+          "drivable_road"
+        ]
+      ],
+      "mechanism": "Directional beams and restrained glare attached to visible headlamp faces of actual source vehicles. Respect vehicle orientation; no detached lights, invented windows or fixed fixtures.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "existing_vehicle",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "existing_vehicle"
+        ]
+      ]
+    },
+    {
+      "id": "tail_lights",
+      "name": "已有车流尾灯",
+      "requires": [
+        [
+          "visible_vehicles"
+        ],
+        [
+          "visible_taillight_faces"
+        ],
+        [
+          "drivable_road"
+        ]
+      ],
+      "mechanism": "Red tail/brake lights and localized ground spill attached to visible rear-lamp faces of actual source vehicles. Respect their orientation; keep the permanent place structure unchanged.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "existing_vehicle",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "existing_vehicle"
+        ]
+      ]
+    },
+    {
+      "id": "passing_vehicle_lights",
+      "name": "可行新车流照明",
+      "requires": [
+        [
+          "drivable_road"
+        ],
+        [
+          "safe_vehicle_space"
+        ]
+      ],
+      "mechanism": "One plausible passing vehicle may occupy positively evidenced free road space. Its correctly attached lights create localized spill and restrained glare; keep road topology and permanent landmarks visible.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "introduced_vehicle",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "introduced_vehicle"
+        ]
+      ]
+    },
+    {
+      "id": "short_light_trails",
+      "name": "短车灯拖影",
+      "requires": [
+        [
+          "visible_vehicles"
+        ],
+        [
+          "drivable_road"
+        ],
+        [
+          "safe_vehicle_space"
+        ],
+        [
+          "visible_headlight_faces",
+          "visible_taillight_faces"
+        ]
+      ],
+      "mechanism": "Short motion streaks attached to actual visible vehicle lamp faces, with positively evidenced free road space and plausible motion. Existing unlit daylight lamp faces may be activated at night; preserve their geometry. No detached trails or new permanent structures; keep buildings, signs and road topology stable.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "existing_vehicle",
+        "ambient"
+      ],
+      "required_origin_groups": [
+        [
+          "existing_vehicle"
+        ]
+      ]
+    },
+    {
+      "id": "wet_reflections",
+      "name": "雨后湿路夜景",
+      "requires": [
+        [
+          "paved_ground"
+        ]
+      ],
+      "mechanism": "Declare existing paved ground wet, with broken localized reflections of supported scene light. Do not add shops or light fixtures to create reflections. Use explicitly off-frame light where no emitter is visible.",
+      "references": [
+        "reflections"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient",
+        "existing_opening",
+        "existing_sign",
+        "existing_vehicle"
+      ],
+      "required_origin_groups": [],
+      "required_surface_states": [
+        "wet"
+      ]
+    },
+    {
+      "id": "damp_matte",
+      "name": "潮湿低反光夜景",
+      "requires": [
+        [
+          "paved_ground"
+        ]
+      ],
+      "mechanism": "Declare existing pavement damp within a mixed dry/damp surface state, with subdued broken reflections and retained texture. Never a full-road mirror, and never add emitters to justify the reflection.",
+      "references": [
+        "reflections"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient",
+        "existing_opening",
+        "existing_sign",
+        "existing_vehicle"
+      ],
+      "required_origin_groups": [],
+      "required_surface_states": [
+        "mixed"
+      ]
+    },
+    {
+      "id": "light_haze",
+      "name": "轻薄夜雾散射",
+      "requires": [
+        [
+          "drivable_road",
+          "visible_fixed_luminaires",
+          "building_windows"
+        ]
+      ],
+      "mechanism": "Thin nocturnal atmospheric scattering around explicitly supported existing or off-frame light, with nearby structural landmarks still readable. Keep the night condition and preserve architecture.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient",
+        "existing_opening",
+        "existing_sign",
+        "existing_vehicle"
+      ],
+      "required_origin_groups": []
+    },
+    {
+      "id": "moonlit_ambient",
+      "name": "月光与弱环境光",
+      "requires": [],
+      "mechanism": "Weak cool nocturnal ambient illumination with source-specific dark surfaces and gentle directionality. No visible moon or fixed fixture needs to be inserted; do not brighten this into a day photograph.",
+      "references": [
+        "moon"
+      ],
+      "allowed_origins": [
+        "ambient",
+        "off_frame"
+      ],
+      "required_origin_groups": []
+    },
+    {
+      "id": "overcast_skyglow",
+      "name": "阴天城市夜间天光",
+      "requires": [],
+      "mechanism": "Diffuse low urban nighttime ambient glow and weak shadows, even if sky is not visible. Retain nocturnal surface luminance; no daytime sunlight, invented lamps or architecture.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "ambient",
+        "off_frame"
+      ],
+      "required_origin_groups": []
+    },
+    {
+      "id": "blue_hour",
+      "name": "蓝调末段入夜",
+      "requires": [],
+      "mechanism": "Deep-blue final transition into night with clearly nocturnal ground lighting and limited residual ambient light. Keep surfaces night-like when no sky is visible; never use a black sky over a daytime facade.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "ambient",
+        "off_frame"
+      ],
+      "required_origin_groups": []
+    },
+    {
+      "id": "highlight_exposed",
+      "name": "保高光夜间曝光",
+      "requires": [
+        [
+          "visible_fixed_luminaires",
+          "building_windows",
+          "existing_signs",
+          "visible_headlight_faces",
+          "visible_taillight_faces"
+        ]
+      ],
+      "mechanism": "Protect highlights of supported existing bright emitters or building openings while retaining varied dark structural detail. Vehicle windows, billboard faces and ordinary glass doors must not be silently promoted to residential lighting.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient",
+        "existing_opening",
+        "existing_sign",
+        "existing_vehicle"
+      ],
+      "required_origin_groups": []
+    },
+    {
+      "id": "shadow_lifted",
+      "name": "自动曝光提亮暗部",
+      "requires": [],
+      "mechanism": "Moderately lift sensor shadow detail while preserving a coherent weak nighttime lighting field, localized highlights and believable dark surfaces. Do not relight the scene as clean daylight.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "ambient",
+        "off_frame"
+      ],
+      "required_origin_groups": []
+    },
+    {
+      "id": "high_iso_documentary",
+      "name": "高ISO纪实夜景",
+      "requires": [],
+      "mechanism": "Natural documentary high-ISO night response with modest grain, restrained local highlight bloom and readable permanent structure. Choose source-supported existing or off-frame illumination; do not invent bright shops or lamps.",
+      "references": [
+        "street"
+      ],
+      "allowed_origins": [
+        "visible_fixture",
+        "off_frame",
+        "ambient",
+        "existing_opening",
+        "existing_sign",
+        "existing_vehicle"
+      ],
+      "required_origin_groups": []
+    }
+  ],
+  "retired_style_ids": [
+    "mercury_vapor"
+  ]
+}
