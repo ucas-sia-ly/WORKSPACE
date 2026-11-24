@@ -1,0 +1,81 @@
+{
+  "real_data": "../../dataset/gsv-cities",
+  "checkpoint": "../checkpoint/dino_salad.ckpt",
+  "backbone_repo": "/home/admin123/.cache/torch/hub/facebookresearch_dinov2_main",
+  "device": "cuda",
+  "precision": "bf16",
+  "num_workers": 4,
+  "prefetch_factor": 1,
+  "torch_threads": 4,
+  "eval_batch_size": 64,
+  "eval_query_chunk_size": 128,
+  "eval_reference_chunk_size": 4096,
+  "eval_reference_cache_mib": 2048,
+  "resource_limits": {
+    "cuda_budget_gib": 40,
+    "cuda_reserve_gib": 4,
+    "host_rss_limit_gib": 20,
+    "host_available_reserve_gib": 3
+  },
+  "output_dir": "../../outputs/qwen_curriculum/state/finetuning/real_baseline_v1",
+  "reserved_places": "splits/ccr_reserved_places.json",
+  "svox_root": "../../dataset/svox",
+  "images_per_place": 4,
+  "epochs": 3,
+  "screen_seed": 42,
+  "confirmation_seeds": [
+    43,
+    44,
+    45
+  ],
+  "acceptance": {
+    "min_active_anchor_fraction": 0.05,
+    "max_empty_mining_fraction": 0.1,
+    "max_val_drop_pp": 0.1,
+    "max_seed_std_pp": 0.1
+  },
+  "candidates": [
+    {
+      "name": "p32_lr1e5_b2",
+      "batch_size": 32,
+      "learning_rate": 1e-05,
+      "num_trainable_blocks": 2
+    },
+    {
+      "name": "p16_lr1e5_b2",
+      "batch_size": 16,
+      "learning_rate": 1e-05,
+      "num_trainable_blocks": 2
+    },
+    {
+      "name": "p64_lr1e5_b2",
+      "batch_size": 64,
+      "learning_rate": 1e-05,
+      "num_trainable_blocks": 2
+    },
+    {
+      "name": "p32_lr3e6_b2",
+      "batch_size": 32,
+      "learning_rate": 3e-06,
+      "num_trainable_blocks": 2
+    },
+    {
+      "name": "p32_lr3e5_b2",
+      "batch_size": 32,
+      "learning_rate": 3e-05,
+      "num_trainable_blocks": 2
+    },
+    {
+      "name": "p32_lr1e5_b1",
+      "batch_size": 32,
+      "learning_rate": 1e-05,
+      "num_trainable_blocks": 1
+    },
+    {
+      "name": "p32_lr1e5_b4",
+      "batch_size": 32,
+      "learning_rate": 1e-05,
+      "num_trainable_blocks": 4
+    }
+  ]
+}

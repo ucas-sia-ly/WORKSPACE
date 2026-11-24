@@ -1,0 +1,9 @@
+# Generated SALAD artifacts (workspace-wide rules live in ../.gitignore).
+checkpoint/
+outputs/
+results/
+logs/
+wandb/
+__pycache__/
+*.py[cod]
+.pytest_cache/

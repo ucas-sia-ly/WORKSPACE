@@ -1,0 +1,49 @@
+{
+  "output_dir": "../outputs/ccr_feasibility_pilot",
+  "real_data": "../../dataset/gsv-cities",
+  "synthetic_manifest": "../../outputs/qwen_curriculum/state/training_manifest.jsonl",
+  "checkpoint": "../../outputs/coverage_run/checkpoint_epoch_050.pt",
+  "teacher_checkpoint": "../../outputs/coverage_run/checkpoint_epoch_050.pt",
+  "backbone_repo": "/home/admin123/.cache/torch/hub/facebookresearch_dinov2_main",
+  "pair_calibration": null,
+  "pair_geometry_cache": "../outputs/ccr_stage2b_diagnostics/geometry",
+  "cities": [
+    "Bangkok",
+    "BuenosAires",
+    "LosAngeles",
+    "Medellin"
+  ],
+  "validation_places_per_weather": 8,
+  "partition_seed": 3041,
+  "steps": 500,
+  "evaluation_interval": 100,
+  "seeds": [
+    42
+  ],
+  "batch_size": 8,
+  "images_per_place": 4,
+  "learning_rate": 1e-06,
+  "num_trainable_blocks": 1,
+  "precision": "16",
+  "device": "cuda",
+  "num_workers": 0,
+  "exposure_probability": 0.5,
+  "global_weight": 0.1,
+  "feature_weight": 0.1,
+  "ot_weight": 0.1,
+  "mix_fraction": 0.5,
+  "max_real_drop_pp": 0.0,
+  "minimum_weather_gain_pp": 0.0,
+  "external_validations": [
+    {
+      "name": "svox_real_val",
+      "kind": "real",
+      "dataset": "SVOX",
+      "root": "../../dataset/svox",
+      "role": "validation",
+      "split": "val"
+    }
+  ],
+  "calibration_places_per_weather": 3,
+  "calibration_tail_probability": 0.01
+}

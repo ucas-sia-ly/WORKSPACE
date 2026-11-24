@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+CCR_REPAIR_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$CCR_REPAIR_ROOT/AdaptVPR${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONDONTWRITEBYTECODE=1
+if [ "$#" -eq 0 ]; then set -- status; fi
+exec /home/admin123/miniconda3/envs/AdaptVPR/bin/python -B -m experiments.qwen_curriculum.night_repair_control "$@"

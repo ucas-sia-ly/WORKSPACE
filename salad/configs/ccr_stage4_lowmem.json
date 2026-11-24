@@ -1,0 +1,23 @@
+{
+  "stage3_dir": "../../outputs/qwen_curriculum/state/finetuning/am_multiseed_v1",
+  "output_dir": "../../outputs/qwen_curriculum/state/finetuning/ccr_stage4_lowmem_v2",
+  "global_weights": [
+    0.0,
+    0.01,
+    0.03,
+    0.1
+  ],
+  "exposure_probability": 0.5,
+  "temperature": 0.1,
+  "feature_weight": 0.1,
+  "ot_weight": 0.1,
+  "gradient_interval": 100,
+  "local_mode": "salad_dropout_off",
+  "calibration_tail_probability": 0.01,
+  "geometry_cache": "../outputs/ccr_stage2b_diagnostics/geometry",
+  "max_B0_drop_pp": 0.1,
+  "max_B0_seed_delta_std_pp": 0.1,
+  "probe_pairs_per_weather": 2,
+  "smoke_batches": 2,
+  "runtime_num_workers": 0
+}

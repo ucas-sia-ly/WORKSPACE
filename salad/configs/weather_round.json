@@ -1,0 +1,64 @@
+{
+  "output_dir": "../../outputs/qwen_curriculum/state/finetuning/weather_round_v1",
+  "real_data": "../../dataset/gsv-cities",
+  "checkpoint": "../checkpoint/dino_salad.ckpt",
+  "backbone_repo": "/home/admin123/.cache/torch/hub/facebookresearch_dinov2_main",
+  "exclude_places": "../../outputs/qwen_curriculum/state/finetuning/real_baseline_v1/excluded_places.json",
+  "synthetic_manifests": [
+    "../../outputs/qwen_curriculum/state/training_manifest.jsonl",
+    "../../outputs/qwen_curriculum/state/requalified_v3_manifest.jsonl"
+  ],
+  "svox_root": "../../dataset/svox",
+  "weather_validation": "../../outputs/qwen_curriculum/state/weather_validation/svox_train_weather.json",
+  "external_validation": [
+    "../../outputs/qwen_curriculum/state/external_validation/nordland_probe",
+    "../../outputs/qwen_curriculum/state/external_validation/tokyo247_reduced"
+  ],
+  "training": {
+    "batch_size": 32,
+    "images_per_place": 4,
+    "learning_rate": 3e-06,
+    "num_trainable_blocks": 2,
+    "epochs": 3,
+    "precision": "bf16",
+    "synthetic_place_slots": 8,
+    "prefer_synthetic_sources": true,
+    "retention_batch_size": 8
+  },
+  "methods": {
+    "A": {},
+    "A_retention": {
+      "real_global_distill_weight": 0.1
+    },
+    "M": {
+      "synthetic_mode": "replace",
+      "synthetic_fraction": 1.0
+    },
+    "B0": {
+      "synthetic_mode": "mix",
+      "synthetic_aux": true,
+      "synthetic_global_weight": 1.0,
+      "synthetic_exposure_prob": 1.0
+    }
+  },
+  "reference_method": "A",
+  "seeds": [
+    43,
+    44,
+    45
+  ],
+  "device": "cuda",
+  "num_workers": 4,
+  "prefetch_factor": 1,
+  "torch_threads": 4,
+  "eval_batch_size": 64,
+  "eval_query_chunk_size": 128,
+  "eval_reference_chunk_size": 4096,
+  "eval_reference_cache_mib": 2048,
+  "resource_limits": {
+    "cuda_budget_gib": 40,
+    "cuda_reserve_gib": 4,
+    "host_rss_limit_gib": 20,
+    "host_available_reserve_gib": 3
+  }
+}

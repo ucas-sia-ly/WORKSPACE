@@ -1,0 +1,24 @@
+[Unit]
+Description=AdaptVPR LightX2V generation service
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=%h/github/WORKSPACE/LightX2V
+EnvironmentFile=%h/github/WORKSPACE/AdaptVPR/.env
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=PYTHONPATH=%h/github/WORKSPACE/LightX2V
+Environment=PLATFORM=cuda
+Environment=SKIP_PLATFORM_CHECK=True
+Environment=LIGHTX2V_PORT=8001
+Environment=LIGHTX2V_OUTPUT_DIR=%h/github/WORKSPACE/AdaptVPR/tmp/service_outputs/lightx2v
+ExecStart=%h/miniconda3/envs/AdaptVPR/bin/python %h/github/WORKSPACE/AdaptVPR/adapters/lightx2v_qwen_image_edit.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+StandardOutput=append:%h/github/WORKSPACE/AdaptVPR/tmp/logs/lightx2v_8001.log
+StandardError=append:%h/github/WORKSPACE/AdaptVPR/tmp/logs/lightx2v_8001.log
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,55 @@
+#!/bin/bash
+set -euo pipefail
+CCR_PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CCR_FINAL_DATASET="$CCR_PROJECT_DIR/outputs/night_dataset_final"
+if [[ "${1:-}" == "content-audit" ]]; then
+  shift
+  cd -- "$CCR_PROJECT_DIR"
+  exec /home/admin123/miniconda3/envs/AdaptVPR/bin/python -B "$CCR_PROJECT_DIR/AdaptVPR/experiments/qwen_curriculum/night_content_audit.py" "$@"
+fi
+if [[ -f "$CCR_FINAL_DATASET/complete.json" ]]; then
+  case "${1:-status}" in
+    status|verify|pair)
+      if [[ $# -eq 0 ]]; then set -- status; fi
+      exec /home/admin123/miniconda3/envs/AdaptVPR/bin/python -B "$CCR_PROJECT_DIR/AdaptVPR/experiments/qwen_curriculum/night_dataset.py" --output-dir "$CCR_FINAL_DATASET" "$@"
+      ;;
+    build)
+      exec /home/admin123/miniconda3/envs/AdaptVPR/bin/python -B "$CCR_PROJECT_DIR/AdaptVPR/experiments/qwen_curriculum/night_dataset_final.py"
+      ;;
+    manifest)
+      echo "$CCR_FINAL_DATASET/manifest.jsonl"
+      exit 0
+      ;;
+    pause|resume|sync)
+      echo "Night dataset is complete: $CCR_FINAL_DATASET"
+      exit 0
+      ;;
+  esac
+fi
+if [[ -f "$CCR_PROJECT_DIR/outputs/night_dataset_v1/complete.json" ]]; then
+  case "${1:-status}" in
+    status|verify|pair|build)
+      if [[ $# -eq 0 ]]; then set -- status; fi
+      exec /home/admin123/miniconda3/envs/AdaptVPR/bin/python -B "$CCR_PROJECT_DIR/AdaptVPR/experiments/qwen_curriculum/night_dataset.py" "$@"
+      ;;
+    pause|resume|sync)
+      echo "61,984 night pairs are complete and collected. No generation service was started."
+      echo "Dataset: $CCR_PROJECT_DIR/outputs/night_dataset_v1"
+      exit 0
+      ;;
+    manifest)
+      echo "$CCR_PROJECT_DIR/outputs/night_dataset_v1/manifest.jsonl"
+      exit 0
+      ;;
+  esac
+fi
+if [[ -d "$CCR_PROJECT_DIR/outputs/night_generation_completion_v1" ]]; then
+  exec /home/admin123/miniconda3/envs/AdaptVPR/bin/python -B "$CCR_PROJECT_DIR/AdaptVPR/experiments/qwen_curriculum/night_generation_completion.py" "$@"
+fi
+if [[ -f "$CCR_PROJECT_DIR/outputs/night_original_no_mercury_v1/cluster.json" ]]; then
+  exec /home/admin123/miniconda3/envs/AdaptVPR/bin/python -B "$CCR_PROJECT_DIR/AdaptVPR/experiments/qwen_curriculum/night_original_images.py" "$@"
+fi
+if [[ -f "$CCR_PROJECT_DIR/outputs/night_revision_images_v1/cluster.json" ]]; then
+  exec /home/admin123/miniconda3/envs/AdaptVPR/bin/python -B "$CCR_PROJECT_DIR/AdaptVPR/experiments/qwen_curriculum/night_revision_images.py" "$@"
+fi
+exec /home/admin123/miniconda3/envs/AdaptVPR/bin/python -B "$CCR_PROJECT_DIR/AdaptVPR/experiments/qwen_curriculum/night_cluster.py" "$@"

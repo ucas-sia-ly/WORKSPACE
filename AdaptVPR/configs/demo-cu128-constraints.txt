@@ -1,0 +1,6 @@
+# Match the pinned LightX2V revision and NVIDIA drivers supporting CUDA 12.8.
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+transformers>=4.57,<5
+diffusers>=0.36,<0.37
